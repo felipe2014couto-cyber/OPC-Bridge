@@ -6,28 +6,27 @@ import struct
 import pytest
 
 from opc_bridge.protocol import (
-    MAGIC,
-    VERSION,
     HEADER_SIZE,
+    MAGIC,
     TRAILER_SIZE,
-    MsgType,
+    VERSION,
+    AuthAckPayload,
+    AuthPayload,
+    ConfigAckPayload,
+    ConfigPushPayload,
+    ErrorPayload,
+    HeartbeatPayload,
+    HelloAckPayload,
+    HelloPayload,
+    ItemRef,
+    ItemResult,
     ItemStatus,
+    MsgType,
+    ReadRequestPayload,
+    ReadResponsePayload,
     ValueType,
-    Header,
     frame_message,
     unframe_message,
-    HelloPayload,
-    HelloAckPayload,
-    AuthPayload,
-    AuthAckPayload,
-    ItemRef,
-    ReadRequestPayload,
-    ItemResult,
-    ReadResponsePayload,
-    HeartbeatPayload,
-    ErrorPayload,
-    ConfigPushPayload,
-    ConfigAckPayload,
 )
 
 
@@ -236,7 +235,7 @@ class TestItemResult:
         assert unpacked.error_code == 0x80040001
 
     def test_string_value(self):
-        val = "running".encode("utf-8")
+        val = b"running"
         r = ItemResult(
             item_id=5,
             status=ItemStatus.OK,

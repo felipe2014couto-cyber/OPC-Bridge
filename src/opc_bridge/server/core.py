@@ -4,21 +4,19 @@ from __future__ import annotations
 import asyncio
 import logging
 import ssl
-import struct
 import time
 from dataclasses import dataclass, field
-from typing import Optional
 
 from opc_bridge.protocol import (
     HEADER_SIZE,
     TRAILER_SIZE,
-    MsgType,
     AuthAckPayload,
     ConfigPushPayload,
     ErrorPayload,
     HelloAckPayload,
     HelloPayload,
     ItemRef,
+    MsgType,
     ReadResponsePayload,
     frame_message,
     unframe_message,
@@ -72,7 +70,7 @@ class BridgeServer:
         self._sessions: dict[str, AgentSession] = {}
         self._config_items: list[ItemRef] = []
         self._config_version: int = 0
-        self._server: Optional[asyncio.AbstractServer] = None
+        self._server: asyncio.AbstractServer | None = None
         self._running = False
 
     @property
@@ -115,8 +113,8 @@ class BridgeServer:
             try:
                 session.writer.close()
                 await session.writer.wait_closed()
-            except Exception:
-                pass
+            except (OSError, ConnectionError) as exc:
+                logger.debug("Error closing session %s: %s", session.session_id, exc)
         self._sessions.clear()
         if self._server:
             self._server.close()
@@ -134,7 +132,7 @@ class BridgeServer:
             try:
                 await session.send(MsgType.CONFIG_PUSH, payload)
                 logger.debug("Config pushed to session %s", sid)
-            except Exception as exc:
+            except (OSError, ConnectionError, asyncio.TimeoutError) as exc:
                 logger.warning("Failed to push config to %s: %s", sid, exc)
 
     async def _handle_client(
@@ -143,7 +141,7 @@ class BridgeServer:
         """Handle a single agent connection lifecycle."""
         addr = writer.get_extra_info("peername")
         logger.info("New connection from %s", addr)
-        session: Optional[AgentSession] = None
+        session: AgentSession | None = None
         try:
             session = await self._handshake(reader, writer)
             if session is None:
@@ -158,7 +156,7 @@ class BridgeServer:
             await self._message_loop(session, reader)
         except asyncio.CancelledError:
             logger.info("Connection cancelled: %s", addr)
-        except Exception as exc:
+        except (OSError, ConnectionError, asyncio.TimeoutError) as exc:
             logger.error("Connection error from %s: %s", addr, exc)
         finally:
             if session and session.session_id in self._sessions:
@@ -167,12 +165,12 @@ class BridgeServer:
             try:
                 writer.close()
                 await writer.wait_closed()
-            except Exception:
-                pass
+            except (OSError, ConnectionError) as exc:
+                logger.debug("Error closing writer for %s: %s", addr, exc)
 
     async def _handshake(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
-    ) -> Optional[AgentSession]:
+    ) -> AgentSession | None:
         """Perform HELLO + AUTH handshake. Returns session or None on failure."""
         # Expect HELLO
         hello_data = await self._read_message(reader)
@@ -272,7 +270,7 @@ class BridgeServer:
 
     async def _read_message(
         self, reader: asyncio.StreamReader
-    ) -> Optional[tuple]:
+    ) -> tuple | None:
         """Read and unframe one protocol message. Returns None on EOF/error."""
         try:
             hdr_bytes = await reader.readexactly(HEADER_SIZE)

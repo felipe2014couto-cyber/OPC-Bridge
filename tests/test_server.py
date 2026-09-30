@@ -4,23 +4,22 @@ from __future__ import annotations
 import asyncio
 import ssl
 import struct
-import tempfile
 import time
 from pathlib import Path
 
 import pytest
 
 from opc_bridge.protocol import (
-    MsgType,
     AuthPayload,
     ConfigAckPayload,
     ConfigPushPayload,
     HelloAckPayload,
     HelloPayload,
     ItemRef,
-    ReadResponsePayload,
     ItemResult,
     ItemStatus,
+    MsgType,
+    ReadResponsePayload,
     ValueType,
     frame_message,
     unframe_message,
@@ -126,7 +125,7 @@ class TestServerHandshake:
 
             # Verify session registered
             assert len(srv.sessions) == 1
-            session = list(srv.sessions.values())[0]
+            session = next(iter(srv.sessions.values()))
             assert session.agent_id == "test-agent-001"
             assert session.hostname == "test-host"
         finally:
@@ -218,7 +217,7 @@ class TestConfigPush:
             await asyncio.sleep(0.1)
 
             # Verify session config version updated
-            session = list(srv.sessions.values())[0]
+            session = next(iter(srv.sessions.values()))
             assert session.config_version == 5
         finally:
             writer.close()
@@ -253,7 +252,7 @@ class TestMessageLoop:
             await asyncio.sleep(0.1)
 
             # Verify last_heartbeat updated
-            session = list(srv.sessions.values())[0]
+            session = next(iter(srv.sessions.values()))
             assert session.last_heartbeat > 0
         finally:
             writer.close()

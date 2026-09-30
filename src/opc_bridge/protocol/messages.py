@@ -8,8 +8,6 @@ import struct
 import zlib
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Optional
-
 
 MAGIC = 0x4F50  # "OP"
 VERSION = 0x0001
