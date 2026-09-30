@@ -14,6 +14,7 @@ from opc_bridge.adapters.simulated import SimulatedOpcAdapter
 from opc_bridge.agent.client import AgentClient
 from opc_bridge.protocol import (
     ItemRef,
+    MsgType,
     ReadRequestPayload,
 )
 from opc_bridge.server import BridgeServer, ServerConfig
@@ -340,6 +341,38 @@ class TestDisconnectReconnect:
 
         await client2.disconnect()
         adapter.disconnect()
+
+    def test_agent_detects_server_heartbeat_timeout(self, tls_certs, auth_token_hash):
+        certfile, keyfile = tls_certs
+        srv = BridgeServer(ServerConfig(
+            host="127.0.0.1", port=0, certfile=certfile, keyfile=keyfile,
+            auth_token_hash=auth_token_hash, heartbeat_interval_ms=20,
+        ))
+        async def scenario():
+            await srv.start()
+            port = srv._server.sockets[0].getsockname()[1]
+            adapter = SimulatedOpcAdapter()
+            client = AgentClient("127.0.0.1", port, "timeout-agent", auth_token_hash,
+                                 adapter, heartbeat_timeout=0.1)
+            await client.connect()
+            client._heartbeat_timeout = 0.1
+            session = next(iter(srv.sessions.values()))
+            original_send = session.send
+
+            async def ignore_server_messages(msg_type, payload):
+                if msg_type == MsgType.READ_REQUEST:
+                    await original_send(msg_type, payload)
+
+            session.send = ignore_server_messages
+            loop_task = asyncio.create_task(client.run_loop())
+            try:
+                await asyncio.wait_for(loop_task, timeout=1)
+                assert not client.is_connected
+            finally:
+                await client.disconnect()
+                await srv.stop()
+
+        asyncio.run(scenario())
 
 
 class TestNoCacheEnforcement:

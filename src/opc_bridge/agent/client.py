@@ -20,6 +20,7 @@ from opc_bridge.protocol import (
     ConfigAckPayload,
     ConfigPushPayload,
     Header,
+    HeartbeatPayload,
     HelloAckPayload,
     HelloPayload,
     ItemResult,
@@ -52,6 +53,7 @@ class AgentClient:
         auth_token_hash: bytes,
         adapter: OpcAdapter,
         certfile: str | None = None,
+        heartbeat_timeout: float = 30.0,
     ) -> None:
         self._host = server_host
         self._port = server_port
@@ -67,6 +69,11 @@ class AgentClient:
         self._running = False
         self._group_handle: object | None = None
         self._item_mapping: dict[int, str] = {}  # item_id -> opc_path
+        self._heartbeat_interval = 5.0
+        self._heartbeat_timeout = heartbeat_timeout
+        self._last_received = time.monotonic()
+        self._heartbeat_task: asyncio.Task[None] | None = None
+        self._heartbeat_expired = False
 
     @property
     def session_id(self) -> str | None:
@@ -78,7 +85,12 @@ class AgentClient:
 
     @property
     def is_connected(self) -> bool:
-        return self._writer is not None and not self._writer.is_closing()
+        return (
+            self._running
+            and self._writer is not None
+            and not self._writer.is_closing()
+            and not self._heartbeat_expired
+        )
 
     async def connect(self) -> None:
         """Establish TLS connection and perform handshake."""
@@ -96,6 +108,8 @@ class AgentClient:
 
         await self._handshake()
         self._running = True
+        self._last_received = time.monotonic()
+        self._heartbeat_expired = False
 
     async def _handshake(self) -> None:
         """Perform HELLO + AUTH handshake with the server."""
@@ -117,6 +131,10 @@ class AgentClient:
             raise RuntimeError(f"Expected HELLO_ACK, got {header.msg_type}")
         ack = HelloAckPayload.unpack(payload)
         self._session_id = ack.session_id
+        self._heartbeat_interval = max(0.1, ack.heartbeat_interval_ms / 1000)
+        self._heartbeat_timeout = max(
+            self._heartbeat_timeout, self._heartbeat_interval * 3
+        )
         logger.info("Session established: %s", self._session_id)
 
         # Send AUTH
@@ -135,10 +153,15 @@ class AgentClient:
     async def run_loop(self) -> None:
         """Main message processing loop."""
         assert self._reader is not None
+        if self._heartbeat_task is None:
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         while self._running:
             try:
-                header, payload = await self._read_message()
-            except (ConnectionError, asyncio.IncompleteReadError):
+                header, payload = await asyncio.wait_for(
+                    self._read_message(), timeout=self._heartbeat_timeout
+                )
+                self._last_received = time.monotonic()
+            except (ConnectionError, asyncio.IncompleteReadError, asyncio.TimeoutError):
                 logger.warning("Connection lost")
                 break
 
@@ -155,6 +178,28 @@ class AgentClient:
                 logger.error("Server error: code=%d msg=%s", err.code, err.message)
             else:
                 logger.warning("Unexpected message type: %s", header.msg_type)
+        self._running = False
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+            await asyncio.gather(self._heartbeat_task, return_exceptions=True)
+            self._heartbeat_task = None
+
+    async def _heartbeat_loop(self) -> None:
+        while self._running:
+            await asyncio.sleep(self._heartbeat_interval)
+            if time.monotonic() - self._last_received > self._heartbeat_timeout:
+                logger.warning("Heartbeat timeout: session=%s", self._session_id)
+                self._running = False
+                self._heartbeat_expired = True
+                if self._writer:
+                    self._writer.close()
+                return
+            try:
+                payload = HeartbeatPayload(timestamp_us=int(time.time() * 1_000_000)).pack()
+                await self._send(MsgType.HEARTBEAT, payload)
+            except (OSError, ConnectionError):
+                self._running = False
+                return
 
     async def _handle_config_push(self, payload: bytes) -> None:
         """Process CONFIG_PUSH and send CONFIG_ACK."""
@@ -258,6 +303,12 @@ class AgentClient:
     async def disconnect(self) -> None:
         """Close the connection gracefully."""
         self._running = False
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+            await asyncio.gather(self._heartbeat_task, return_exceptions=True)
+            self._heartbeat_task = None
+        if self._heartbeat_expired and self._writer:
+            self._writer.close()
         if self._writer:
             self._writer.close()
             try:
