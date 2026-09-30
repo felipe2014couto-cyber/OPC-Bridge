@@ -4,6 +4,8 @@ import asyncio
 import logging
 import sys
 
+import pytest
+
 from opc_bridge.agent.supervisor import (
     AgentSupervisor,
     ProcessWatchdog,
@@ -34,18 +36,21 @@ class FakeClient:
         return "test"
 
 
-def test_supervisor_reconnects_and_stops():
+@pytest.mark.asyncio
+async def test_supervisor_reconnects_and_stops():
     clients = []
+    supervisor = None
 
     def factory():
+        nonlocal supervisor
         client = FakeClient()
         clients.append(client)
-        if len(clients) == 2:
-            asyncio.get_running_loop().call_soon(supervisor.stop)
+        if len(clients) == 2 and supervisor is not None:
+            supervisor.stop()
         return client
 
     supervisor = AgentSupervisor(factory, min_backoff=0.001, max_backoff=0.002)
-    asyncio.run(asyncio.wait_for(supervisor.run(), timeout=1))
+    await asyncio.wait_for(supervisor.run(), timeout=1)
     assert len(clients) >= 2
     assert all(client.disconnected for client in clients)
 
