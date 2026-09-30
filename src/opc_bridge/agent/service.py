@@ -233,19 +233,25 @@ if HAS_WIN32:
 
         def SvcDoRun(self) -> None:
             """Main service execution called by SCM."""
-            servicemanager.LogMsg(
-                servicemanager.EVENTLOG_INFORMATION_TYPE,
-                servicemanager.PYS_SERVICE_STARTED,
-                (self._svc_name_, ""),
-            )
+            try:
+                servicemanager.LogMsg(
+                    servicemanager.EVENTLOG_INFORMATION_TYPE,
+                    servicemanager.PYS_SERVICE_STARTED,
+                    (self._svc_name_, ""),
+                )
+            except Exception:
+                pass
             logger.info("Windows Service %s started.", self._svc_name_)
             config = load_config()
             run_agent_main(config, stop_event=self._async_stop_event)
-            servicemanager.LogMsg(
-                servicemanager.EVENTLOG_INFORMATION_TYPE,
-                servicemanager.PYS_SERVICE_STOPPED,
-                (self._svc_name_, ""),
-            )
+            try:
+                servicemanager.LogMsg(
+                    servicemanager.EVENTLOG_INFORMATION_TYPE,
+                    servicemanager.PYS_SERVICE_STOPPED,
+                    (self._svc_name_, ""),
+                )
+            except Exception:
+                pass
             logger.info("Windows Service %s stopped.", self._svc_name_)
 
 else:

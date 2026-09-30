@@ -38,7 +38,15 @@ class SupervisedOpcAdapter:
         command_timeout: float = 10.0,
         connect_timeout: float = 15.0,
     ) -> None:
-        self.worker_executable = worker_executable or sys.executable
+        if not worker_executable:
+            exe = sys.executable
+            if exe.lower().endswith("pythonservice.exe"):
+                candidate = os.path.join(os.path.dirname(exe), "python.exe")
+                if os.path.exists(candidate):
+                    exe = candidate
+            self.worker_executable = exe
+        else:
+            self.worker_executable = worker_executable
         self.worker_module = worker_module
         self.command_timeout = command_timeout
         self.connect_timeout = connect_timeout
