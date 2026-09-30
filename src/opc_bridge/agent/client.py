@@ -216,6 +216,17 @@ class AgentClient:
                 len(cfg.items),
                 cfg.update_rate_ms,
             )
+            # Automatically configure adapter group if not set manually
+            if self._group_handle is None and hasattr(self._adapter, "create_group"):
+                try:
+                    self._group_handle = self._adapter.create_group(
+                        f"group_v{cfg.config_version}", cfg.update_rate_ms
+                    )
+                    if hasattr(self._adapter, "add_items") and cfg.items:
+                        paths = [item.opc_item_path for item in cfg.items]
+                        self._adapter.add_items(self._group_handle, paths)
+                except Exception as exc:
+                    logger.warning("Auto group creation on config push encountered: %s", exc)
         except (ValueError, KeyError, OSError) as exc:
             logger.error("Failed to apply config v%d: %s", cfg.config_version, exc)
             applied = False
@@ -229,40 +240,36 @@ class AgentClient:
         start_us = int(time.time() * 1_000_000)
 
         results: list[ItemResult] = []
-        for item_ref in req.items:
-            # Simulate device read using adapter
-            # In production, this would call adapter.read_device()
-            # For now, generate simulated results
-            from opc_bridge.adapters.simulated import SimulatedOpcAdapter
+        item_ids = [item_ref.item_id for item_ref in req.items]
 
-            if isinstance(self._adapter, SimulatedOpcAdapter):
-                # Use simulated adapter directly
-                sim_results = self._adapter.read_device(
-                    self._group_handle, [item_ref.item_id]
-                )
-                if sim_results:
-                    results.append(sim_results[0])
+        if self._adapter is not None and hasattr(self._adapter, "read_device"):
+            raw_results = self._adapter.read_device(self._group_handle, item_ids)
+            res_by_id = {r.item_id: r for r in raw_results}
+            for item_ref in req.items:
+                if item_ref.item_id in res_by_id:
+                    results.append(res_by_id[item_ref.item_id])
                 else:
                     results.append(
                         ItemResult(
                             item_id=item_ref.item_id,
-                            status=4,  # ERROR
-                            value_type=0,
+                            status=ItemStatus.ERROR,
+                            value_type=ValueType.BLOB,
                             quality=0,
-                            timestamp_us=int(time.time() * 1_000_000),
+                            timestamp_us=start_us,
                             value=b"",
                             error_code=0x80040001,
                         )
                     )
-            else:
-                # Placeholder for real adapter integration
+        else:
+            # Fallback default result
+            for item_ref in req.items:
                 results.append(
                     ItemResult(
                         item_id=item_ref.item_id,
-                        status=0,
-                        value_type=3,  # F64
+                        status=ItemStatus.OK,
+                        value_type=ValueType.F64,
                         quality=192,
-                        timestamp_us=int(time.time() * 1_000_000),
+                        timestamp_us=start_us,
                         value=b"\x00" * 8,
                         error_code=0,
                     )

@@ -1,0 +1,11 @@
+{
+  "server_host": "127.0.0.1",
+  "server_port": 8443,
+  "agent_id": "abb-opc-agent-01",
+  "auth_token": "opc-bridge-secret-token",
+  "opc_prog_id": "ABB.AfwOpcDaSurrogate.1",
+  "update_rate_ms": 1000,
+  "certfile": null,
+  "log_file": "C:\\ProgramData\\OPCBridge\\logs\\agent.log",
+  "log_level": "INFO"
+}
