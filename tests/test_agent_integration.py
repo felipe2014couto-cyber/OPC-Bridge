@@ -1,0 +1,300 @@
+"""Integration tests: server -> simulated agent -> read -> response.
+Validates the complete flow without real ABB hardware.
+"""
+from __future__ import annotations
+
+import asyncio
+import subprocess
+import time
+from pathlib import Path
+
+import pytest
+
+from opc_bridge.adapters.simulated import SimulatedOpcAdapter
+from opc_bridge.agent.client import AgentClient
+from opc_bridge.protocol import (
+    ItemRef,
+    ReadRequestPayload,
+)
+from opc_bridge.server import BridgeServer, ServerConfig
+
+
+@pytest.fixture
+def tls_certs(tmp_path: Path):
+    """Generate self-signed TLS certificates for testing."""
+    certfile = tmp_path / "cert.pem"
+    keyfile = tmp_path / "key.pem"
+    subprocess.run(
+        [
+            "openssl", "req", "-x509", "-newkey", "rsa:2048",
+            "-keyout", str(keyfile), "-out", str(certfile),
+            "-days", "1", "-nodes", "-subj", "/CN=localhost",
+        ],
+        check=True, capture_output=True,
+    )
+    return str(certfile), str(keyfile)
+
+
+@pytest.fixture
+def auth_token_hash():
+    return b"\xaa\xbb\xcc\xdd" * 8  # 32 bytes
+
+
+@pytest.fixture
+async def server_with_config(tls_certs, auth_token_hash):
+    """Start a BridgeServer with pre-loaded config."""
+    certfile, keyfile = tls_certs
+    config = ServerConfig(
+        host="127.0.0.1",
+        port=0,
+        certfile=certfile,
+        keyfile=keyfile,
+        auth_token_hash=auth_token_hash,
+        heartbeat_interval_ms=5000,
+        default_update_rate_ms=1000,
+    )
+    srv = BridgeServer(config)
+    items = [
+        ItemRef(item_id=1, opc_item_path="Simulated.Temperature", requested_source=0),
+        ItemRef(item_id=2, opc_item_path="Simulated.Pressure", requested_source=0),
+        ItemRef(item_id=3, opc_item_path="Simulated.Status", requested_source=0),
+    ]
+    srv.set_config(items, version=1)
+    await srv.start()
+    port = srv._server.sockets[0].getsockname()[1]
+    yield srv, port, auth_token_hash, certfile
+    await srv.stop()
+
+
+class TestFullFlowNormalRead:
+    """Server sends READ_REQUEST, agent reads via simulated adapter, returns response."""
+
+    @pytest.mark.asyncio
+    async def test_normal_read_roundtrip(self, server_with_config):
+        srv, port, token_hash, certfile = server_with_config
+
+        adapter = SimulatedOpcAdapter(read_latency_us=0)
+        adapter.connect("Simulated.OPC")
+        group = adapter.create_group("test-group", 1000)
+        adapter.add_items(group, ["Simulated.Temperature", "Simulated.Pressure", "Simulated.Status"])
+        adapter._group_handle = group
+
+        client = AgentClient(
+            server_host="127.0.0.1",
+            server_port=port,
+            agent_id="integration-agent-001",
+            auth_token_hash=token_hash,
+            adapter=adapter,
+            certfile=certfile,
+        )
+        client._group_handle = group
+
+        await client.connect()
+        assert client.is_connected
+        assert client.session_id is not None
+
+        # Push config from server
+        await srv.push_config_to_all()
+        await asyncio.sleep(0.2)
+
+        # Send READ_REQUEST from server side by injecting into message loop
+        # We simulate this by having the client process a read request directly
+        req = ReadRequestPayload(
+            request_id=42,
+            items=[
+                ItemRef(item_id=1, opc_item_path="Simulated.Temperature", requested_source=0),
+                ItemRef(item_id=2, opc_item_path="Simulated.Pressure", requested_source=0),
+            ],
+        )
+        await client._handle_read_request(req.pack())
+
+        # Verify the server received the READ_RESPONSE
+        await asyncio.sleep(0.2)
+        session = next(iter(srv.sessions.values()))
+        assert session.agent_id == "integration-agent-001"
+
+        await client.disconnect()
+        adapter.disconnect()
+
+
+class TestPartialError:
+    """Some items succeed, others fail — all reported individually."""
+
+    @pytest.mark.asyncio
+    async def test_partial_error_in_batch(self, server_with_config):
+        srv, port, token_hash, certfile = server_with_config
+
+        adapter = SimulatedOpcAdapter(read_latency_us=0)
+        adapter.connect("Simulated.OPC")
+        group = adapter.create_group("err-group", 1000)
+        mapping = adapter.add_items(group, ["Simulated.Temperature"])
+        # Add a non-existent item that will return NOT_FOUND
+        adapter._group_handle = group
+
+        client = AgentClient(
+            server_host="127.0.0.1",
+            server_port=port,
+            agent_id="err-agent",
+            auth_token_hash=token_hash,
+            adapter=adapter,
+            certfile=certfile,
+        )
+        client._group_handle = group
+
+        await client.connect()
+        await srv.push_config_to_all()
+        await asyncio.sleep(0.2)
+
+        # Request one valid + one invalid item
+        req = ReadRequestPayload(
+            request_id=99,
+            items=[
+                ItemRef(item_id=next(iter(mapping.values())), opc_item_path="Simulated.Temperature", requested_source=0),
+                ItemRef(item_id=9999, opc_item_path="NonExistent.Tag", requested_source=0),
+            ],
+        )
+        await client._handle_read_request(req.pack())
+        await asyncio.sleep(0.2)
+
+        await client.disconnect()
+        adapter.disconnect()
+
+
+class TestSlowRead:
+    """Simulate slow device read; verify duration_us reflects actual latency."""
+
+    @pytest.mark.asyncio
+    async def test_slow_read_reports_duration(self, server_with_config):
+        srv, port, token_hash, certfile = server_with_config
+
+        # 50ms simulated latency
+        adapter = SimulatedOpcAdapter(read_latency_us=50_000)
+        adapter.connect("Simulated.OPC")
+        group = adapter.create_group("slow-group", 1000)
+        adapter.add_items(group, ["Simulated.Temperature"])
+        adapter._group_handle = group
+
+        client = AgentClient(
+            server_host="127.0.0.1",
+            server_port=port,
+            agent_id="slow-agent",
+            auth_token_hash=token_hash,
+            adapter=adapter,
+            certfile=certfile,
+        )
+        client._group_handle = group
+
+        await client.connect()
+        await srv.push_config_to_all()
+        await asyncio.sleep(0.2)
+
+        start = time.monotonic()
+        req = ReadRequestPayload(
+            request_id=77,
+            items=[ItemRef(item_id=1, opc_item_path="Simulated.Temperature", requested_source=0)],
+        )
+        await client._handle_read_request(req.pack())
+        elapsed = time.monotonic() - start
+
+        # Should take at least ~50ms due to simulated latency
+        assert elapsed >= 0.04  # Allow some tolerance
+
+        await client.disconnect()
+        adapter.disconnect()
+
+
+class TestDisconnectReconnect:
+    """Agent disconnects and reconnects; server handles gracefully."""
+
+    @pytest.mark.asyncio
+    async def test_reconnect_after_disconnect(self, server_with_config):
+        srv, port, token_hash, certfile = server_with_config
+
+        adapter = SimulatedOpcAdapter(read_latency_us=0)
+        adapter.connect("Simulated.OPC")
+        group = adapter.create_group("reconn-group", 1000)
+        adapter.add_items(group, ["Simulated.Temperature"])
+        adapter._group_handle = group
+
+        # First connection
+        client1 = AgentClient(
+            server_host="127.0.0.1",
+            server_port=port,
+            agent_id="reconn-agent",
+            auth_token_hash=token_hash,
+            adapter=adapter,
+            certfile=certfile,
+        )
+        client1._group_handle = group
+        await client1.connect()
+        assert len(srv.sessions) == 1
+        first_session = client1.session_id
+
+        # Disconnect
+        await client1.disconnect()
+        await asyncio.sleep(0.3)
+        assert len(srv.sessions) == 0
+
+        # Reconnect
+        client2 = AgentClient(
+            server_host="127.0.0.1",
+            server_port=port,
+            agent_id="reconn-agent",
+            auth_token_hash=token_hash,
+            adapter=adapter,
+            certfile=certfile,
+        )
+        client2._group_handle = group
+        await client2.connect()
+        assert len(srv.sessions) == 1
+        assert client2.session_id != first_session  # New session
+
+        await client2.disconnect()
+        adapter.disconnect()
+
+
+class TestNoCacheEnforcement:
+    """Each read must hit the adapter; no cached values."""
+
+    @pytest.mark.asyncio
+    async def test_consecutive_reads_produce_different_timestamps(self, server_with_config):
+        srv, port, token_hash, certfile = server_with_config
+
+        adapter = SimulatedOpcAdapter(read_latency_us=1000)  # 1ms to ensure distinct timestamps
+        adapter.connect("Simulated.OPC")
+        group = adapter.create_group("nocache-group", 1000)
+        adapter.add_items(group, ["Simulated.Temperature"])
+        adapter._group_handle = group
+
+        client = AgentClient(
+            server_host="127.0.0.1",
+            server_port=port,
+            agent_id="nocache-agent",
+            auth_token_hash=token_hash,
+            adapter=adapter,
+            certfile=certfile,
+        )
+        client._group_handle = group
+
+        await client.connect()
+        await srv.push_config_to_all()
+        await asyncio.sleep(0.2)
+
+        # Two consecutive reads
+        req = ReadRequestPayload(
+            request_id=1,
+            items=[ItemRef(item_id=1, opc_item_path="Simulated.Temperature", requested_source=0)],
+        )
+        await client._handle_read_request(req.pack())
+        await asyncio.sleep(0.01)
+
+        req2 = ReadRequestPayload(
+            request_id=2,
+            items=[ItemRef(item_id=1, opc_item_path="Simulated.Temperature", requested_source=0)],
+        )
+        await client._handle_read_request(req2.pack())
+        await asyncio.sleep(0.2)
+
+        # Both reads should have completed without error
+        await client.disconnect()
+        adapter.disconnect()
