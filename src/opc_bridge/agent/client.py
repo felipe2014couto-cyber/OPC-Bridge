@@ -171,7 +171,7 @@ class AgentClient:
                 len(cfg.items),
                 cfg.update_rate_ms,
             )
-        except Exception as exc:
+        except (ValueError, KeyError, OSError) as exc:
             logger.error("Failed to apply config v%d: %s", cfg.config_version, exc)
             applied = False
 
@@ -262,6 +262,6 @@ class AgentClient:
             self._writer.close()
             try:
                 await self._writer.wait_closed()
-            except Exception:
-                pass
+            except (OSError, ConnectionError) as exc:
+                logger.debug("Error closing writer: %s", exc)
         logger.info("Disconnected from server")
