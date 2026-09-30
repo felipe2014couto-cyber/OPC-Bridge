@@ -17,6 +17,7 @@ from opc_bridge.protocol import (
     HelloPayload,
     ItemRef,
     MsgType,
+    ReadRequestPayload,
     ReadResponsePayload,
     frame_message,
     unframe_message,
@@ -36,6 +37,19 @@ class ServerConfig:
     auth_token_hash: bytes = b""
     heartbeat_interval_ms: int = 5000
     default_update_rate_ms: int = 1000
+    read_cycle_timeout_ms: int = 5000
+
+
+@dataclass
+class ReadSchedulerMetrics:
+    """Aggregate metrics for centrally scheduled read cycles."""
+
+    cycles: int = 0
+    timeouts: int = 0
+    overruns: int = 0
+    duration_total_ms: float = 0.0
+    duration_max_ms: float = 0.0
+    duration_last_ms: float = 0.0
 
 
 @dataclass
@@ -72,6 +86,10 @@ class BridgeServer:
         self._config_version: int = 0
         self._server: asyncio.AbstractServer | None = None
         self._running = False
+        self._next_request_id = 0
+        self._pending_reads: dict[tuple[str, int], asyncio.Future[ReadResponsePayload]] = {}
+        self._scheduler_tasks: dict[str, asyncio.Task[None]] = {}
+        self.read_metrics = ReadSchedulerMetrics()
 
     @property
     def sessions(self) -> dict[str, AgentSession]:
@@ -86,6 +104,15 @@ class BridgeServer:
         self._config_items = list(items)
         self._config_version = version
         logger.info("Config updated: version=%d, items=%d", version, len(items))
+
+    def _allocate_request_id(self) -> int:
+        """Return a request ID that is not currently awaiting a response."""
+        for _ in range(len(self._pending_reads) + 1):
+            request_id = self._next_request_id
+            self._next_request_id = (request_id + 1) & 0xFFFFFFFF
+            if all(key[1] != request_id for key in self._pending_reads):
+                return request_id
+        raise RuntimeError("No request IDs available")
 
     async def start(self) -> None:
         """Start the TLS server."""
@@ -109,6 +136,15 @@ class BridgeServer:
     async def stop(self) -> None:
         """Stop the server and close all sessions."""
         self._running = False
+        for task in list(self._scheduler_tasks.values()):
+            task.cancel()
+        if self._scheduler_tasks:
+            await asyncio.gather(*self._scheduler_tasks.values(), return_exceptions=True)
+        self._scheduler_tasks.clear()
+        for future in self._pending_reads.values():
+            if not future.done():
+                future.cancel()
+        self._pending_reads.clear()
         for session in list(self._sessions.values()):
             try:
                 session.writer.close()
@@ -147,6 +183,11 @@ class BridgeServer:
             if session is None:
                 return
             self._sessions[session.session_id] = session
+            scheduler_task = asyncio.create_task(
+                self._schedule_reads(session),
+                name=f"read-scheduler-{session.session_id}",
+            )
+            self._scheduler_tasks[session.session_id] = scheduler_task
             logger.info(
                 "Agent authenticated: id=%s host=%s session=%s",
                 session.agent_id,
@@ -159,6 +200,16 @@ class BridgeServer:
         except (OSError, ConnectionError, asyncio.TimeoutError) as exc:
             logger.error("Connection error from %s: %s", addr, exc)
         finally:
+            scheduler_task = self._scheduler_tasks.pop(session.session_id, None) if session else None
+            if scheduler_task:
+                scheduler_task.cancel()
+                await asyncio.gather(scheduler_task, return_exceptions=True)
+            if session:
+                for key, future in list(self._pending_reads.items()):
+                    if key[0] == session.session_id:
+                        self._pending_reads.pop(key, None)
+                        if not future.done():
+                            future.cancel()
             if session and session.session_id in self._sessions:
                 del self._sessions[session.session_id]
                 logger.info("Session removed: %s", session.session_id)
@@ -242,6 +293,9 @@ class BridgeServer:
                 logger.debug("Heartbeat from %s", session.session_id)
             elif header.msg_type == MsgType.READ_RESPONSE:
                 resp = ReadResponsePayload.unpack(payload)
+                pending = self._pending_reads.get((session.session_id, resp.request_id))
+                if pending is not None and not pending.done():
+                    pending.set_result(resp)
                 logger.info(
                     "Read response from %s: request=%d duration=%dus results=%d",
                     session.session_id,
@@ -291,3 +345,59 @@ class BridgeServer:
         except ValueError as exc:
             logger.warning("Invalid message: %s", exc)
             return None
+
+    async def _schedule_reads(self, session: AgentSession) -> None:
+        """Run one non-overlapping read cycle per configured agent group."""
+        interval_ms = max(1, self.config.default_update_rate_ms)
+        next_tick = time.monotonic() + interval_ms / 1000
+        while self._running and session.session_id in self._sessions:
+            interval_ms = max(1, self.config.default_update_rate_ms)
+            interval = interval_ms / 1000
+            timeout = max(1, self.config.read_cycle_timeout_ms) / 1000
+            delay = next_tick - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            if not self._running or session.session_id not in self._sessions:
+                return
+
+            started = time.monotonic()
+            request_id = self._allocate_request_id()
+            future: asyncio.Future[ReadResponsePayload] = asyncio.get_running_loop().create_future()
+            key = (session.session_id, request_id)
+            self._pending_reads[key] = future
+            try:
+                request = ReadRequestPayload(request_id=request_id, items=list(self._config_items))
+                await session.send(MsgType.READ_REQUEST, request.pack())
+                await asyncio.wait_for(future, timeout=timeout)
+            except asyncio.TimeoutError:
+                self.read_metrics.timeouts += 1
+                logger.warning("Read cycle timed out: session=%s request=%d", session.session_id, request_id)
+            except asyncio.CancelledError:
+                raise
+            except (OSError, ConnectionError):
+                return
+            finally:
+                self._pending_reads.pop(key, None)
+                if not future.done():
+                    future.cancel()
+
+            elapsed = time.monotonic() - started
+            elapsed_ms = elapsed * 1000
+            self.read_metrics.cycles += 1
+            self.read_metrics.duration_last_ms = elapsed_ms
+            self.read_metrics.duration_total_ms += elapsed_ms
+            self.read_metrics.duration_max_ms = max(self.read_metrics.duration_max_ms, elapsed_ms)
+
+            # Keep the cadence anchored to the original schedule. Any ticks
+            # elapsed while this cycle ran are dropped instead of queued.
+            next_tick += interval
+            now = time.monotonic()
+            if now >= next_tick:
+                skipped = int((now - next_tick) // interval) + 1
+                self.read_metrics.overruns += skipped
+                logger.warning(
+                    "Read cycle overrun: session=%s dropped_ticks=%d",
+                    session.session_id,
+                    skipped,
+                )
+                next_tick += skipped * interval

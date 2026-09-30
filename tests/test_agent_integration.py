@@ -116,6 +116,95 @@ class TestFullFlowNormalRead:
         await client.disconnect()
         adapter.disconnect()
 
+    @pytest.mark.asyncio
+    async def test_server_schedules_correlated_cycles_for_simulated_agent(self, server_with_config):
+        srv, port, token_hash, certfile = server_with_config
+        srv.config.default_update_rate_ms = 30
+        srv.config.read_cycle_timeout_ms = 250
+
+        adapter = SimulatedOpcAdapter(read_latency_us=0)
+        adapter.connect("Simulated.OPC")
+        group = adapter.create_group("scheduled-group", 30)
+        adapter.add_items(group, ["Simulated.Temperature", "Simulated.Pressure", "Simulated.Status"])
+        adapter._group_handle = group
+        client = AgentClient(
+            server_host="127.0.0.1",
+            server_port=port,
+            agent_id="scheduled-agent",
+            auth_token_hash=token_hash,
+            adapter=adapter,
+            certfile=certfile,
+        )
+        client._group_handle = group
+        request_ids = []
+        original_handler = client._handle_read_request
+
+        async def capture_response(payload):
+            request_ids.append(ReadRequestPayload.unpack(payload).request_id)
+            await original_handler(payload)
+
+        client._handle_read_request = capture_response
+        await client.connect()
+        loop_task = asyncio.create_task(client.run_loop())
+        try:
+            await asyncio.wait_for(_wait_for_cycles(srv, 3), timeout=1)
+            assert len(request_ids) >= 3
+            assert len(set(request_ids)) == len(request_ids)
+            assert srv.read_metrics.cycles >= 3
+            assert srv.read_metrics.duration_total_ms >= srv.read_metrics.duration_last_ms
+        finally:
+            await client.disconnect()
+            await asyncio.gather(loop_task, return_exceptions=True)
+            adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_timeout_discards_missed_cycles_without_queueing(self, server_with_config):
+        srv, port, token_hash, certfile = server_with_config
+        srv.config.default_update_rate_ms = 20
+        srv.config.read_cycle_timeout_ms = 60
+
+        adapter = SimulatedOpcAdapter(read_latency_us=0)
+        adapter.connect("Simulated.OPC")
+        group = adapter.create_group("timeout-group", 20)
+        adapter.add_items(group, ["Simulated.Temperature", "Simulated.Pressure", "Simulated.Status"])
+        adapter._group_handle = group
+        client = AgentClient(
+            server_host="127.0.0.1",
+            server_port=port,
+            agent_id="timeout-agent",
+            auth_token_hash=token_hash,
+            adapter=adapter,
+            certfile=certfile,
+        )
+        client._group_handle = group
+        received_ids = []
+        original_handler = client._handle_read_request
+
+        async def drop_first_response(payload):
+            request_id = ReadRequestPayload.unpack(payload).request_id
+            received_ids.append(request_id)
+            if len(received_ids) > 1:
+                await original_handler(payload)
+
+        client._handle_read_request = drop_first_response
+        await client.connect()
+        loop_task = asyncio.create_task(client.run_loop())
+        try:
+            await asyncio.wait_for(_wait_for_cycles(srv, 2), timeout=1)
+            assert srv.read_metrics.timeouts == 1
+            assert srv.read_metrics.overruns >= 1
+            assert len(received_ids) == 2
+            assert received_ids[0] != received_ids[1]
+        finally:
+            await client.disconnect()
+            await asyncio.gather(loop_task, return_exceptions=True)
+            adapter.disconnect()
+
+
+async def _wait_for_cycles(server, count):
+    while server.read_metrics.cycles < count:
+        await asyncio.sleep(0.005)
+
 
 class TestPartialError:
     """Some items succeed, others fail — all reported individually."""
