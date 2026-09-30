@@ -50,14 +50,11 @@ except ImportError:
     pytest = PytestFallback()
 
 from opc_bridge.adapters.base import (
-    OPC_DS_CACHE,
     OPC_DS_DEVICE,
     OPC_QUALITY_BAD,
     OPC_QUALITY_GOOD,
     OPC_QUALITY_UNCERTAIN,
     BrowseEntry,
-    GroupHandle,
-    ServerStatus,
 )
 from opc_bridge.adapters.da import (
     OpcDaAdapter,
@@ -65,7 +62,7 @@ from opc_bridge.adapters.da import (
     pack_variant_value,
 )
 from opc_bridge.adapters.supervised import SupervisedOpcAdapter
-from opc_bridge.protocol import ItemResult, ItemStatus, ValueType
+from opc_bridge.protocol import ItemStatus, ValueType
 
 
 class MockComItem:
@@ -502,7 +499,7 @@ class TestSupervisedOpcAdapter:
             # execute successfully, and return a new correlated value.
             start_time2 = time.monotonic()
             results2 = adapter.read_device(group, [normal_item_id], timeout=2.0)
-            elapsed2 = time.monotonic() - start_time2
+            _elapsed2 = time.monotonic() - start_time2
 
             assert len(results2) == 1
             assert results2[0].status == ItemStatus.OK
@@ -557,6 +554,7 @@ class TestServiceAndPackaging:
 
     def test_load_config_custom(self, tmp_path):
         import json
+
         from opc_bridge.agent.service import load_config
 
         cfg_file = tmp_path / "custom.json"
@@ -569,12 +567,11 @@ class TestServiceAndPackaging:
         assert cfg["opc_prog_id"] == "Custom.ProgId.1"
 
     def test_offline_package_build(self, tmp_path):
-        import sys
         sys.path.insert(0, "packaging/windows")
         from build_package import build_package
 
         out_dir = str(tmp_path / "offline_bundle")
-        pkg_path = build_package(out_dir, create_zip=False)
+        build_package(out_dir, create_zip=False)
 
         assert (tmp_path / "offline_bundle" / "install.bat").exists()
         assert (tmp_path / "offline_bundle" / "uninstall.bat").exists()
@@ -585,7 +582,8 @@ class TestServiceAndPackaging:
 
 
 if __name__ == "__main__":
-    import pathlib, tempfile
+    import pathlib
+    import tempfile
     print("=" * 60)
     print("Running OPC DA Adapter & Supervised Adapter Test Suite")
     print("=" * 60)

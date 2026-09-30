@@ -6,7 +6,7 @@ from .supervisor import AgentSupervisor, ProcessWatchdog
 __all__ = [
     "AgentClient",
     "AgentSupervisor",
-    "ProcessWatchdog",
     "OpcBridgeWindowsService",
+    "ProcessWatchdog",
     "run_agent_main",
 ]

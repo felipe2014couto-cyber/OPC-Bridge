@@ -16,7 +16,6 @@ import time
 from typing import Any, Callable
 
 from opc_bridge.adapters.base import (
-    OPC_DS_CACHE,
     OPC_DS_DEVICE,
     OPC_QUALITY_BAD,
     OPC_QUALITY_GOOD,

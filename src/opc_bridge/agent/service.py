@@ -17,7 +17,6 @@ import logging
 import os
 import subprocess
 import sys
-import time
 from typing import Any
 
 from opc_bridge.adapters.supervised import SupervisedOpcAdapter
@@ -27,10 +26,10 @@ from opc_bridge.agent.supervisor import AgentSupervisor, configure_rotating_logg
 logger = logging.getLogger("opc_bridge.service")
 
 try:
+    import servicemanager
     import win32event
     import win32service
     import win32serviceutil
-    import servicemanager
 
     HAS_WIN32 = True
 except ImportError:
@@ -148,7 +147,7 @@ def run_agent_main(config: dict[str, Any], stop_event: asyncio.Event | None = No
         supervisor_task = asyncio.create_task(supervisor.run())
         if stop_event:
             stop_waiter = asyncio.create_task(stop_event.wait())
-            done, pending = await asyncio.wait(
+            _, pending = await asyncio.wait(
                 [supervisor_task, stop_waiter],
                 return_when=asyncio.FIRST_COMPLETED,
             )
@@ -213,7 +212,6 @@ else:
     class OpcBridgeWindowsService:  # type: ignore
         """Dummy fallback when pywin32 is not installed (e.g. Linux)."""
 
-        pass
 
 
 def main() -> None:
@@ -239,7 +237,7 @@ def main() -> None:
 
     if args.run:
         config = load_config(args.config)
-        print(f"Starting OPC-Bridge Agent in foreground console mode...")
+        print("Starting OPC-Bridge Agent in foreground console mode...")
         run_agent_main(config)
         return
 

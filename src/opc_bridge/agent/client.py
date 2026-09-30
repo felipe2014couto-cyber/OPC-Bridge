@@ -24,9 +24,11 @@ from opc_bridge.protocol import (
     HelloAckPayload,
     HelloPayload,
     ItemResult,
+    ItemStatus,
     MsgType,
     ReadRequestPayload,
     ReadResponsePayload,
+    ValueType,
     frame_message,
     unframe_message,
 )
