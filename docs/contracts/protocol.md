@@ -49,7 +49,54 @@ Versão inicial para prova de conceito com ABB.AfwOpcDaSurrogate.1.
 - TLS obrigatório; credenciais nunca em claro.
 - Sequências (seq) incrementais por direção; detecção de perda/duplicação.
 
+## Decisão de design: binário vs JSON
+A proposta inicial previa JSON com tamanho prefixado sobre TLS. A implementação
+adotou framing binário little-endian pelos seguintes motivos:
+1. **Desempenho**: a meta de 3.000 tags/s exige serialização/deserialização de
+   alta velocidade; `struct.pack/unpack` é ordens de magnitude mais rápido que
+   `json.dumps/loads` para payloads numéricos repetitivos.
+2. **Tamanho**: payloads binários são estimados em 3-5x menores que JSON
+   equivalente (medição reproduzível pendente), reduzindo largura de banda e
+   latência em redes industriais.
+3. **Tipos nativos**: valores OPC (i16, i32, f32, f64, bool) mapeiam diretamente
+   para formatos struct, evitando conversões de string e perda de precisão.
+4. **Determinismo**: sem ambiguidade de encoding JSON (whitespace, ordem de chaves),
+   facilitando testes de round-trip e depuração.
+5. **Compatibilidade**: Python 3.8+ suporta `struct` nativamente; sem dependências
+   externas adicionais.
+
+JSON permanece como opção futura para mensagens de configuração humana ou
+diagnóstico, mas não para o caminho crítico de leitura Device.
+
+## Requisitos preservados na implementação binária
+| Requisito | Status | Evidência |
+|-----------|--------|-----------|
+| Descoberta de OPC | Pendente | Requer adaptador real (T4) |
+| Browse de itens | Pendente | Requer adaptador real (T4) |
+| Validação de endereços | Pendente | Requer adaptador real (T4) |
+| Configuração versionada | ✅ Implementado | CONFIG_PUSH + CONFIG_ACK com config_version |
+| Leitura Device (sem cache) | ✅ Definido | requested_source=0 obrigatório em ItemRef; validado com adaptador simulado |
+| Qualidade original OPC | ✅ Implementado | quality (u16) em ItemResult |
+| Timestamp por item | ✅ Implementado | timestamp_us (u64) em ItemResult |
+| Tipos preservados | ✅ Implementado | ValueType enum + value_bytes em ItemResult |
+| Erros individuais por item | ✅ Implementado | status + error_code em ItemResult |
+| Lote de leituras | ✅ Implementado | ReadRequestPayload com items[] |
+| Duração da leitura | ✅ Implementado | duration_us em ReadResponsePayload |
+| Não acumular ciclos | ✅ Implementado | Regra de overrun + scheduler com descarte |
+| TLS obrigatório | ✅ Implementado | BridgeServer com ssl.SSLContext |
+| Sequências incrementais | ✅ Implementado | seq no Header, rastreado em AgentSession |
+
+## Testes de robustez implementados
+- [x] Mensagens fragmentadas (TCP split no meio do header/payload/trailer)
+- [x] Mensagens concatenadas (dois/três frames em um único buffer)
+- [x] Payload máximo (64KB string, 1000 itens em lote)
+- [x] Entrada malformada (CRC corrompido, length inconsistente, magic inválido)
+- [x] Sequências incrementais e limite u32
+- [ ] Timeout de leitura durante handshake (pendente)
+- [ ] Reconexão após desconexão abrupta (coberto parcialmente em test_agent_integration)
+
 ## Extensões futuras
 - Compressão de payload (flag).
 - Multiplexação de streams.
 - OPC UA transport mapping.
+- JSON alternativo para mensagens de diagnóstico/configuração humana.
