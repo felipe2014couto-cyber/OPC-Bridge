@@ -21,7 +21,11 @@ PINNED_DEPENDENCIES = [
 
 def build_package(output_dir: str, create_zip: bool = True) -> str:
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-    pkg_dir = os.path.abspath(output_dir)
+    norm = os.path.normpath(output_dir)
+    if os.path.basename(norm).lower() == "dist":
+        pkg_dir = os.path.abspath(os.path.join(norm, "opc-bridge-agent-windows-offline"))
+    else:
+        pkg_dir = os.path.abspath(output_dir)
 
     print(f"Building OPC-Bridge offline package in: {pkg_dir}")
     if os.path.exists(pkg_dir):
@@ -43,7 +47,7 @@ def build_package(output_dir: str, create_zip: bool = True) -> str:
     if os.path.exists(cfg_src):
         shutil.copy(cfg_src, os.path.join(config_dir, "agent.default.json"))
 
-    for bat in ["install.bat", "uninstall.bat", "run_foreground.bat"]:
+    for bat in ["install.bat", "uninstall.bat", "run_foreground.bat", "setup_config.py"]:
         bat_src = os.path.join(script_dir, bat)
         if os.path.exists(bat_src):
             shutil.copy(bat_src, os.path.join(pkg_dir, bat))
@@ -82,6 +86,14 @@ def build_package(output_dir: str, create_zip: bool = True) -> str:
     except Exception as exc:
         print(f"Could not download wheels automatically ({exc}); target machine can use existing wheels.")
 
+    # Ensure offline wheels are present from fallback if needed
+    if not os.listdir(wheels_dir):
+        fallback_wheels = os.path.join(base_dir, "dist", "opc-bridge-agent-windows-offline", "wheels")
+        if os.path.exists(fallback_wheels) and os.path.abspath(fallback_wheels) != os.path.abspath(wheels_dir):
+            for wf in os.listdir(fallback_wheels):
+                shutil.copy(os.path.join(fallback_wheels, wf), os.path.join(wheels_dir, wf))
+            print(f"Copied existing offline wheels from {fallback_wheels}")
+
     # 4. Create ZIP archive if requested
     if create_zip:
         zip_path = f"{pkg_dir}.zip"
@@ -111,7 +123,9 @@ def build_package(output_dir: str, create_zip: bool = True) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build offline Windows deployment package")
     parser.add_argument(
+        "--output-dir",
         "--output",
+        dest="output",
         default=os.path.join("dist", "opc-bridge-agent-windows-offline"),
         help="Target output directory",
     )

@@ -588,13 +588,6 @@ class OpcDaAdapter:
         if not valid_items:
             return results
 
-        # Simulated indefinite block in child process for watchdog deadline verification
-        for _, rec in valid_items:
-            if "BLOCK_INDEFINITELY" in str(rec.get("path", "")):
-                logger.warning("Simulated indefinite block triggered in COM read for item %s", rec.get("path"))
-                while True:
-                    time.sleep(1.0)
-
         native_group = group_data.get("native_group")
         if native_group is not None and hasattr(native_group, "SyncRead"):
             server_handles = [rec["server_handle"] for _, rec in valid_items]

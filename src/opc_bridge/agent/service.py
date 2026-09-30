@@ -49,24 +49,24 @@ def load_config(config_path: str | None = None) -> dict[str, Any]:
         "server_host": "127.0.0.1",
         "server_port": 8443,
         "agent_id": "opc-agent-windows-01",
-        "auth_token": "opc-bridge-secret-token",
-        "opc_prog_id": "ABB.AfwOpcDaSurrogate.1",
+        "auth_token": "",
+        "opc_prog_id": "",
         "update_rate_ms": 1000,
         "certfile": None,
         "log_file": "agent.log",
         "log_level": "INFO",
     }
 
-    search_paths = []
     if config_path:
-        search_paths.append(config_path)
-    if os.environ.get("OPC_BRIDGE_CONFIG"):
-        search_paths.append(os.environ["OPC_BRIDGE_CONFIG"])
-    search_paths.extend([
-        os.path.join(os.getcwd(), "config", "agent.json"),
-        os.path.join(os.getcwd(), "agent.json"),
-        os.path.join("C:\\ProgramData", "OPCBridge", "agent.json"),
-    ])
+        search_paths = [config_path]
+    elif os.environ.get("OPC_BRIDGE_CONFIG"):
+        search_paths = [os.environ["OPC_BRIDGE_CONFIG"]]
+    else:
+        search_paths = [
+            os.path.join(os.getcwd(), "config", "agent.json"),
+            os.path.join(os.getcwd(), "agent.json"),
+            os.path.join("C:\\ProgramData", "OPCBridge", "agent.json"),
+        ]
 
     for path in search_paths:
         if os.path.isfile(path):
@@ -80,6 +80,39 @@ def load_config(config_path: str | None = None) -> dict[str, Any]:
                 logger.warning("Failed to parse config file %s: %s", path, exc)
 
     return default_config
+
+
+def configure_service_account(service_name: str, account_name: str, password: str | None = None) -> bool:
+    """Configure Windows service logon credentials via Win32 API without command-line exposure."""
+    if sys.platform != "win32" or not HAS_WIN32:
+        return False
+    try:
+        hscm = win32service.OpenSCManager(None, None, win32service.SC_MANAGER_ALL_ACCESS)
+        try:
+            hs = win32service.OpenService(hscm, service_name, win32service.SERVICE_CHANGE_CONFIG)
+            try:
+                win32service.ChangeServiceConfig(
+                    hs,
+                    win32service.SERVICE_NO_CHANGE,
+                    win32service.SERVICE_NO_CHANGE,
+                    win32service.SERVICE_NO_CHANGE,
+                    None,
+                    None,
+                    0,
+                    None,
+                    account_name,
+                    password,
+                    None,
+                )
+                logger.info("Service '%s' logon account successfully updated via Win32 API", service_name)
+                return True
+            finally:
+                win32service.CloseServiceHandle(hs)
+        finally:
+            win32service.CloseServiceHandle(hscm)
+    except Exception as exc:
+        logger.error("Failed to configure service account for '%s': %s", service_name, exc)
+        return False
 
 
 def configure_service_recovery(service_name: str = SERVICE_NAME) -> bool:
@@ -114,6 +147,11 @@ def configure_service_recovery(service_name: str = SERVICE_NAME) -> bool:
 
 def run_agent_main(config: dict[str, Any], stop_event: asyncio.Event | None = None) -> None:
     """Core agent runtime loop using SupervisedOpcAdapter and AgentSupervisor."""
+    raw_token = config.get("auth_token")
+    if not raw_token:
+        logger.critical("Fatal: 'auth_token' is missing or empty in configuration. Failing closed.")
+        raise ValueError("auth_token is required to start OPC-Bridge Agent")
+
     log_file = config.get("log_file", "agent.log")
     log_level_name = config.get("log_level", "INFO").upper()
     log_level = getattr(logging, log_level_name, logging.INFO)
@@ -123,12 +161,15 @@ def run_agent_main(config: dict[str, Any], stop_event: asyncio.Event | None = No
         os.makedirs(log_dir, exist_ok=True)
 
     configure_rotating_logging(log_file, level=log_level)
-    logger.info("Starting OPC-Bridge Agent with config: %s", config)
+    safe_config = {
+        k: ("[REDACTED]" if any(s in k.lower() for s in ["token", "password", "secret", "key"]) else v)
+        for k, v in config.items()
+    }
+    logger.info("Starting OPC-Bridge Agent with config: %s", safe_config)
 
-    prog_id = config.get("opc_prog_id", "ABB.AfwOpcDaSurrogate.1")
+    prog_id = config.get("opc_prog_id") or None
     adapter = SupervisedOpcAdapter(prog_id=prog_id)
 
-    raw_token = config.get("auth_token", "default-token")
     auth_token_hash = hashlib.sha256(raw_token.encode("utf-8")).digest()
 
     def client_factory() -> AgentClient:

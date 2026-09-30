@@ -113,12 +113,6 @@ def main() -> None:
             elif op == "read_device":
                 group = msg["group"]
                 item_ids = msg["item_ids"]
-                # If block requested or BLOCK_INDEFINITELY item present, hang forever to test deadline reaping
-                simulate_block = msg.get("simulate_block", False)
-                if simulate_block or any("BLOCK_INDEFINITELY" in str(x) for x in item_ids):
-                    logger.warning("Simulated indefinite COM block triggered in child process; sleeping forever...")
-                    while True:
-                        time.sleep(1.0)
                 results = adapter.read_device(group, item_ids)
                 conn.send({"ok": True, "results": results})
             elif op == "browse_items":
@@ -135,11 +129,6 @@ def main() -> None:
                 # For testing crash recovery
                 logger.warning("Simulated crash requested; terminating abruptly.")
                 os._exit(42)
-            elif op == "block":
-                # For testing hang/timeout reaping
-                logger.warning("Simulated infinite hang requested; sleeping forever...")
-                while True:
-                    time.sleep(1.0)
             elif op == "exit":
                 logger.info("Graceful exit requested.")
                 running = False

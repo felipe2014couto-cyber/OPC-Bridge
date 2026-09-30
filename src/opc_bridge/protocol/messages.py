@@ -359,6 +359,7 @@ class ConfigPushPayload:
     config_version: int
     update_rate_ms: int
     items: list[ItemRef]
+    opc_prog_id: str = ""
 
     def pack(self) -> bytes:
         buf = bytearray()
@@ -367,6 +368,8 @@ class ConfigPushPayload:
         buf.extend(struct.pack("<H", len(self.items)))
         for item in self.items:
             buf.extend(item.pack())
+        if self.opc_prog_id:
+            buf.extend(encode_utf8(self.opc_prog_id))
         return bytes(buf)
 
     @classmethod
@@ -379,7 +382,15 @@ class ConfigPushPayload:
         for _ in range(count):
             item, off = ItemRef.unpack(data, off)
             items.append(item)
-        return cls(config_version=config_version, update_rate_ms=update_rate_ms, items=items)
+        opc_prog_id = ""
+        if off < len(data):
+            opc_prog_id, off = decode_utf8(data, off)
+        return cls(
+            config_version=config_version,
+            update_rate_ms=update_rate_ms,
+            items=items,
+            opc_prog_id=opc_prog_id,
+        )
 
 
 @dataclass

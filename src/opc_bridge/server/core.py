@@ -38,6 +38,7 @@ class ServerConfig:
     heartbeat_interval_ms: int = 5000
     default_update_rate_ms: int = 1000
     read_cycle_timeout_ms: int = 5000
+    opc_prog_id: str = ""
 
 
 @dataclass
@@ -163,6 +164,7 @@ class BridgeServer:
             config_version=self._config_version,
             update_rate_ms=self.config.default_update_rate_ms,
             items=self._config_items,
+            opc_prog_id=self.config.opc_prog_id,
         ).pack()
         for sid, session in list(self._sessions.items()):
             try:

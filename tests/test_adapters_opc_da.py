@@ -10,6 +10,8 @@ Tests the opc-adapter.md contract:
 """
 from __future__ import annotations
 
+import logging
+import os
 import struct
 import sys
 import time
@@ -468,7 +470,11 @@ class TestSupervisedOpcAdapter:
     def test_supervised_blocked_read_timeout_and_process_reaping(self):
         """A blocked COM read times out within deadline bound, kills and reaps child PID,
         and subsequent read starts a fresh child process returning a newly correlated value."""
-        adapter = SupervisedOpcAdapter(command_timeout=1.0)
+        os.environ["TEST_HANG_ON_READ"] = "1"
+        adapter = SupervisedOpcAdapter(
+            worker_module="tests.fake_blocking_worker",
+            command_timeout=1.0,
+        )
         try:
             adapter.connect("Simulated.OPC")
             assert adapter.is_alive
@@ -476,14 +482,14 @@ class TestSupervisedOpcAdapter:
             assert initial_pid is not None
 
             group = adapter.create_group("HangGroup", 100)
-            paths = ["Tag.Normal", "Tag.BLOCK_INDEFINITELY"]
+            paths = ["Tag.Normal", "Tag.Faulty"]
             mapping = adapter.add_items(group, paths)
             assert len(mapping) == 2
 
-            block_item_id = mapping["Tag.BLOCK_INDEFINITELY"]
+            block_item_id = mapping["Tag.Faulty"]
             normal_item_id = mapping["Tag.Normal"]
 
-            # 1. First read requests the item that blocks indefinitely in child process.
+            # 1. First read requests the item while TEST_HANG_ON_READ=1 in fake worker.
             # Enforce 0.5s deadline.
             start_time = time.monotonic()
             results = adapter.read_device(group, [block_item_id], timeout=0.5)
@@ -494,6 +500,9 @@ class TestSupervisedOpcAdapter:
             assert len(results) == 1
             assert results[0].status == ItemStatus.TIMEOUT
             assert results[0].error_code == 0x80040003
+
+            # Clear hang flag so subsequent child worker executes successfully
+            os.environ["TEST_HANG_ON_READ"] = "0"
 
             # 2. Subsequent requested simulated read must start a fresh child,
             # execute successfully, and return a new correlated value.
@@ -512,6 +521,7 @@ class TestSupervisedOpcAdapter:
             assert new_pid is not None
             assert new_pid != initial_pid, f"Child PID did not change after hang (still {initial_pid})"
         finally:
+            os.environ.pop("TEST_HANG_ON_READ", None)
             adapter.disconnect()
 
 
@@ -549,7 +559,8 @@ class TestServiceAndPackaging:
 
         cfg = load_config(str(tmp_path / "nonexistent.json"))
         assert cfg["server_host"] == "127.0.0.1"
-        assert cfg["opc_prog_id"] == "ABB.AfwOpcDaSurrogate.1"
+        assert cfg["opc_prog_id"] == ""
+        assert cfg["auth_token"] == ""
         assert cfg["update_rate_ms"] == 1000
 
     def test_load_config_custom(self, tmp_path):
@@ -559,12 +570,54 @@ class TestServiceAndPackaging:
 
         cfg_file = tmp_path / "custom.json"
         cfg_file.write_text(
-            json.dumps({"server_host": "192.168.1.50", "opc_prog_id": "Custom.ProgId.1"}),
+            json.dumps({"server_host": "192.168.1.50", "opc_prog_id": "Custom.ProgId.1", "auth_token": "my-token"}),
             encoding="utf-8",
         )
         cfg = load_config(str(cfg_file))
         assert cfg["server_host"] == "192.168.1.50"
         assert cfg["opc_prog_id"] == "Custom.ProgId.1"
+        assert cfg["auth_token"] == "my-token"
+
+    def test_service_logging_redacts_secrets(self, tmp_path):
+        import asyncio
+        from opc_bridge.agent.service import run_agent_main
+
+        log_file = tmp_path / "agent.log"
+        cfg = {
+            "server_host": "127.0.0.1",
+            "server_port": 8443,
+            "agent_id": "test-agent",
+            "auth_token": "super-secret-cleartext-token",
+            "opc_prog_id": "",
+            "log_file": str(log_file),
+            "log_level": "INFO",
+        }
+
+        stop_event = asyncio.Event()
+        stop_event.set()
+        run_agent_main(cfg, stop_event=stop_event)
+
+        log_content = log_file.read_text(encoding="utf-8")
+        assert "super-secret-cleartext-token" not in log_content
+        assert "[REDACTED]" in log_content
+
+        for handler in logging.root.handlers[:]:
+            handler.close()
+            logging.root.removeHandler(handler)
+
+    def test_setup_config_fails_closed_without_token(self, tmp_path):
+        import subprocess
+        cfg_file = tmp_path / "agent.json"
+        cmd = [
+            sys.executable,
+            "packaging/windows/setup_config.py",
+            "--config-file", str(cfg_file),
+            "--unattended",
+        ]
+        clean_env = {k: v for k, v in os.environ.items() if k != "OPC_AUTH_TOKEN"}
+        res = subprocess.run(cmd, env=clean_env, stdin=subprocess.DEVNULL, capture_output=True, text=True)
+        assert res.returncode != 0
+        assert not cfg_file.exists()
 
     def test_offline_package_build(self, tmp_path):
         sys.path.insert(0, "packaging/windows")
@@ -576,6 +629,7 @@ class TestServiceAndPackaging:
         assert (tmp_path / "offline_bundle" / "install.bat").exists()
         assert (tmp_path / "offline_bundle" / "uninstall.bat").exists()
         assert (tmp_path / "offline_bundle" / "run_foreground.bat").exists()
+        assert (tmp_path / "offline_bundle" / "setup_config.py").exists()
         assert (tmp_path / "offline_bundle" / "README_WINDOWS.md").exists()
         assert (tmp_path / "offline_bundle" / "config" / "agent.default.json").exists()
         assert (tmp_path / "offline_bundle" / "src" / "opc_bridge" / "adapters" / "da.py").exists()
@@ -632,10 +686,12 @@ if __name__ == "__main__":
         tsp = TestServiceAndPackaging()
         tsp.test_load_config_defaults(tmp_p)
         tsp.test_load_config_custom(tmp_p)
+        tsp.test_service_logging_redacts_secrets(tmp_p)
+        tsp.test_setup_config_fails_closed_without_token(tmp_p)
         tsp.test_offline_package_build(tmp_p)
     print("[PASS] TestServiceAndPackaging")
 
     print("=" * 60)
-    print("ALL 17 OPC DA & SUPERVISION TESTS PASSED SUCCESSFULLY!")
+    print("ALL 19 OPC DA & SUPERVISION TESTS PASSED SUCCESSFULLY!")
     print("=" * 60)
 

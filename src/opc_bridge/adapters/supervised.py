@@ -34,10 +34,12 @@ class SupervisedOpcAdapter:
         self,
         prog_id: str | None = None,
         worker_executable: str | None = None,
+        worker_module: str = "opc_bridge.adapters.da_worker",
         command_timeout: float = 10.0,
         connect_timeout: float = 15.0,
     ) -> None:
         self.worker_executable = worker_executable or sys.executable
+        self.worker_module = worker_module
         self.command_timeout = command_timeout
         self.connect_timeout = connect_timeout
         self._prog_id = prog_id
@@ -77,7 +79,7 @@ class SupervisedOpcAdapter:
         cmd = [
             self.worker_executable,
             "-m",
-            "opc_bridge.adapters.da_worker",
+            self.worker_module,
             "--pipe",
             pipe_arg,
         ]

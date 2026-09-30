@@ -24,11 +24,9 @@ from opc_bridge.protocol import (
     HelloAckPayload,
     HelloPayload,
     ItemResult,
-    ItemStatus,
     MsgType,
     ReadRequestPayload,
     ReadResponsePayload,
-    ValueType,
     frame_message,
     unframe_message,
 )
@@ -212,11 +210,20 @@ class AgentClient:
             self._item_mapping = {
                 item.item_id: item.opc_item_path for item in cfg.items
             }
+            # Connect or switch ProgID if specified by central server
+            if cfg.opc_prog_id and hasattr(self._adapter, "connect"):
+                logger.info("Connecting/switching adapter to central ProgID: %s", cfg.opc_prog_id)
+                try:
+                    self._adapter.connect(cfg.opc_prog_id)
+                except Exception as exc:
+                    logger.warning("Failed to connect to central ProgID %s: %s", cfg.opc_prog_id, exc)
+
             logger.info(
-                "Config v%d applied: %d items, rate=%dms",
+                "Config v%d applied: %d items, rate=%dms, prog_id=%s",
                 cfg.config_version,
                 len(cfg.items),
                 cfg.update_rate_ms,
+                cfg.opc_prog_id,
             )
             # Automatically configure adapter group if not set manually
             if self._group_handle is None and hasattr(self._adapter, "create_group"):
