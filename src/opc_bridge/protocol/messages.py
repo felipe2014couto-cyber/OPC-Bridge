@@ -385,6 +385,8 @@ class ConfigPushPayload:
         opc_prog_id = ""
         if off < len(data):
             opc_prog_id, off = decode_utf8(data, off)
+        if off != len(data):
+            raise ValueError("Trailing bytes in CONFIG_PUSH")
         return cls(
             config_version=config_version,
             update_rate_ms=update_rate_ms,

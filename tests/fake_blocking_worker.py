@@ -39,24 +39,24 @@ def main() -> None:
     logger.info("Connecting fake test worker to supervisor at %s...", address)
     try:
         conn = Client(address, family=family, authkey=IPC_AUTHKEY)
-    except Exception as exc:
-        logger.exception("Fake worker connection failed: %s", exc)
+    except Exception:
+        logger.exception("Fake worker connection failed")
         sys.exit(1)
 
-    from opc_bridge.adapters.da import OpcDaAdapter
+    from opc_bridge.adapters.da import DevelopmentComServer, OpcDaAdapter
 
-    adapter = OpcDaAdapter(default_prog_id=args.prog_id)
+    adapter = OpcDaAdapter(default_prog_id=args.prog_id, com_factory=DevelopmentComServer)
     if args.prog_id:
         try:
             adapter.connect(args.prog_id)
         except Exception:
-            pass
+            logger.debug("Fake worker adapter initialization failed", exc_info=True)
 
     running = True
     while running:
         try:
             msg = conn.recv()
-        except Exception:
+        except Exception:  # noqa: BLE001 - best-effort provider cleanup.
             break
 
         op = msg.get("op")
@@ -106,13 +106,13 @@ def main() -> None:
                 break
             else:
                 conn.send({"ok": False, "error": f"Unknown op: {op}"})
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - provider-specific exception boundary.
             conn.send({"ok": False, "error": str(exc), "type": type(exc).__name__})
 
     try:
         conn.close()
     except Exception:
-        pass
+        logger.debug("Fake worker IPC close failed", exc_info=True)
 
 
 if __name__ == "__main__":

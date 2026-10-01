@@ -111,7 +111,7 @@ class SupervisedOpcAdapter:
 
         try:
             # Wait for child to connect with timeout
-            if not listener._listener._socket.fileno() == -1:
+            if listener._listener._socket.fileno() != -1:
                 self._conn = listener.accept()
                 logger.info("OPC worker connected successfully pid=%s", self._process.pid)
             else:
@@ -128,7 +128,7 @@ class SupervisedOpcAdapter:
             try:
                 self._conn.close()
             except Exception:
-                pass
+                logger.debug("IPC connection close failed", exc_info=True)
             self._conn = None
 
         if self._process is not None:
@@ -138,7 +138,7 @@ class SupervisedOpcAdapter:
                     logger.info("Forcibly killing and reaping child process pid=%s", pid)
                     self._process.kill()
                     self._process.wait(timeout=2.0)
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - provider-specific exception boundary.
                     logger.debug("Error killing/reaping child process pid=%s: %s", pid, exc)
             self._process = None
 
@@ -237,7 +237,7 @@ class SupervisedOpcAdapter:
         if not self.is_alive:
             self._start_worker()
 
-        resp = self._execute({"op": "connect", "prog_id": prog_id}, timeout=self.connect_timeout)
+        self._execute({"op": "connect", "prog_id": prog_id}, timeout=self.connect_timeout)
         self._connected = True
 
     def disconnect(self) -> None:
@@ -247,7 +247,7 @@ class SupervisedOpcAdapter:
                 self._send_raw({"op": "disconnect"}, timeout=3.0)
                 self._send_raw({"op": "exit"}, timeout=2.0)
             except Exception:
-                pass
+                logger.debug("Worker disconnect failed", exc_info=True)
 
         self._cleanup_process()
         self._connected = False
@@ -340,7 +340,7 @@ class SupervisedOpcAdapter:
                 )
                 for iid in item_ids
             ]
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - provider-specific exception boundary.
             logger.error("read_device failed: %s", exc)
             return [
                 ItemResult(
@@ -376,7 +376,7 @@ class SupervisedOpcAdapter:
             try:
                 self._conn.send({"op": "crash"})
             except Exception:
-                pass
+                logger.debug("Crash injection IPC send failed", exc_info=True)
             time.sleep(0.05)
 
     def simulate_block(self) -> None:
@@ -385,4 +385,4 @@ class SupervisedOpcAdapter:
             try:
                 self._conn.send({"op": "block"})
             except Exception:
-                pass
+                logger.debug("Block injection IPC send failed", exc_info=True)

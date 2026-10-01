@@ -76,7 +76,7 @@ def load_config(config_path: str | None = None) -> dict[str, Any]:
                     default_config.update(user_cfg)
                 logger.info("Loaded configuration from %s", path)
                 break
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - provider-specific exception boundary.
                 logger.warning("Failed to parse config file %s: %s", path, exc)
 
     return default_config
@@ -110,7 +110,7 @@ def configure_service_account(service_name: str, account_name: str, password: st
                 win32service.CloseServiceHandle(hs)
         finally:
             win32service.CloseServiceHandle(hscm)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - provider-specific exception boundary.
         logger.error("Failed to configure service account for '%s': %s", service_name, exc)
         return False
 
@@ -140,7 +140,7 @@ def configure_service_recovery(service_name: str = SERVICE_NAME) -> bool:
         else:
             logger.warning("sc.exe failure returned non-zero code: %s", res.stderr.strip())
             return False
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - provider-specific exception boundary.
         logger.warning("Failed to configure service recovery via sc.exe: %s", exc)
         return False
 
@@ -179,6 +179,8 @@ def run_agent_main(config: dict[str, Any], stop_event: asyncio.Event | None = No
             agent_id=config["agent_id"],
             auth_token_hash=auth_token_hash,
             adapter=adapter,
+            adapter_factory=SupervisedOpcAdapter,
+            server_hostname=config.get("server_hostname"),
             certfile=config.get("certfile"),
         )
 
@@ -206,7 +208,7 @@ def run_agent_main(config: dict[str, Any], stop_event: asyncio.Event | None = No
         try:
             adapter.disconnect()
         except Exception:
-            pass
+            logger.debug("Agent adapter shutdown failed", exc_info=True)
         logger.info("Agent stopped cleanly.")
 
 
@@ -240,7 +242,7 @@ if HAS_WIN32:
                     (self._svc_name_, ""),
                 )
             except Exception:
-                pass
+                logger.debug("Windows service start event logging failed", exc_info=True)
             logger.info("Windows Service %s started.", self._svc_name_)
             config = load_config()
             run_agent_main(config, stop_event=self._async_stop_event)
@@ -251,7 +253,7 @@ if HAS_WIN32:
                     (self._svc_name_, ""),
                 )
             except Exception:
-                pass
+                logger.debug("Windows service stop event logging failed", exc_info=True)
             logger.info("Windows Service %s stopped.", self._svc_name_)
 
 else:

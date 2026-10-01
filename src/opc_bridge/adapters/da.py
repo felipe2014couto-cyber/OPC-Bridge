@@ -325,7 +325,7 @@ class OpcDaAdapter:
                                 break
                 except OSError:
                     pass
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - provider-specific exception boundary.
                 logger.warning("Registry discovery encountered error: %s", exc)
 
         return sorted(servers)
@@ -348,24 +348,17 @@ class OpcDaAdapter:
             if self.com_factory is not None:
                 self._server = self.com_factory()
             elif sys.platform == "win32":
-                try:
-                    import pythoncom
-                    import win32com.client
+                import pythoncom
+                import win32com.client
 
-                    pythoncom.CoInitialize()
-                    try:
-                        self._server = win32com.client.Dispatch("OPCAutomation.OPCServer")
-                    except Exception:
-                        self._server = win32com.client.Dispatch(prog_id)
-                except Exception as com_err:
-                    logger.warning("Windows COM initialization failed: %s; falling back to development server", com_err)
-                    self._server = DevelopmentComServer()
+                pythoncom.CoInitialize()
+                self._server = win32com.client.Dispatch("OPCAutomation.OPCServer")
             else:
-                logger.info("Non-Windows platform detected; using development OPC server fallback")
-                self._server = DevelopmentComServer()
+                raise RuntimeError("Production OPC DA requires Windows COM")
 
-            if hasattr(self._server, "Connect"):
-                self._server.Connect(prog_id)
+            if not hasattr(self._server, "Connect") or not hasattr(self._server, "OPCGroups"):
+                raise RuntimeError("OPC Automation server interface is unavailable")
+            self._server.Connect(prog_id)
 
             self._connected = True
             self._start_time = time.time()
@@ -378,7 +371,7 @@ class OpcDaAdapter:
         except Exception as exc:
             self._connected = False
             self._server = None
-            logger.exception("Failed to connect to OPC DA server %s: %s", prog_id, exc)
+            logger.exception("Failed to connect to OPC DA server %s", prog_id)
             raise ConnectionError(f"Could not connect to OPC DA server '{prog_id}': {exc}") from exc
 
     def disconnect(self) -> None:
@@ -390,7 +383,7 @@ class OpcDaAdapter:
         for group_name in list(self._groups.keys()):
             try:
                 self._remove_group_internal(group_name)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - provider-specific exception boundary.
                 logger.debug("Error releasing group %s: %s", group_name, exc)
         self._groups.clear()
 
@@ -398,7 +391,7 @@ class OpcDaAdapter:
             try:
                 if hasattr(self._server, "Disconnect"):
                     self._server.Disconnect()
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - provider-specific exception boundary.
                 logger.debug("Error disconnecting COM server: %s", exc)
             self._server = None
 
@@ -407,7 +400,7 @@ class OpcDaAdapter:
                 import pythoncom
                 pythoncom.CoUninitialize()
             except Exception:
-                pass
+                logger.debug("Best-effort COM cleanup failed", exc_info=True)
 
         self._connected = False
         self.prog_id = None
@@ -423,6 +416,8 @@ class OpcDaAdapter:
 
         self._group_counter += 1
         native_group = None
+        if not hasattr(self._server, "OPCGroups"):
+            raise RuntimeError("OPC group interface is unavailable")
         if hasattr(self._server, "OPCGroups"):
             opc_groups = self._server.OPCGroups
             try:
@@ -453,7 +448,7 @@ class OpcDaAdapter:
         if native_group is not None and hasattr(self._server, "OPCGroups"):
             try:
                 self._server.OPCGroups.Remove(native_group)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - provider-specific exception boundary.
                 logger.debug("Error removing group %s from OPCGroups: %s", name, exc)
 
     def remove_group(self, handle: GroupHandle) -> None:
@@ -474,6 +469,9 @@ class OpcDaAdapter:
         native_group = group_data.get("native_group")
         opc_items = getattr(native_group, "OPCItems", None) if native_group else None
 
+        if opc_items is None:
+            raise RuntimeError("OPC item registration interface is unavailable")
+
         result_mapping: dict[str, int] = {}
         for path in item_paths:
             if path in group_data["id_by_path"]:
@@ -490,7 +488,7 @@ class OpcDaAdapter:
                     native_item = opc_items.AddItem(path, item_id)
                     server_handle = getattr(native_item, "ServerHandle", item_id)
                 except Exception as exc:
-                    logger.warning("Failed to add OPC item '%s': %s", path, exc)
+                    raise RuntimeError(f"Failed to add OPC item {path!r}: {exc}") from exc
 
             record = {
                 "item_id": item_id,
@@ -525,7 +523,7 @@ class OpcDaAdapter:
             try:
                 if hasattr(opc_items, "Remove"):
                     opc_items.Remove(len(server_handles_to_remove), server_handles_to_remove)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - provider-specific exception boundary.
                 logger.debug("Error removing items from OPCItems: %s", exc)
 
     def validate_items(self, item_paths: list[str]) -> dict[str, bool]:
@@ -632,7 +630,7 @@ class OpcDaAdapter:
                         )
                     )
                 return results
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - provider-specific exception boundary.
                 logger.error("COM SyncRead failed on group %s: %s", group_name, exc)
                 for iid, _ in valid_items:
                     results.append(
@@ -648,19 +646,16 @@ class OpcDaAdapter:
                     )
                 return results
 
-        if hasattr(self._server, "read_device"):
-            return self._server.read_device(group, item_ids)
-
-        for iid, record in valid_items:
+        for iid, _ in valid_items:
             results.append(
                 ItemResult(
                     item_id=iid,
-                    status=ItemStatus.OK,
-                    value_type=ValueType.F64,
-                    quality=OPC_QUALITY_GOOD,
+                    status=ItemStatus.ERROR,
+                    value_type=ValueType.BLOB,
+                    quality=OPC_QUALITY_BAD,
                     timestamp_us=now_us,
-                    value=struct.pack("<d", 0.0),
-                    error_code=0,
+                    value=b"",
+                    error_code=OPC_E_INVALIDHANDLE,
                 )
             )
 
@@ -707,7 +702,7 @@ class OpcDaAdapter:
                             )
                         )
                 return entries
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - provider-specific exception boundary.
                 logger.warning("Browse using CreateBrowser failed: %s", exc)
 
         if hasattr(self._server, "browse_items"):
@@ -733,7 +728,7 @@ class OpcDaAdapter:
                 }
                 state = state_map.get(raw_state, OPC_STATUS_RUNNING)
             except Exception:
-                pass
+                logger.debug("Could not query OPC server status", exc_info=True)
 
         return ServerStatus(
             state=state,

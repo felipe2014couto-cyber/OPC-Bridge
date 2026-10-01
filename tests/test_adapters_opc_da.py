@@ -420,7 +420,7 @@ class TestSupervisedOpcAdapter:
 
     def test_supervised_basic_lifecycle(self):
         """Supervised adapter starts worker, executes commands, and shuts down."""
-        adapter = SupervisedOpcAdapter()
+        adapter = SupervisedOpcAdapter(worker_module="tests.fake_blocking_worker")
         try:
             adapter.connect("Simulated.OPC")
             assert adapter.is_alive
@@ -441,7 +441,7 @@ class TestSupervisedOpcAdapter:
 
     def test_supervised_crash_recovery(self):
         """Supervised adapter automatically restarts worker and restores state after crash."""
-        adapter = SupervisedOpcAdapter()
+        adapter = SupervisedOpcAdapter(worker_module="tests.fake_blocking_worker")
         try:
             adapter.connect("RecoverTest.OPC")
             assert adapter.is_alive
@@ -580,6 +580,7 @@ class TestServiceAndPackaging:
 
     def test_service_logging_redacts_secrets(self, tmp_path):
         import asyncio
+
         from opc_bridge.agent.service import run_agent_main
 
         log_file = tmp_path / "agent.log"
@@ -615,7 +616,7 @@ class TestServiceAndPackaging:
             "--unattended",
         ]
         clean_env = {k: v for k, v in os.environ.items() if k != "OPC_AUTH_TOKEN"}
-        res = subprocess.run(cmd, env=clean_env, stdin=subprocess.DEVNULL, capture_output=True, text=True)
+        res = subprocess.run(cmd, env=clean_env, stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False)
         assert res.returncode != 0
         assert not cfg_file.exists()
 

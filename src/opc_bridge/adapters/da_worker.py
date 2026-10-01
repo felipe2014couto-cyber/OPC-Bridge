@@ -46,8 +46,8 @@ def main() -> None:
     try:
         conn = Client(address, family=family, authkey=IPC_AUTHKEY)
         logger.info("Connected to supervisor successfully.")
-    except Exception as exc:
-        logger.exception("Failed to connect to supervisor: %s", exc)
+    except Exception:
+        logger.exception("Failed to connect to supervisor")
         sys.exit(1)
 
     # Initialize COM if on Windows
@@ -56,7 +56,7 @@ def main() -> None:
             import pythoncom
             pythoncom.CoInitialize()
             logger.info("COM CoInitialize() completed in worker process.")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - provider-specific exception boundary.
             logger.warning("Could not initialize COM in worker: %s", exc)
 
     from opc_bridge.adapters.da import OpcDaAdapter
@@ -65,7 +65,7 @@ def main() -> None:
     if args.prog_id:
         try:
             adapter.connect(args.prog_id)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - provider-specific exception boundary.
             logger.warning("Initial connect to %s failed: %s", args.prog_id, exc)
 
     # Main command processing loop
@@ -76,8 +76,8 @@ def main() -> None:
         except (EOFError, BrokenPipeError, ConnectionResetError):
             logger.info("Supervisor closed connection. Exiting.")
             break
-        except Exception as exc:
-            logger.exception("Error receiving command: %s", exc)
+        except Exception:
+            logger.exception("Error receiving command")
             break
 
         op = msg.get("op")
@@ -137,25 +137,25 @@ def main() -> None:
             else:
                 conn.send({"ok": False, "error": f"Unknown operation: {op}"})
         except Exception as exc:
-            logger.exception("Error executing operation '%s': %s", op, exc)
+            logger.exception("Error executing operation %r", op)
             conn.send({"ok": False, "error": str(exc), "type": type(exc).__name__})
 
     try:
         adapter.disconnect()
     except Exception:
-        pass
+        logger.debug("Worker adapter cleanup failed", exc_info=True)
 
     if sys.platform == "win32":
         try:
             import pythoncom
             pythoncom.CoUninitialize()
         except Exception:
-            pass
+            logger.debug("Worker COM uninitialization failed", exc_info=True)
 
     try:
         conn.close()
     except Exception:
-        pass
+        logger.debug("Worker IPC close failed", exc_info=True)
     logger.info("OPC Worker process stopped.")
 
 

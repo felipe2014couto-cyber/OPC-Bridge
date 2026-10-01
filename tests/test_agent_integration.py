@@ -4,6 +4,7 @@ Validates the complete flow without real ABB hardware.
 from __future__ import annotations
 
 import asyncio
+import ssl
 import subprocess
 import time
 from pathlib import Path
@@ -13,9 +14,12 @@ import pytest
 from opc_bridge.adapters.simulated import SimulatedOpcAdapter
 from opc_bridge.agent.client import AgentClient
 from opc_bridge.protocol import (
+    ConfigAckPayload,
+    ConfigPushPayload,
     ItemRef,
     MsgType,
     ReadRequestPayload,
+    ReadResponsePayload,
 )
 from opc_bridge.server import BridgeServer, ServerConfig
 
@@ -30,6 +34,7 @@ def tls_certs(tmp_path: Path):
             "openssl", "req", "-x509", "-newkey", "rsa:2048",
             "-keyout", str(keyfile), "-out", str(certfile),
             "-days", "1", "-nodes", "-subj", "/CN=localhost",
+            "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1",
         ],
         check=True, capture_output=True,
     )
@@ -96,6 +101,9 @@ class TestFullFlowNormalRead:
 
         # Push config from server
         await srv.push_config_to_all()
+        await client._handle_config_push(
+            ConfigPushPayload(1, 1000, srv._config_items).pack()
+        )
         await asyncio.sleep(0.2)
 
         # Send READ_REQUEST from server side by injecting into message loop
@@ -117,6 +125,128 @@ class TestFullFlowNormalRead:
         await client.disconnect()
         adapter.disconnect()
 
+
+class RecordingAdapter(SimulatedOpcAdapter):
+    def __init__(self, fail_path: str | None = None) -> None:
+        super().__init__(read_latency_us=0)
+        self.fail_path = fail_path
+        self.disconnected = False
+        self.seen_read_ids: list[int] = []
+
+    def add_items(self, group, item_paths):
+        if self.fail_path and self.fail_path in item_paths:
+            raise RuntimeError("simulated item registration failure")
+        return super().add_items(group, item_paths)
+
+    def read_device(self, group, item_ids):
+        self.seen_read_ids.extend(item_ids)
+        return super().read_device(group, item_ids)
+
+    def disconnect(self):
+        self.disconnected = True
+        super().disconnect()
+
+
+class TestConfigPushRegression:
+    @pytest.mark.asyncio
+    async def test_ack_only_after_complete_apply_and_maps_central_ids(self):
+        adapter = RecordingAdapter()
+        adapter.connect("Simulated.OPC")
+        client = AgentClient("localhost", 0, "agent", b"x" * 32, adapter)
+        sent = []
+
+        async def capture_send(msg_type, payload):
+            sent.append((msg_type, payload))
+
+        client._send = capture_send
+        cfg = ConfigPushPayload(
+            1, 1000, [ItemRef(41, "Simulated.Temperature", 0)]
+        )
+        await client._handle_config_push(cfg.pack())
+
+        assert ConfigAckPayload.unpack(sent[-1][1]).applied
+        native_id = client._native_ids[41]
+        assert native_id != 41
+        await client._handle_read_request(
+            ReadRequestPayload(9, [ItemRef(41, "Simulated.Temperature", 0)]).pack()
+        )
+        response = ReadResponsePayload.unpack(sent[-1][1])
+        assert adapter.seen_read_ids == [native_id]
+        assert response.results[0].item_id == 41
+
+    @pytest.mark.asyncio
+    async def test_failed_candidate_keeps_active_adapter_config_and_group(self):
+        active = RecordingAdapter()
+        active.connect("Active.OPC")
+        client = AgentClient(
+            "localhost", 0, "agent", b"x" * 32, active,
+            adapter_factory=lambda: RecordingAdapter(fail_path="Missing.Tag"),
+        )
+        sent = []
+
+        async def capture_send(msg_type, payload):
+            sent.append((msg_type, payload))
+
+        client._send = capture_send
+        original = ConfigPushPayload(1, 1000, [ItemRef(7, "Good.Tag", 0)])
+        await client._handle_config_push(original.pack())
+        old_group = client._group_handle
+        candidate = None
+
+        def new_candidate():
+            nonlocal candidate
+            candidate = RecordingAdapter(fail_path="Missing.Tag")
+            return candidate
+
+        client._adapter_factory = new_candidate
+        rejected = ConfigPushPayload(2, 500, [ItemRef(8, "Missing.Tag", 0)], "Other.OPC")
+        await client._handle_config_push(rejected.pack())
+
+        assert not ConfigAckPayload.unpack(sent[-1][1]).applied
+        assert client._adapter is active
+        assert client._group_handle is old_group
+        assert client._active_config == original
+        assert client.config_version == 1
+        assert candidate is not None and candidate.disconnected
+        assert not active.disconnected
+
+    @pytest.mark.asyncio
+    async def test_prog_id_switch_prepares_candidate_before_disconnect(self):
+        active = RecordingAdapter()
+        active.connect("Active.OPC")
+        events = []
+        active.disconnect = lambda: events.append("old-disconnect")
+
+        class Candidate(RecordingAdapter):
+            def connect(self, prog_id):
+                events.append("candidate-connect")
+                super().connect(prog_id)
+
+            def add_items(self, group, item_paths):
+                events.append("candidate-add")
+                return super().add_items(group, item_paths)
+
+        client = AgentClient(
+            "localhost", 0, "agent", b"x" * 32, active,
+            adapter_factory=Candidate,
+        )
+        client._send = _async_noop
+        await client._handle_config_push(
+            ConfigPushPayload(1, 1000, [ItemRef(1, "Tag", 0)], "New.OPC").pack()
+        )
+        assert events == ["candidate-connect", "candidate-add", "old-disconnect"]
+
+
+async def _async_noop(*args, **kwargs):
+    pass
+
+
+async def _wait_for_cycles(server, count):
+    while server.read_metrics.cycles < count:
+        await asyncio.sleep(0.005)
+
+
+class TestSchedulingRegression:
     @pytest.mark.asyncio
     async def test_server_schedules_correlated_cycles_for_simulated_agent(self, server_with_config):
         srv, port, token_hash, certfile = server_with_config
@@ -202,11 +332,6 @@ class TestFullFlowNormalRead:
             adapter.disconnect()
 
 
-async def _wait_for_cycles(server, count):
-    while server.read_metrics.cycles < count:
-        await asyncio.sleep(0.005)
-
-
 class TestPartialError:
     """Some items succeed, others fail — all reported individually."""
 
@@ -233,6 +358,9 @@ class TestPartialError:
 
         await client.connect()
         await srv.push_config_to_all()
+        await client._handle_config_push(
+            ConfigPushPayload(1, 1000, srv._config_items).pack()
+        )
         await asyncio.sleep(0.2)
 
         # Request one valid + one invalid item
@@ -276,6 +404,9 @@ class TestSlowRead:
 
         await client.connect()
         await srv.push_config_to_all()
+        await client._handle_config_push(
+            ConfigPushPayload(1, 1000, srv._config_items).pack()
+        )
         await asyncio.sleep(0.2)
 
         start = time.monotonic()
@@ -353,7 +484,7 @@ class TestDisconnectReconnect:
             port = srv._server.sockets[0].getsockname()[1]
             adapter = SimulatedOpcAdapter()
             client = AgentClient("127.0.0.1", port, "timeout-agent", auth_token_hash,
-                                 adapter, heartbeat_timeout=0.1)
+                                 adapter, certfile=certfile, heartbeat_timeout=0.1)
             await client.connect()
             client._heartbeat_timeout = 0.1
             session = next(iter(srv.sessions.values()))
@@ -370,6 +501,61 @@ class TestDisconnectReconnect:
                 assert not client.is_connected
             finally:
                 await client.disconnect()
+                await srv.stop()
+
+        asyncio.run(scenario())
+
+    def test_tls_rejects_untrusted_ca_and_hostname_mismatch(self, tls_certs, auth_token_hash):
+        certfile, keyfile = tls_certs
+
+        async def scenario(server_hostname):
+            srv = BridgeServer(ServerConfig(
+                host="127.0.0.1", port=0, certfile=certfile, keyfile=keyfile,
+                auth_token_hash=auth_token_hash,
+            ))
+            await srv.start()
+            port = srv._server.sockets[0].getsockname()[1]
+            try:
+                client = AgentClient(
+                    "127.0.0.1", port, "tls-agent", auth_token_hash,
+                    SimulatedOpcAdapter(), certfile=certfile,
+                    server_hostname=server_hostname,
+                )
+                with pytest.raises(ssl.SSLCertVerificationError):
+                    await client.connect()
+            finally:
+                await srv.stop()
+
+        asyncio.run(scenario("wrong-host.invalid"))
+
+    def test_tls_rejects_untrusted_certificate(self, tls_certs, auth_token_hash, tmp_path):
+        certfile, keyfile = tls_certs
+        unrelated_ca = tmp_path / "unrelated.pem"
+        subprocess.run(
+            [
+                "openssl", "req", "-x509", "-newkey", "rsa:2048",
+                "-keyout", str(tmp_path / "unrelated-key.pem"),
+                "-out", str(unrelated_ca), "-days", "1", "-nodes",
+                "-subj", "/CN=unrelated",
+            ],
+            check=True, capture_output=True,
+        )
+
+        async def scenario():
+            srv = BridgeServer(ServerConfig(
+                host="127.0.0.1", port=0, certfile=certfile, keyfile=keyfile,
+                auth_token_hash=auth_token_hash,
+            ))
+            await srv.start()
+            port = srv._server.sockets[0].getsockname()[1]
+            try:
+                client = AgentClient(
+                    "127.0.0.1", port, "tls-agent", auth_token_hash,
+                    SimulatedOpcAdapter(), certfile=str(unrelated_ca),
+                )
+                with pytest.raises(ssl.SSLCertVerificationError):
+                    await client.connect()
+            finally:
                 await srv.stop()
 
         asyncio.run(scenario())
@@ -400,6 +586,9 @@ class TestNoCacheEnforcement:
 
         await client.connect()
         await srv.push_config_to_all()
+        await client._handle_config_push(
+            ConfigPushPayload(1, 1000, srv._config_items).pack()
+        )
         await asyncio.sleep(0.2)
 
         # Two consecutive reads

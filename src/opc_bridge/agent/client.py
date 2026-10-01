@@ -9,9 +9,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import ssl
+import struct
 import time
-from typing import Protocol
+from dataclasses import replace
+from typing import Callable
 
+from opc_bridge.adapters.base import OpcAdapter
 from opc_bridge.protocol import (
     HEADER_SIZE,
     TRAILER_SIZE,
@@ -24,23 +27,16 @@ from opc_bridge.protocol import (
     HelloAckPayload,
     HelloPayload,
     ItemResult,
+    ItemStatus,
     MsgType,
     ReadRequestPayload,
     ReadResponsePayload,
+    ValueType,
     frame_message,
     unframe_message,
 )
 
 logger = logging.getLogger(__name__)
-
-
-class OpcAdapter(Protocol):
-    """Protocol for OPC adapters (simulated or real COM)."""
-
-    def connect(self, prog_id: str) -> None: ...
-    def disconnect(self) -> None: ...
-    def read_device(self, group: object, item_ids: list[int]) -> list[ItemResult]: ...
-
 
 class AgentClient:
     """TLS client that connects to the OPC-Bridge central server."""
@@ -54,13 +50,20 @@ class AgentClient:
         adapter: OpcAdapter,
         certfile: str | None = None,
         heartbeat_timeout: float = 30.0,
+        adapter_factory: Callable[[], OpcAdapter] | None = None,
+        server_hostname: str | None = None,
     ) -> None:
         self._host = server_host
         self._port = server_port
         self._agent_id = agent_id
         self._auth_token_hash = auth_token_hash
         self._adapter = adapter
-        self._certfile = certfile
+        self._certfile = certfile  # Trusted CA bundle (legacy option name).
+        self._server_hostname = server_hostname or server_host
+        self._adapter_factory = adapter_factory
+        self._active_config: ConfigPushPayload | None = None
+        self._native_ids: dict[int, int] = {}
+        self._config_attempt = 0
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._session_id: str | None = None
@@ -94,15 +97,9 @@ class AgentClient:
 
     async def connect(self) -> None:
         """Establish TLS connection and perform handshake."""
-        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        ssl_ctx.check_hostname = False
-        ssl_ctx.verify_mode = ssl.CERT_NONE
-        # NOTE: In production, load the CA bundle and enable verification.
-        # For testing with self-signed certs (CN mismatch on 127.0.0.1),
-        # verification is disabled to match server test fixtures.
-
+        ssl_ctx = ssl.create_default_context(cafile=self._certfile or None)
         self._reader, self._writer = await asyncio.open_connection(
-            self._host, self._port, ssl=ssl_ctx
+            self._host, self._port, ssl=ssl_ctx, server_hostname=self._server_hostname
         )
         logger.info("Connected to %s:%d", self._host, self._port)
 
@@ -203,102 +200,116 @@ class AgentClient:
 
     async def _handle_config_push(self, payload: bytes) -> None:
         """Process CONFIG_PUSH and send CONFIG_ACK."""
-        cfg = ConfigPushPayload.unpack(payload)
-        applied = True
+        # Even a malformed body can be rejected with its version when available.
+        if len(payload) < 4:
+            raise ValueError("CONFIG_PUSH has no configuration version")
+        version = struct.unpack_from("<I", payload)[0]
+        candidate = self._adapter
+        staged_group = None
+        applied = False
         try:
-            self._config_version = cfg.config_version
-            self._item_mapping = {
-                item.item_id: item.opc_item_path for item in cfg.items
-            }
-            # Connect or switch ProgID if specified by central server
-            if cfg.opc_prog_id and hasattr(self._adapter, "connect"):
-                logger.info("Connecting/switching adapter to central ProgID: %s", cfg.opc_prog_id)
+            cfg = ConfigPushPayload.unpack(payload)
+            if cfg.config_version < self._config_version:
+                raise ValueError("Stale configuration version")
+            if self._active_config and cfg.config_version == self._config_version:
+                if cfg != self._active_config:
+                    raise ValueError("Configuration changed without a new version")
+                applied = True
+            else:
+                if cfg.update_rate_ms == 0:
+                    raise ValueError("Update rate must be positive")
+                ids = [item.item_id for item in cfg.items]
+                paths = [item.opc_item_path for item in cfg.items]
+                if len(set(ids)) != len(ids):
+                    raise ValueError("Duplicate central item IDs")
+                if any(not path.strip() for path in paths):
+                    raise ValueError("Empty OPC item path")
+                if any(item.requested_source != 0 for item in cfg.items):
+                    raise ValueError("Only Device reads are supported")
+                if cfg.opc_prog_id and candidate is self._adapter:
+                    if self._adapter_factory is None:
+                        raise ValueError("ProgID configuration requires an isolated adapter factory")
+                    candidate = self._adapter_factory()
+                    if candidate is self._adapter:
+                        raise ValueError("Adapter factory must return a separate instance")
+                if cfg.opc_prog_id:
+                    candidate.connect(cfg.opc_prog_id)
+                self._config_attempt += 1
+                staged_group = candidate.create_group(
+                    f"config_{id(self)}_{self._config_attempt}", cfg.update_rate_ms
+                )
+                mapping = candidate.add_items(staged_group, list(dict.fromkeys(paths)))
+                if any(path not in mapping for path in paths):
+                    raise ValueError("Adapter did not register every configured item")
+                if any(not isinstance(iid, int) or iid <= 0 for iid in mapping.values()):
+                    raise ValueError("Invalid adapter item IDs")
+                if len(set(mapping.values())) != len(mapping):
+                    raise ValueError("Ambiguous adapter item IDs")
+                native_ids = {item.item_id: mapping[item.opc_item_path] for item in cfg.items}
+                old_adapter, old_group = self._adapter, self._group_handle
+                # No await between preparing and publishing this complete state.
+                self._adapter = candidate
+                self._group_handle = staged_group
+                self._item_mapping = dict(zip(ids, paths))
+                self._native_ids = native_ids
+                self._active_config = cfg
+                self._config_version = cfg.config_version
+                applied = True
                 try:
-                    self._adapter.connect(cfg.opc_prog_id)
-                except Exception as exc:
-                    logger.warning("Failed to connect to central ProgID %s: %s", cfg.opc_prog_id, exc)
+                    if old_adapter is not candidate:
+                        old_adapter.disconnect()
+                    elif old_group is not None:
+                        old_adapter.remove_group(old_group)
+                except (RuntimeError, OSError, ConnectionError, ValueError):
+                    logger.exception("Failed to release superseded configuration resources")
+                logger.info("Config v%d applied: %d items", version, len(cfg.items))
+        except Exception as exc:  # Adapter providers may raise vendor-specific COM exceptions.  # noqa: BLE001 - provider-specific exception boundary.
+            logger.warning("Config v%d rejected: %s", version, exc)
+            try:
+                if candidate is not self._adapter and candidate is not None:
+                    candidate.disconnect()
+                elif staged_group is not None:
+                    candidate.remove_group(staged_group)
+            except (RuntimeError, OSError, ConnectionError, ValueError):
+                logger.exception("Failed to release rejected configuration resources")
 
-            logger.info(
-                "Config v%d applied: %d items, rate=%dms, prog_id=%s",
-                cfg.config_version,
-                len(cfg.items),
-                cfg.update_rate_ms,
-                cfg.opc_prog_id,
-            )
-            # Automatically configure adapter group if not set manually
-            if self._group_handle is None and hasattr(self._adapter, "create_group"):
-                try:
-                    self._group_handle = self._adapter.create_group(
-                        f"group_v{cfg.config_version}", cfg.update_rate_ms
-                    )
-                    if hasattr(self._adapter, "add_items") and cfg.items:
-                        paths = [item.opc_item_path for item in cfg.items]
-                        self._adapter.add_items(self._group_handle, paths)
-                except Exception as exc:
-                    logger.warning("Auto group creation on config push encountered: %s", exc)
-        except (ValueError, KeyError, OSError) as exc:
-            logger.error("Failed to apply config v%d: %s", cfg.config_version, exc)
-            applied = False
-
-        ack = ConfigAckPayload(config_version=cfg.config_version, applied=applied)
+        ack = ConfigAckPayload(config_version=version, applied=applied)
         await self._send(MsgType.CONFIG_ACK, ack.pack())
 
     async def _handle_read_request(self, payload: bytes) -> None:
-        """Execute Device read via adapter and send READ_RESPONSE."""
+        """Translate central IDs to adapter IDs for a fresh Device read."""
         req = ReadRequestPayload.unpack(payload)
         start_us = int(time.time() * 1_000_000)
-
-        results: list[ItemResult] = []
-        item_ids = [item_ref.item_id for item_ref in req.items]
-
-        if self._adapter is not None and hasattr(self._adapter, "read_device"):
-            raw_results = self._adapter.read_device(self._group_handle, item_ids)
-            res_by_id = {r.item_id: r for r in raw_results}
-            for item_ref in req.items:
-                if item_ref.item_id in res_by_id:
-                    results.append(res_by_id[item_ref.item_id])
-                else:
-                    results.append(
-                        ItemResult(
-                            item_id=item_ref.item_id,
-                            status=ItemStatus.ERROR,
-                            value_type=ValueType.BLOB,
-                            quality=0,
-                            timestamp_us=start_us,
-                            value=b"",
-                            error_code=0x80040001,
-                        )
-                    )
-        else:
-            # Fallback default result
-            for item_ref in req.items:
-                results.append(
-                    ItemResult(
-                        item_id=item_ref.item_id,
-                        status=ItemStatus.OK,
-                        value_type=ValueType.F64,
-                        quality=192,
-                        timestamp_us=start_us,
-                        value=b"\x00" * 8,
-                        error_code=0,
-                    )
-                )
-
-        end_us = int(time.time() * 1_000_000)
-        duration_us = end_us - start_us
-
+        native_ids = list(dict.fromkeys(
+            self._native_ids[item.item_id] for item in req.items
+            if item.item_id in self._native_ids and item.requested_source == 0
+        ))
+        raw_results = []
+        if self._group_handle is not None and native_ids:
+            try:
+                raw_results = self._adapter.read_device(self._group_handle, native_ids)
+            except Exception:
+                logger.exception("Device read failed")
+        res_by_id = {r.item_id: r for r in raw_results}
+        results = []
+        for item in req.items:
+            native_id = self._native_ids.get(item.item_id)
+            result = res_by_id.get(native_id) if item.requested_source == 0 else None
+            if result is not None:
+                results.append(replace(result, item_id=item.item_id))
+            else:
+                results.append(ItemResult(
+                    item_id=item.item_id,
+                    status=ItemStatus.NOT_FOUND if native_id is None else ItemStatus.ERROR,
+                    value_type=ValueType.BLOB, quality=0, timestamp_us=start_us,
+                    value=b"", error_code=0x80040001,
+                ))
         resp = ReadResponsePayload(
             request_id=req.request_id,
-            duration_us=duration_us,
+            duration_us=int(time.time() * 1_000_000) - start_us,
             results=results,
         )
         await self._send(MsgType.READ_RESPONSE, resp.pack())
-        logger.debug(
-            "Read response sent: request=%d duration=%dus items=%d",
-            req.request_id,
-            duration_us,
-            len(results),
-        )
 
     async def _send(self, msg_type: MsgType, payload: bytes) -> None:
         """Send a framed message to the server."""
