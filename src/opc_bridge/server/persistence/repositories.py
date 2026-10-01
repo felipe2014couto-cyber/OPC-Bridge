@@ -50,6 +50,69 @@ class PersistenceRepository:
     def _list(self, cursor: Any, model: Type[T]) -> List[T]:
         return [self._model(row, cursor, model) for row in cursor.fetchall()]
 
+    def _dicts(self, cursor: Any) -> List[dict[str, Any]]:
+        descriptions = [column[0] for column in cursor.description]
+        rows = cursor.fetchall()
+        result = []
+        for row in rows:
+            values = dict(row) if hasattr(row, "keys") else dict(zip(descriptions, row))
+            result.append(
+                {
+                    key: value.isoformat() if isinstance(value, datetime) else value
+                    for key, value in values.items()
+                }
+            )
+        return result
+
+    def list_admin_agents(self) -> List[dict[str, Any]]:
+        """Return a safe operational projection, never selecting credentials or secrets."""
+        cursor = self._execute(
+            "SELECT a.agent_id, a.display_name, a.enabled, a.created_at, "
+            "s.session_id, s.state AS observed_state, s.started_at AS session_started_at, "
+            "s.ended_at AS session_ended_at, s.hostname, s.os_version, s.last_heartbeat_at, "
+            "s.applied_config_version, s.observed_config_version "
+            "FROM agents a LEFT JOIN agent_sessions s ON s.session_id = ("
+            "SELECT latest.session_id FROM agent_sessions latest "
+            "WHERE latest.agent_id = a.agent_id "
+            "ORDER BY latest.started_at DESC, latest.session_id DESC LIMIT 1) "
+            "ORDER BY a.agent_id"
+        )
+        return self._dicts(cursor)
+
+    def get_admin_agent(self, agent_id: str) -> Optional[dict[str, Any]]:
+        """Return one agent's safe operational projection, if it exists."""
+        cursor = self._execute(
+            "SELECT a.agent_id, a.display_name, a.enabled, a.created_at, "
+            "s.session_id, s.state AS observed_state, s.started_at AS session_started_at, "
+            "s.ended_at AS session_ended_at, s.hostname, s.os_version, s.last_heartbeat_at, "
+            "s.applied_config_version, s.observed_config_version "
+            "FROM agents a LEFT JOIN agent_sessions s ON s.session_id = ("
+            "SELECT latest.session_id FROM agent_sessions latest "
+            "WHERE latest.agent_id = a.agent_id "
+            "ORDER BY latest.started_at DESC, latest.session_id DESC LIMIT 1) "
+            "WHERE a.agent_id = ?",
+            (agent_id,),
+        )
+        rows = self._dicts(cursor)
+        return rows[0] if rows else None
+
+    def list_admin_config_operations(
+        self, agent_id: Optional[str] = None
+    ) -> List[dict[str, Any]]:
+        """Return safe operation history joined to its persisted snapshot version."""
+        query = (
+            "SELECT o.operation_id, o.agent_id, o.status, s.version, "
+            "o.requested_at, o.completed_at "
+            "FROM config_operations o JOIN config_snapshots s "
+            "ON s.snapshot_id = o.snapshot_id AND s.agent_id = o.agent_id"
+        )
+        parameters: tuple = ()
+        if agent_id is not None:
+            query += " WHERE o.agent_id = ?"
+            parameters = (agent_id,)
+        query += " ORDER BY o.requested_at DESC, o.operation_id DESC"
+        return self._dicts(self._execute(query, parameters))
+
     def add_agent(self, agent_id: str, display_name: str) -> Agent:
         self._execute("INSERT INTO agents(agent_id, display_name) VALUES (?, ?)", (agent_id, display_name))
         return Agent(agent_id=agent_id, display_name=display_name)
