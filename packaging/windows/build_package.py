@@ -8,18 +8,39 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import shutil
 import subprocess
 import sys
 import zipfile
+from pathlib import Path
+
+from verify_package import verify_package
 
 PINNED_DEPENDENCIES = [
     "pywin32==312",
 ]
 
 
-def build_package(output_dir: str, create_zip: bool = True) -> str:
+def _tree_sha256(root: str) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(Path(root).rglob("*")):
+        if path.is_file() and path.name != "manifest.json":
+            digest.update(path.relative_to(root).as_posix().encode("utf-8"))
+            digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def build_package(
+    output_dir: str,
+    create_zip: bool = True,
+    architecture: str = "x64",
+    central_address: str = "127.0.0.1:8443",
+    agent_id: str = "opc-agent-windows-01",
+    token: str = "",
+    ca_file: str = "",
+) -> str:
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
     norm = os.path.normpath(output_dir)
     if os.path.basename(norm).lower() == "dist":
@@ -32,6 +53,21 @@ def build_package(output_dir: str, create_zip: bool = True) -> str:
         shutil.rmtree(pkg_dir)
     os.makedirs(pkg_dir, exist_ok=True)
 
+    if architecture not in {"x86", "x64"}:
+        raise ValueError("architecture must be x86 or x64")
+    if create_zip and (not token or not ca_file or not os.path.isfile(ca_file)):
+        raise ValueError("a bootstrap token and existing CA certificate file are required")
+    host, _, port = central_address.rpartition(":")
+    if create_zip and (not host or not port.isdigit()):
+        raise ValueError("central_address must be HOST:PORT")
+
+    # Embed the selected architecture's official embeddable runtime. The caller
+    # provides an extracted Python distribution and matching pip bootstrap.
+    runtime_source = os.environ.get("OPC_PYTHON_RUNTIME")
+    runtime_dst = os.path.join(pkg_dir, "runtime")
+    if runtime_source and os.path.isdir(runtime_source):
+        shutil.copytree(runtime_source, runtime_dst)
+
     # 1. Copy source code
     src_src = os.path.join(base_dir, "src", "opc_bridge")
     dst_src = os.path.join(pkg_dir, "src", "opc_bridge")
@@ -43,9 +79,22 @@ def build_package(output_dir: str, create_zip: bool = True) -> str:
     config_dir = os.path.join(pkg_dir, "config")
     os.makedirs(config_dir, exist_ok=True)
 
-    cfg_src = os.path.join(script_dir, "config", "agent.default.json")
-    if os.path.exists(cfg_src):
-        shutil.copy(cfg_src, os.path.join(config_dir, "agent.default.json"))
+    ca_name = os.path.basename(ca_file) if ca_file else "ca.pem"
+    if ca_file and os.path.isfile(ca_file):
+        shutil.copy2(ca_file, os.path.join(config_dir, ca_name))
+    config = {
+        "server_host": host,
+        "server_port": int(port),
+        "agent_id": agent_id,
+        "auth_token": token,
+        "opc_prog_id": "",
+        "update_rate_ms": 1000,
+        "certfile": f"config/{ca_name}",
+        "log_file": r"C:\ProgramData\OPCBridge\logs\agent.log",
+        "log_level": "INFO",
+    }
+    with open(os.path.join(config_dir, "agent.default.json"), "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
 
     for bat in ["install.bat", "uninstall.bat", "run_foreground.bat", "setup_config.py"]:
         bat_src = os.path.join(script_dir, bat)
@@ -56,7 +105,7 @@ def build_package(output_dir: str, create_zip: bool = True) -> str:
     if os.path.exists(readme_src):
         shutil.copy(readme_src, os.path.join(pkg_dir, "README_WINDOWS.md"))
 
-    # 3. Download/bundle offline wheels if pip is available
+    # 3. Download/bundle offline wheels for the selected Windows architecture.
     wheels_dir = os.path.join(pkg_dir, "wheels")
     os.makedirs(wheels_dir, exist_ok=True)
 
@@ -68,13 +117,25 @@ def build_package(output_dir: str, create_zip: bool = True) -> str:
 
     print(f"Downloading pinned wheels to {wheels_dir}...")
     try:
+        python_exe = os.path.join(runtime_dst, "python.exe")
+        pip_dir = os.path.join(runtime_dst, "Scripts")
+        os.makedirs(pip_dir, exist_ok=True)
         cmd = [
-            sys.executable,
+            python_exe,
             "-m",
             "pip",
             "download",
             "--dest",
             wheels_dir,
+            "--platform",
+            "win32" if architecture == "x86" else "win_amd64",
+            "--python-version",
+            "38",
+            "--implementation",
+            "cp",
+            "--abi",
+            "cp38",
+            "--only-binary=:all:",
             "-r",
             req_file,
         ]
@@ -86,13 +147,26 @@ def build_package(output_dir: str, create_zip: bool = True) -> str:
     except Exception as exc:
         print(f"Could not download wheels automatically ({exc}); target machine can use existing wheels.")
 
-    # Ensure offline wheels are present from fallback if needed
+    if not create_zip:
+        return pkg_dir
+    if not os.path.isfile(os.path.join(runtime_dst, "python.exe")):
+        raise RuntimeError("OPC_PYTHON_RUNTIME must provide runtime/python.exe")
     if not os.listdir(wheels_dir):
-        fallback_wheels = os.path.join(base_dir, "dist", "opc-bridge-agent-windows-offline", "wheels")
-        if os.path.exists(fallback_wheels) and os.path.abspath(fallback_wheels) != os.path.abspath(wheels_dir):
-            for wf in os.listdir(fallback_wheels):
-                shutil.copy(os.path.join(fallback_wheels, wf), os.path.join(wheels_dir, wf))
-            print(f"Copied existing offline wheels from {fallback_wheels}")
+        raise RuntimeError("no compatible offline wheels were downloaded")
+
+    manifest = {
+        "version": "0.1.0",
+        "commit": subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=base_dir, capture_output=True, text=True, check=True
+        ).stdout.strip(),
+        "architecture": architecture,
+        "runtime": "CPython 3.8 Windows embeddable",
+    }
+    with open(os.path.join(pkg_dir, "manifest.json"), "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+    manifest["sha256"] = _tree_sha256(pkg_dir)
+    with open(os.path.join(pkg_dir, "manifest.json"), "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
 
     # 4. Create ZIP archive if requested
     if create_zip:
@@ -104,14 +178,9 @@ def build_package(output_dir: str, create_zip: bool = True) -> str:
                     full_path = os.path.join(root, file)
                     rel_path = os.path.relpath(full_path, pkg_dir)
                     zf.write(full_path, rel_path)
-        sha256 = hashlib.sha256()
-        with open(zip_path, "rb") as f:
-            while True:
-                chunk = f.read(65536)
-                if not chunk:
-                    break
-                sha256.update(chunk)
-        digest = sha256.hexdigest()
+        verify_package(zip_path, architecture)
+        with open(zip_path, "rb") as package_file:
+            digest = hashlib.sha256(package_file.read()).hexdigest()
         print(f"Package created: {zip_path}")
         print(f"Package SHA-256: {digest}")
         return zip_path
@@ -129,13 +198,26 @@ def main() -> None:
         default=os.path.join("dist", "opc-bridge-agent-windows-offline"),
         help="Target output directory",
     )
+    parser.add_argument("--architecture", choices=("x86", "x64"), default="x64")
+    parser.add_argument("--central-address", required=True)
+    parser.add_argument("--agent-id", required=True)
+    parser.add_argument("--token", required=True)
+    parser.add_argument("--ca-file", required=True)
     parser.add_argument(
         "--no-zip",
         action="store_true",
         help="Skip ZIP archive generation",
     )
     args = parser.parse_args()
-    build_package(args.output, create_zip=not args.no_zip)
+    build_package(
+        args.output,
+        create_zip=not args.no_zip,
+        architecture=args.architecture,
+        central_address=args.central_address,
+        agent_id=args.agent_id,
+        token=args.token,
+        ca_file=args.ca_file,
+    )
 
 
 if __name__ == "__main__":

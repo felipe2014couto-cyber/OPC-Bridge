@@ -105,37 +105,23 @@ exit /b 1
 
 :: 4. Locate Python Runtime
 set "PYTHON_EXE="
-if exist "runtime\python.exe" (
-    set "PYTHON_EXE=runtime\python.exe"
-    echo [INFO] Using bundled Python runtime: !PYTHON_EXE!
-    goto python_found
+if not exist "runtime\python.exe" (
+    echo [ERROR] Bundled Python runtime is missing. This package is incomplete.
+    if "%UNATTENDED%"=="0" pause
+    popd
+    exit /b 1
 )
-where python >nul 2>&1
-if %errorlevel% equ 0 (
-    set "PYTHON_EXE=python"
-    echo [INFO] Using system Python: python
-    goto python_found
-)
-where py >nul 2>&1
-if %errorlevel% equ 0 (
-    set "PYTHON_EXE=py -3"
-    echo [INFO] Using system Python launcher: py -3
-    goto python_found
-)
-echo [ERROR] Python 3 was not found in PATH or runtime\ folder.
-echo Please install Python 3.10+ or bundle runtime\ before installing.
-if "%UNATTENDED%"=="0" pause
-popd
-exit /b 1
-
-:python_found
+set "PYTHON_EXE=runtime\python.exe"
+echo [INFO] Using bundled Python runtime: !PYTHON_EXE!
 
 :: 5. Offline dependency installation (without network)
-if not exist "wheels" goto skip_wheels
 echo [INFO] Installing pinned dependencies from offline wheels directory...
 !PYTHON_EXE! -m pip install --no-index --find-links="wheels" -r "requirements-offline.txt" >nul 2>&1
-
-:skip_wheels
+if %errorlevel% neq 0 (
+    echo [ERROR] Offline dependency installation failed.
+    popd
+    exit /b 1
+)
 
 :: 6. Run Secure Configuration Setup Helper
 set "PYTHONPATH=src;!PYTHONPATH!"

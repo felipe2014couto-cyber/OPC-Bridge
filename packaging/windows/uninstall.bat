@@ -16,22 +16,12 @@ if %errorlevel% neq 0 (
 
 pushd "%~dp0"
 
-:: Locate Python executable
-set "PYTHON_EXE="
+:: Use only the bundled Python runtime when available.
+set "PYTHON_EXE=runtime\python.exe"
 if exist "runtime\python.exe" (
-    set "PYTHON_EXE=runtime\python.exe"
     goto python_found
 )
-where python >nul 2>&1
-if %errorlevel% equ 0 (
-    set "PYTHON_EXE=python"
-    goto python_found
-)
-where py >nul 2>&1
-if %errorlevel% equ 0 (
-    set "PYTHON_EXE=py -3"
-    goto python_found
-)
+set "PYTHON_EXE="
 
 :python_found
 
