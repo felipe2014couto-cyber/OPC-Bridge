@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from typing import Any, List
 
-REVISION = "0001_initial"
+REVISION = "0002_bridge_server_state"
+_INITIAL_REVISION = "0001_initial"
 
 _SCHEMA: List[str] = [
     """CREATE TABLE agents (
@@ -51,7 +52,7 @@ _SCHEMA: List[str] = [
         snapshot_id VARCHAR(128) NOT NULL,
         plan_id VARCHAR(128),
         status VARCHAR(32) NOT NULL DEFAULT 'pending'
-            CHECK (status IN ('pending', 'applied', 'rejected', 'failed')),
+            CHECK (status IN ('pending', 'applied', 'rejected', 'failed', 'expired')),
         requested_at __TIMESTAMP__ NOT NULL DEFAULT CURRENT_TIMESTAMP,
         completed_at __TIMESTAMP__,
         FOREIGN KEY (snapshot_id, agent_id)
@@ -69,6 +70,69 @@ _SCHEMA: List[str] = [
 ]
 
 
+def _apply_initial(cursor: Any, database: Any, marker: str, timestamp_type: str) -> None:
+    for statement in _SCHEMA:
+        statement = statement.replace("__TIMESTAMP__", timestamp_type)
+        cursor.execute(statement)
+    if database.dialect == "sqlite":
+        cursor.execute(
+            "CREATE TRIGGER config_snapshots_no_update BEFORE UPDATE ON config_snapshots "
+            "BEGIN SELECT RAISE(ABORT, 'config snapshots are immutable'); END"
+        )
+        cursor.execute(
+            "CREATE TRIGGER config_snapshots_no_delete BEFORE DELETE ON config_snapshots "
+            "BEGIN SELECT RAISE(ABORT, 'config snapshots are immutable'); END"
+        )
+    else:
+        cursor.execute(
+            "CREATE FUNCTION reject_config_snapshot_mutation() RETURNS trigger AS $$ "
+            "BEGIN RAISE EXCEPTION 'config snapshots are immutable'; END; $$ LANGUAGE plpgsql"
+        )
+        cursor.execute(
+            "CREATE TRIGGER config_snapshots_immutable BEFORE UPDATE OR DELETE "
+            "ON config_snapshots FOR EACH ROW EXECUTE FUNCTION reject_config_snapshot_mutation()"
+        )
+    cursor.execute("INSERT INTO schema_migrations(revision) VALUES (" + marker + ")", (_INITIAL_REVISION,))
+
+
+def _apply_bridge_state(cursor: Any, database: Any, marker: str, timestamp_type: str) -> None:
+    for statement in (
+        "ALTER TABLE agent_sessions ADD COLUMN hostname VARCHAR(255) NOT NULL DEFAULT ''",
+        "ALTER TABLE agent_sessions ADD COLUMN os_version VARCHAR(255) NOT NULL DEFAULT ''",
+        "ALTER TABLE agent_sessions ADD COLUMN state VARCHAR(32) NOT NULL DEFAULT 'connected'",
+        "ALTER TABLE agent_sessions ADD COLUMN last_heartbeat_at " + timestamp_type,
+        "ALTER TABLE agent_sessions ADD COLUMN observed_state_json TEXT NOT NULL DEFAULT '{}'",
+    ):
+        cursor.execute(statement)
+    if database.dialect == "sqlite":
+        cursor.execute(
+            "CREATE TABLE config_operations_v2 ("
+            "operation_id VARCHAR(128) PRIMARY KEY, agent_id VARCHAR(128) NOT NULL "
+            "REFERENCES agents(agent_id) ON DELETE CASCADE, snapshot_id VARCHAR(128) NOT NULL, "
+            "plan_id VARCHAR(128), status VARCHAR(32) NOT NULL DEFAULT 'pending' "
+            "CHECK (status IN ('pending', 'applied', 'rejected', 'failed', 'expired')), "
+            "requested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, completed_at TEXT, "
+            "FOREIGN KEY (snapshot_id, agent_id) REFERENCES config_snapshots(snapshot_id, agent_id) "
+            "ON DELETE RESTRICT, FOREIGN KEY (plan_id, agent_id) REFERENCES "
+            "collection_plans(plan_id, agent_id) ON DELETE RESTRICT)"
+        )
+        cursor.execute(
+            "INSERT INTO config_operations_v2 SELECT operation_id, agent_id, snapshot_id, "
+            "plan_id, status, requested_at, completed_at FROM config_operations"
+        )
+        cursor.execute("DROP TABLE config_operations")
+        cursor.execute("ALTER TABLE config_operations_v2 RENAME TO config_operations")
+    else:
+        cursor.execute("ALTER TABLE config_operations DROP CONSTRAINT config_operations_status_check")
+        cursor.execute(
+            "ALTER TABLE config_operations ADD CONSTRAINT config_operations_status_check "
+            "CHECK (status IN ('pending', 'applied', 'rejected', 'failed', 'expired'))"
+        )
+    cursor.execute(
+        "INSERT INTO schema_migrations(revision) VALUES (" + marker + ")", (REVISION,)
+    )
+
+
 def upgrade_database(database: Any) -> None:
     """Apply pending migration revisions to an isolated target database."""
     connection = database._connect()
@@ -84,32 +148,12 @@ def upgrade_database(database: Any) -> None:
             + " NOT NULL DEFAULT CURRENT_TIMESTAMP)"
         )
         marker = "%s" if database.dialect == "postgresql" else "?"
-        cursor.execute("SELECT revision FROM schema_migrations WHERE revision = " + marker, (REVISION,))
-        if cursor.fetchone() is None:
-            for statement in _SCHEMA:
-                statement = statement.replace("__TIMESTAMP__", timestamp_type)
-                cursor.execute(statement)
-            if database.dialect == "sqlite":
-                cursor.execute(
-                    "CREATE TRIGGER config_snapshots_no_update BEFORE UPDATE ON config_snapshots "
-                    "BEGIN SELECT RAISE(ABORT, 'config snapshots are immutable'); END"
-                )
-                cursor.execute(
-                    "CREATE TRIGGER config_snapshots_no_delete BEFORE DELETE ON config_snapshots "
-                    "BEGIN SELECT RAISE(ABORT, 'config snapshots are immutable'); END"
-                )
-            else:
-                cursor.execute(
-                    "CREATE FUNCTION reject_config_snapshot_mutation() RETURNS trigger AS $$ "
-                    "BEGIN RAISE EXCEPTION 'config snapshots are immutable'; END; $$ LANGUAGE plpgsql"
-                )
-                cursor.execute(
-                    "CREATE TRIGGER config_snapshots_immutable BEFORE UPDATE OR DELETE "
-                    "ON config_snapshots FOR EACH ROW EXECUTE FUNCTION reject_config_snapshot_mutation()"
-                )
-            cursor.execute(
-                "INSERT INTO schema_migrations(revision) VALUES (" + marker + ")", (REVISION,)
-            )
+        cursor.execute("SELECT revision FROM schema_migrations")
+        applied = {row[0] for row in cursor.fetchall()}
+        if _INITIAL_REVISION not in applied:
+            _apply_initial(cursor, database, marker, timestamp_type)
+        if REVISION not in applied:
+            _apply_bridge_state(cursor, database, marker, timestamp_type)
         connection.commit()
     except Exception:
         connection.rollback()

@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
+import json
 import logging
 import ssl
 import time
+import uuid
 from dataclasses import dataclass, field
 
 from opc_bridge.protocol import (
@@ -22,6 +25,7 @@ from opc_bridge.protocol import (
     frame_message,
     unframe_message,
 )
+from opc_bridge.server.persistence import Database
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +43,8 @@ class ServerConfig:
     default_update_rate_ms: int = 1000
     read_cycle_timeout_ms: int = 5000
     opc_prog_id: str = ""
+    config_ack_timeout_ms: int = 5000
+    persistence: Database | None = None
 
 
 @dataclass
@@ -91,6 +97,119 @@ class BridgeServer:
         self._pending_reads: dict[tuple[str, int], asyncio.Future[ReadResponsePayload]] = {}
         self._scheduler_tasks: dict[str, asyncio.Task[None]] = {}
         self.read_metrics = ReadSchedulerMetrics()
+        self._pending_config_operations: dict[tuple[str, int], str] = {}
+        self._config_timeout_tasks: dict[tuple[str, int], asyncio.Task[None]] = {}
+        if self.config.persistence is not None:
+            self._recover_persisted_state()
+
+    def _recover_persisted_state(self) -> None:
+        """Restore the latest desired snapshot and close state lost in a server crash."""
+        assert self.config.persistence is not None
+        with self.config.persistence.session() as repo:
+            repo.recover_interrupted_sessions()
+            for operation in repo.pending_operations():
+                repo.complete_operation(operation.operation_id, "expired")
+                repo.add_audit_event(
+                    operation.agent_id,
+                    str(uuid.uuid4()),
+                    "config.expired",
+                    json.dumps({"operation_id": operation.operation_id, "reason": "server_restart"}),
+                )
+            snapshot = repo.latest_snapshot()
+        if snapshot is None:
+            return
+        try:
+            restored = json.loads(snapshot.payload_json)
+            items = [ItemRef(**item) for item in restored["items"]]
+            version = int(restored["config_version"])
+            update_rate = int(restored["update_rate_ms"])
+            prog_id = str(restored["opc_prog_id"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            logger.exception("Persisted configuration snapshot %s is invalid", snapshot.snapshot_id)
+            return
+        self._config_items = items
+        self._config_version = version
+        self.config.default_update_rate_ms = update_rate
+        self.config.opc_prog_id = prog_id
+
+    def _persist_config_operation(self, session: AgentSession) -> str | None:
+        if self.config.persistence is None:
+            return None
+        snapshot_id = str(uuid.uuid4())
+        operation_id = str(uuid.uuid4())
+        payload_json = json.dumps(
+            {
+                "config_version": self._config_version,
+                "update_rate_ms": self.config.default_update_rate_ms,
+                "opc_prog_id": self.config.opc_prog_id,
+                "items": [
+                    {
+                        "item_id": item.item_id,
+                        "opc_item_path": item.opc_item_path,
+                        "requested_source": item.requested_source,
+                    }
+                    for item in self._config_items
+                ],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        with self.config.persistence.session() as repo:
+            snapshot = repo.add_snapshot_if_absent(
+                session.agent_id, snapshot_id, self._config_version, payload_json
+            )
+            repo.add_operation(session.agent_id, operation_id, snapshot.snapshot_id)
+            repo.add_audit_event(
+                session.agent_id,
+                str(uuid.uuid4()),
+                "config.requested",
+                json.dumps({"operation_id": operation_id, "version": self._config_version}),
+            )
+        return operation_id
+
+    def _complete_config_operation(self, operation_id: str, agent_id: str, status: str) -> None:
+        if self.config.persistence is None:
+            return
+        with self.config.persistence.session() as repo:
+            repo.complete_operation(operation_id, status)
+            repo.add_audit_event(
+                agent_id,
+                str(uuid.uuid4()),
+                "config." + status,
+                json.dumps({"operation_id": operation_id}),
+            )
+
+    async def _expire_config_operation(
+        self, key: tuple[str, int], operation_id: str, agent_id: str
+    ) -> None:
+        await asyncio.sleep(max(self.config.config_ack_timeout_ms, 1) / 1000)
+        if self._pending_config_operations.get(key) != operation_id:
+            return
+        self._pending_config_operations.pop(key, None)
+        self._config_timeout_tasks.pop(key, None)
+        self._complete_config_operation(operation_id, agent_id, "expired")
+
+    def _persist_observed_state(
+        self, session: AgentSession, state: str, message_type: str, heartbeat: bool = False
+    ) -> None:
+        if self.config.persistence is None:
+            return
+        with self.config.persistence.session() as repo:
+            repo.update_session_observed(
+                session.session_id,
+                state,
+                json.dumps(
+                    {
+                        "connection": state,
+                        "last_message": message_type,
+                        "hostname": session.hostname,
+                        "os_version": session.os_version,
+                        "applied_config_version": session.config_version,
+                    },
+                    sort_keys=True,
+                ),
+                time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) if heartbeat else None,
+            )
 
     @property
     def sessions(self) -> dict[str, AgentSession]:
@@ -152,6 +271,17 @@ class BridgeServer:
                 await session.writer.wait_closed()
             except (OSError, ConnectionError) as exc:
                 logger.debug("Error closing session %s: %s", session.session_id, exc)
+        for key, operation_id in list(self._pending_config_operations.items()):
+            session = next(
+                (active for active in self._sessions.values() if active.session_id == key[0]),
+                None,
+            )
+            if session is not None:
+                self._complete_config_operation(operation_id, session.agent_id, "expired")
+            timeout_task = self._config_timeout_tasks.pop(key, None)
+            if timeout_task is not None:
+                timeout_task.cancel()
+        self._pending_config_operations.clear()
         self._sessions.clear()
         if self._server:
             self._server.close()
@@ -167,11 +297,28 @@ class BridgeServer:
             opc_prog_id=self.config.opc_prog_id,
         ).pack()
         for sid, session in list(self._sessions.items()):
+            key = (sid, self._config_version)
+            if key in self._pending_config_operations:
+                continue
+            operation_id = None
             try:
+                operation_id = self._persist_config_operation(session)
+                if operation_id is not None:
+                    self._pending_config_operations[key] = operation_id
+                    self._config_timeout_tasks[key] = asyncio.create_task(
+                        self._expire_config_operation(key, operation_id, session.agent_id),
+                        name=f"config-ack-timeout-{session.session_id}-{self._config_version}",
+                    )
                 await session.send(MsgType.CONFIG_PUSH, payload)
                 logger.debug("Config pushed to session %s", sid)
             except (OSError, ConnectionError, asyncio.TimeoutError) as exc:
                 logger.warning("Failed to push config to %s: %s", sid, exc)
+                if operation_id is not None:
+                    timeout_task = self._config_timeout_tasks.pop(key, None)
+                    if timeout_task is not None:
+                        timeout_task.cancel()
+                    self._pending_config_operations.pop(key, None)
+                    self._complete_config_operation(operation_id, session.agent_id, "failed")
 
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -215,6 +362,20 @@ class BridgeServer:
             if session and session.session_id in self._sessions:
                 del self._sessions[session.session_id]
                 logger.info("Session removed: %s", session.session_id)
+            if session and self.config.persistence is not None:
+                with self.config.persistence.session() as repo:
+                    repo.disconnect_session(
+                        session.session_id,
+                        json.dumps(
+                            {
+                                "connection": "disconnected",
+                                "hostname": session.hostname,
+                                "os_version": session.os_version,
+                                "applied_config_version": session.config_version,
+                            },
+                            sort_keys=True,
+                        ),
+                    )
             try:
                 writer.close()
                 await writer.wait_closed()
@@ -236,7 +397,7 @@ class BridgeServer:
         hello = HelloPayload.unpack(payload)
 
         # Send HELLO_ACK
-        session_id = f"sess-{int(time.time() * 1000)}"
+        session_id = "sess-" + str(uuid.uuid4())
         ack_payload = HelloAckPayload(
             session_id=session_id,
             heartbeat_interval_ms=self.config.heartbeat_interval_ms,
@@ -258,18 +419,61 @@ class BridgeServer:
         from opc_bridge.protocol.messages import AuthPayload
 
         auth = AuthPayload.unpack(payload)
-        success = (
-            len(auth.token_hash) == len(self.config.auth_token_hash)
-            and auth.token_hash == self.config.auth_token_hash
-        )
+        applied_version: int | None = None
+        if self.config.persistence is None:
+            success = hmac.compare_digest(auth.token_hash, self.config.auth_token_hash)
+        else:
+            success = False
+            with self.config.persistence.session() as repo:
+                agent = repo.get_agent(hello.agent_id)
+                if agent is not None and agent.enabled:
+                    for stored_hash in repo.active_credential_hashes(hello.agent_id):
+                        encoded_hash = stored_hash.split(":", 1)[-1]
+                        try:
+                            expected_hash = bytes.fromhex(encoded_hash)
+                        except ValueError:
+                            expected_hash = b""
+                        success = hmac.compare_digest(auth.token_hash, expected_hash) or success
+                    previous_snapshot = repo.latest_applied_snapshot(hello.agent_id)
+                    if previous_snapshot is not None:
+                        try:
+                            applied_version = int(json.loads(previous_snapshot.payload_json)["config_version"])
+                        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                            logger.exception("Persisted applied config for %s is invalid", hello.agent_id)
         auth_ack = AuthAckPayload(success=success, policies_version=1).pack()
+        if not success:
+            seq += 1
+            writer.write(frame_message(MsgType.AUTH_ACK, seq, auth_ack))
+            await writer.drain()
+            logger.warning("Auth failed for agent %s", hello.agent_id)
+            return None
+
+        if self.config.persistence is not None:
+            with self.config.persistence.session() as repo:
+                repo.add_session(
+                    hello.agent_id,
+                    session_id,
+                    hello.hostname,
+                    hello.os_version,
+                    applied_config_version=applied_version,
+                )
+                repo.update_session_observed(
+                    session_id,
+                    "connected",
+                    json.dumps(
+                        {
+                            "connection": "connected",
+                            "hostname": hello.hostname,
+                            "os_version": hello.os_version,
+                            "applied_config_version": applied_version,
+                        },
+                        sort_keys=True,
+                    ),
+                )
+
         seq += 1
         writer.write(frame_message(MsgType.AUTH_ACK, seq, auth_ack))
         await writer.drain()
-
-        if not success:
-            logger.warning("Auth failed for agent %s", hello.agent_id)
-            return None
 
         return AgentSession(
             session_id=session_id,
@@ -278,6 +482,7 @@ class BridgeServer:
             hostname=hello.hostname,
             os_version=hello.os_version,
             capabilities=hello.capabilities,
+            config_version=applied_version or 0,
             seq_in=header.seq,
         )
 
@@ -290,9 +495,15 @@ class BridgeServer:
             header, payload = msg
             session.seq_in = header.seq
             session.last_heartbeat = time.time()
+            try:
+                message_name = MsgType(header.msg_type).name
+            except ValueError:
+                message_name = str(header.msg_type)
+            self._persist_observed_state(session, "connected", message_name)
 
             if header.msg_type == MsgType.HEARTBEAT:
                 logger.debug("Heartbeat from %s", session.session_id)
+                self._persist_observed_state(session, "connected", message_name, heartbeat=True)
             elif header.msg_type == MsgType.READ_RESPONSE:
                 resp = ReadResponsePayload.unpack(payload)
                 pending = self._pending_reads.get((session.session_id, resp.request_id))
@@ -309,12 +520,24 @@ class BridgeServer:
                 from opc_bridge.protocol.messages import ConfigAckPayload
 
                 ack = ConfigAckPayload.unpack(payload)
-                if ack.applied:
+                key = (session.session_id, ack.config_version)
+                operation_id = self._pending_config_operations.pop(key, None)
+                timeout_task = self._config_timeout_tasks.pop(key, None)
+                if timeout_task is not None:
+                    timeout_task.cancel()
+                persisted = self.config.persistence is not None
+                if ack.applied and (not persisted or operation_id is not None):
                     session.config_version = ack.config_version
+                    if operation_id is not None:
+                        self._complete_config_operation(operation_id, session.agent_id, "applied")
+                        with self.config.persistence.session() as repo:
+                            repo.update_session_applied_version(session.session_id, ack.config_version)
                     logger.info(
                         "Config v%d applied by %s", ack.config_version, session.session_id
                     )
                 else:
+                    if operation_id is not None:
+                        self._complete_config_operation(operation_id, session.agent_id, "rejected")
                     logger.warning(
                         "Config v%d rejected by %s", ack.config_version, session.session_id
                     )

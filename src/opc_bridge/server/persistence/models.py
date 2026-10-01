@@ -30,6 +30,11 @@ class AgentSession:
     ended_at: Optional[str] = None
     applied_config_version: Optional[int] = None
     observed_config_version: Optional[int] = None
+    hostname: str = ""
+    os_version: str = ""
+    state: str = "connected"
+    last_heartbeat_at: Optional[str] = None
+    observed_state_json: str = "{}"
 
 
 @dataclass(frozen=True)
