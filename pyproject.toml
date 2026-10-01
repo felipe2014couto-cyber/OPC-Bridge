@@ -14,6 +14,7 @@ dependencies = []
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "pytest-asyncio>=0.23", "ruff>=0.4"]
 windows = ["pywin32>=306"]
+persistence = ["psycopg2-binary>=2.9"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -21,6 +22,11 @@ where = ["src"]
 [tool.ruff]
 line-length = 100
 target-version = "py38"
+
+[tool.ruff.lint]
+
+[tool.ruff.lint.per-file-ignores]
+"src/opc_bridge/server/persistence/*.py" = ["UP006", "UP045"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
