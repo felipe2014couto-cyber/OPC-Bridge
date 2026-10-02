@@ -44,6 +44,7 @@ def main() -> None:
         sys.exit(1)
 
     from opc_bridge.adapters.da import DevelopmentComServer, OpcDaAdapter
+    from opc_bridge.adapters.da_worker import process_worker_command
 
     adapter = OpcDaAdapter(default_prog_id=args.prog_id, com_factory=DevelopmentComServer)
     if args.prog_id:
@@ -61,51 +62,17 @@ def main() -> None:
 
         op = msg.get("op")
         try:
-            if op == "ping":
-                conn.send({"ok": True, "pong": True, "time": time.time()})
-            elif op == "connect":
-                adapter.connect(msg["prog_id"])
-                conn.send({"ok": True})
-            elif op == "disconnect":
-                adapter.disconnect()
-                conn.send({"ok": True})
-            elif op == "create_group":
-                handle = adapter.create_group(msg["name"], msg["update_rate_ms"])
-                conn.send({"ok": True, "handle": handle})
-            elif op == "remove_group":
-                adapter.remove_group(msg["handle"])
-                conn.send({"ok": True})
-            elif op == "add_items":
-                mapping = adapter.add_items(msg["group"], msg["item_paths"])
-                conn.send({"ok": True, "mapping": mapping})
-            elif op == "remove_items":
-                adapter.remove_items(msg["group"], msg["item_ids"])
-                conn.send({"ok": True})
-            elif op == "read_device":
-                # If test hang environment variable is enabled, hang indefinitely
-                if os.environ.get("TEST_HANG_ON_READ") == "1":
-                    logger.warning("TEST_HANG_ON_READ=1 detected; simulating indefinite driver block...")
-                    while True:
-                        time.sleep(1.0)
-                results = adapter.read_device(msg["group"], msg["item_ids"])
-                conn.send({"ok": True, "results": results})
-            elif op == "browse_items":
-                entries = adapter.browse_items(msg.get("parent_path", ""))
-                conn.send({"ok": True, "entries": entries})
-            elif op == "get_server_status":
-                status = adapter.get_server_status()
-                conn.send({"ok": True, "status": status})
-            elif op == "discover_servers":
-                servers = OpcDaAdapter.discover_servers()
-                conn.send({"ok": True, "servers": servers})
-            elif op == "crash":
+            if op == "crash":
                 os._exit(42)
-            elif op == "exit":
+            # If test hang environment variable is enabled, hang indefinitely.
+            if op == "read_device" and os.environ.get("TEST_HANG_ON_READ") == "1":
+                logger.warning("TEST_HANG_ON_READ=1 detected; simulating indefinite driver block...")
+                while True:
+                    time.sleep(1.0)
+            conn.send(process_worker_command(adapter, msg))
+            if op == "exit":
                 running = False
-                conn.send({"ok": True})
                 break
-            else:
-                conn.send({"ok": False, "error": f"Unknown op: {op}"})
         except Exception as exc:  # noqa: BLE001 - provider-specific exception boundary.
             conn.send({"ok": False, "error": str(exc), "type": type(exc).__name__})
 

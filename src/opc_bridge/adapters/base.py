@@ -59,6 +59,20 @@ class GroupHandle:
     native_handle: object = None
 
 
+def group_handle_to_ipc(handle: GroupHandle) -> dict[str, str | int]:
+    """Serialize only the identity of a group, never its native COM handle."""
+    return {"name": handle.name, "update_rate_ms": handle.update_rate_ms}
+
+
+def group_handle_from_ipc(value: dict[str, str | int]) -> GroupHandle:
+    """Rebuild a process-local group reference from its primitive IPC form."""
+    name = value.get("name")
+    update_rate_ms = value.get("update_rate_ms")
+    if not isinstance(name, str) or type(update_rate_ms) is not int:
+        raise ValueError("Invalid OPC worker group reference")
+    return GroupHandle(name=name, update_rate_ms=update_rate_ms)
+
+
 @runtime_checkable
 class OpcAdapter(Protocol):
     """Contract for OPC DA adapters (real COM or simulated)."""

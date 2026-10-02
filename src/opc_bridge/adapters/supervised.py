@@ -15,7 +15,13 @@ import time
 from multiprocessing.connection import Listener
 from typing import Any
 
-from opc_bridge.adapters.base import BrowseEntry, GroupHandle, ServerStatus
+from opc_bridge.adapters.base import (
+    BrowseEntry,
+    GroupHandle,
+    ServerStatus,
+    group_handle_from_ipc,
+    group_handle_to_ipc,
+)
 from opc_bridge.adapters.da_worker import IPC_AUTHKEY
 from opc_bridge.adapters.worker_runtime import select_worker_runtime
 from opc_bridge.protocol import ItemResult, ItemStatus, ValueType
@@ -173,12 +179,14 @@ class SupervisedOpcAdapter:
                 logger.info("Re-creating group %s (rate=%dms)...", group_name, update_rate)
                 resp = self._send_raw({"op": "create_group", "name": group_name, "update_rate_ms": update_rate})
                 if resp.get("ok"):
-                    handle = resp.get("handle")
+                    handle = group_handle_from_ipc(resp["handle"])
                     self._group_handles[group_name] = handle
                     items = self._group_items.get(group_name, [])
                     if items:
                         logger.info("Re-adding %d items to group %s...", len(items), group_name)
-                        add_resp = self._send_raw({"op": "add_items", "group": handle, "item_paths": items})
+                        add_resp = self._send_raw({
+                            "op": "add_items", "group": group_handle_to_ipc(handle), "item_paths": items
+                        })
                         if add_resp.get("ok"):
                             self._item_mappings[group_name] = add_resp.get("mapping", {})
 
@@ -269,7 +277,7 @@ class SupervisedOpcAdapter:
     def create_group(self, name: str, update_rate_ms: int) -> GroupHandle:
         """Create a new OPC group."""
         resp = self._execute({"op": "create_group", "name": name, "update_rate_ms": update_rate_ms})
-        handle = resp["handle"]
+        handle = group_handle_from_ipc(resp["handle"])
         self._groups[name] = update_rate_ms
         self._group_items[name] = []
         self._group_handles[name] = handle
@@ -278,7 +286,7 @@ class SupervisedOpcAdapter:
     def remove_group(self, handle: GroupHandle) -> None:
         """Remove an OPC group."""
         group_name = handle.name if hasattr(handle, "name") else str(handle)
-        self._execute({"op": "remove_group", "handle": handle})
+        self._execute({"op": "remove_group", "handle": group_handle_to_ipc(handle)})
         self._groups.pop(group_name, None)
         self._group_items.pop(group_name, None)
         self._group_handles.pop(group_name, None)
@@ -287,7 +295,9 @@ class SupervisedOpcAdapter:
     def add_items(self, group: GroupHandle, item_paths: list[str]) -> dict[str, int]:
         """Add items to an OPC group. Returns mapping of item_path -> item_id."""
         group_name = group.name if hasattr(group, "name") else str(group)
-        resp = self._execute({"op": "add_items", "group": group, "item_paths": item_paths})
+        resp = self._execute({
+            "op": "add_items", "group": group_handle_to_ipc(group), "item_paths": item_paths
+        })
         mapping = resp["mapping"]
 
         # Track items for recovery
@@ -302,7 +312,9 @@ class SupervisedOpcAdapter:
     def remove_items(self, group: GroupHandle, item_ids: list[int]) -> None:
         """Remove items from an OPC group."""
         group_name = group.name if hasattr(group, "name") else str(group)
-        self._execute({"op": "remove_items", "group": group, "item_ids": item_ids})
+        self._execute({
+            "op": "remove_items", "group": group_handle_to_ipc(group), "item_ids": item_ids
+        })
 
         # Update tracked items
         mapping = self._item_mappings.get(group_name, {})
@@ -330,7 +342,7 @@ class SupervisedOpcAdapter:
         now_us = int(time.time() * 1_000_000)
         try:
             resp = self._execute(
-                {"op": "read_device", "group": group, "item_ids": item_ids},
+                {"op": "read_device", "group": group_handle_to_ipc(group), "item_ids": item_ids},
                 timeout=timeout,
                 allow_retry=False,  # Single-attempt deadline enforcement
             )

@@ -13,6 +13,8 @@ import sys
 import time
 from multiprocessing.connection import Client
 
+from opc_bridge.adapters.base import group_handle_from_ipc, group_handle_to_ipc
+
 # Configure basic logging for child process
 logging.basicConfig(
     level=logging.INFO,
@@ -21,6 +23,46 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 IPC_AUTHKEY = b"opc-bridge-supervised-worker"
+
+
+def process_worker_command(adapter, msg: dict) -> dict:
+    """Execute a command and return data safe to serialize across IPC."""
+    op = msg.get("op")
+    if op == "ping":
+        return {"ok": True, "pong": True, "time": time.time()}
+    if op == "connect":
+        adapter.connect(msg["prog_id"])
+        return {"ok": True}
+    if op == "disconnect":
+        adapter.disconnect()
+        return {"ok": True}
+    if op == "create_group":
+        handle = adapter.create_group(msg["name"], msg["update_rate_ms"])
+        return {"ok": True, "handle": group_handle_to_ipc(handle)}
+    if op == "remove_group":
+        adapter.remove_group(group_handle_from_ipc(msg["handle"]))
+        return {"ok": True}
+    if op == "add_items":
+        group = group_handle_from_ipc(msg["group"])
+        return {"ok": True, "mapping": adapter.add_items(group, msg["item_paths"])}
+    if op == "remove_items":
+        group = group_handle_from_ipc(msg["group"])
+        adapter.remove_items(group, msg["item_ids"])
+        return {"ok": True}
+    if op == "read_device":
+        group = group_handle_from_ipc(msg["group"])
+        return {"ok": True, "results": adapter.read_device(group, msg["item_ids"])}
+    if op == "browse_items":
+        return {"ok": True, "entries": adapter.browse_items(msg.get("parent_path", ""))}
+    if op == "get_server_status":
+        return {"ok": True, "status": adapter.get_server_status()}
+    if op == "discover_servers":
+        from opc_bridge.adapters.da import OpcDaAdapter
+
+        return {"ok": True, "servers": OpcDaAdapter.discover_servers()}
+    if op == "exit":
+        return {"ok": True}
+    return {"ok": False, "error": f"Unknown operation: {op}"}
 
 
 def main() -> None:
@@ -82,60 +124,14 @@ def main() -> None:
 
         op = msg.get("op")
         try:
-            if op == "ping":
-                conn.send({"ok": True, "pong": True, "time": time.time()})
-            elif op == "connect":
-                prog_id = msg["prog_id"]
-                adapter.connect(prog_id)
-                conn.send({"ok": True})
-            elif op == "disconnect":
-                adapter.disconnect()
-                conn.send({"ok": True})
-            elif op == "create_group":
-                name = msg["name"]
-                update_rate_ms = msg["update_rate_ms"]
-                handle = adapter.create_group(name, update_rate_ms)
-                conn.send({"ok": True, "handle": handle})
-            elif op == "remove_group":
-                handle = msg["handle"]
-                adapter.remove_group(handle)
-                conn.send({"ok": True})
-            elif op == "add_items":
-                group = msg["group"]
-                item_paths = msg["item_paths"]
-                mapping = adapter.add_items(group, item_paths)
-                conn.send({"ok": True, "mapping": mapping})
-            elif op == "remove_items":
-                group = msg["group"]
-                item_ids = msg["item_ids"]
-                adapter.remove_items(group, item_ids)
-                conn.send({"ok": True})
-            elif op == "read_device":
-                group = msg["group"]
-                item_ids = msg["item_ids"]
-                results = adapter.read_device(group, item_ids)
-                conn.send({"ok": True, "results": results})
-            elif op == "browse_items":
-                parent_path = msg.get("parent_path", "")
-                entries = adapter.browse_items(parent_path)
-                conn.send({"ok": True, "entries": entries})
-            elif op == "get_server_status":
-                status = adapter.get_server_status()
-                conn.send({"ok": True, "status": status})
-            elif op == "discover_servers":
-                servers = OpcDaAdapter.discover_servers()
-                conn.send({"ok": True, "servers": servers})
-            elif op == "crash":
-                # For testing crash recovery
+            if op == "crash":
                 logger.warning("Simulated crash requested; terminating abruptly.")
                 os._exit(42)
-            elif op == "exit":
+            conn.send(process_worker_command(adapter, msg))
+            if op == "exit":
                 logger.info("Graceful exit requested.")
                 running = False
-                conn.send({"ok": True})
                 break
-            else:
-                conn.send({"ok": False, "error": f"Unknown operation: {op}"})
         except Exception as exc:
             logger.exception("Error executing operation %r", op)
             conn.send({"ok": False, "error": str(exc), "type": type(exc).__name__})
