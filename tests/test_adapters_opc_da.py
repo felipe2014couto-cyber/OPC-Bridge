@@ -15,6 +15,7 @@ import os
 import struct
 import sys
 import time
+from types import ModuleType
 from typing import Any
 
 try:
@@ -234,6 +235,44 @@ def mock_com_adapter() -> OpcDaAdapter:
 
 class TestOpcDaAdapter:
     """Unit tests for OpcDaAdapter contract compliance."""
+
+    def test_connect_activates_automation_wrapper_before_abb(self, monkeypatch):
+        """Simulate Windows activation without invoking COM or the ABB server."""
+        calls = []
+
+        class RecordingComServer(MockComServer):
+            def Connect(self, prog_id):
+                calls.append(("Connect", prog_id))
+                super().Connect(prog_id)
+
+        server = RecordingComServer()
+
+        def dispatch(prog_id):
+            calls.append(("Dispatch", prog_id))
+            return server
+
+        pythoncom = ModuleType("pythoncom")
+        pythoncom.CoInitialize = lambda: None
+        pythoncom.CoUninitialize = lambda: None
+        win32com = ModuleType("win32com")
+        client = ModuleType("win32com.client")
+        client.Dispatch = dispatch
+        win32com.client = client
+        monkeypatch.setitem(sys.modules, "pythoncom", pythoncom)
+        monkeypatch.setitem(sys.modules, "win32com", win32com)
+        monkeypatch.setitem(sys.modules, "win32com.client", client)
+        monkeypatch.setattr(sys, "platform", "win32")
+
+        adapter = OpcDaAdapter()
+        try:
+            adapter.connect("ABB.AfwOpcDaSurrogate.1")
+            assert adapter._connected is True
+            assert calls == [
+                ("Dispatch", "OPC.Automation"),
+                ("Connect", "ABB.AfwOpcDaSurrogate.1"),
+            ]
+        finally:
+            adapter.disconnect()
 
     def test_discovery(self):
         """Discovery enumerates registered servers without crashing."""
@@ -695,4 +734,3 @@ if __name__ == "__main__":
     print("=" * 60)
     print("ALL 19 OPC DA & SUPERVISION TESTS PASSED SUCCESSFULLY!")
     print("=" * 60)
-

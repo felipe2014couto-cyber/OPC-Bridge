@@ -352,7 +352,7 @@ class OpcDaAdapter:
                 import win32com.client
 
                 pythoncom.CoInitialize()
-                self._server = win32com.client.Dispatch("OPCAutomation.OPCServer")
+                self._server = win32com.client.Dispatch("OPC.Automation")
             else:
                 raise RuntimeError("Production OPC DA requires Windows COM")
 
