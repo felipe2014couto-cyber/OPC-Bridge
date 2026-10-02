@@ -113,6 +113,26 @@ class PersistenceRepository:
         query += " ORDER BY o.requested_at DESC, o.operation_id DESC"
         return self._dicts(self._execute(query, parameters))
 
+    def next_config_version(self, agent_id: str) -> int:
+        cursor = self._execute(
+            "SELECT COALESCE(MAX(version), 0) + 1 FROM config_snapshots WHERE agent_id = ?",
+            (agent_id,),
+        )
+        return int(cursor.fetchone()[0])
+
+    def get_admin_config_operation(self, operation_id: str) -> Optional[dict[str, Any]]:
+        rows = self._dicts(
+            self._execute(
+                "SELECT o.operation_id, o.agent_id, o.status, s.version, "
+                "o.requested_at, o.completed_at "
+                "FROM config_operations o JOIN config_snapshots s "
+                "ON s.snapshot_id = o.snapshot_id AND s.agent_id = o.agent_id "
+                "WHERE o.operation_id = ?",
+                (operation_id,),
+            )
+        )
+        return rows[0] if rows else None
+
     def add_agent(self, agent_id: str, display_name: str) -> Agent:
         self._execute("INSERT INTO agents(agent_id, display_name) VALUES (?, ?)", (agent_id, display_name))
         return Agent(agent_id=agent_id, display_name=display_name)

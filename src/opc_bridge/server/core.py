@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import hmac
 import json
 import logging
+import os
 import ssl
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -74,6 +77,9 @@ class AgentSession:
     config_version: int = 0
     seq_out: int = 0
     seq_in: int = 0
+    config_items: list[ItemRef] = field(default_factory=list)
+    update_rate_ms: int = 1000
+    opc_prog_id: str = ""
 
     async def send(self, msg_type: MsgType, payload: bytes) -> None:
         """Send a framed message to the agent."""
@@ -92,6 +98,9 @@ class BridgeServer:
         self._config_items: list[ItemRef] = []
         self._config_version: int = 0
         self._server: asyncio.AbstractServer | None = None
+        self._event_loop: asyncio.AbstractEventLoop | None = None
+        self._admin_httpd = None
+        self._admin_thread: threading.Thread | None = None
         self._running = False
         self._next_request_id = 0
         self._pending_reads: dict[tuple[str, int], asyncio.Future[ReadResponsePayload]] = {}
@@ -99,6 +108,7 @@ class BridgeServer:
         self.read_metrics = ReadSchedulerMetrics()
         self._pending_config_operations: dict[tuple[str, int], str] = {}
         self._config_timeout_tasks: dict[tuple[str, int], asyncio.Task[None]] = {}
+        self._pending_config_payloads: dict[tuple[str, int], ConfigPushPayload] = {}
         if self.config.persistence is not None:
             self._recover_persisted_state()
 
@@ -186,6 +196,7 @@ class BridgeServer:
         if self._pending_config_operations.get(key) != operation_id:
             return
         self._pending_config_operations.pop(key, None)
+        self._pending_config_payloads.pop(key, None)
         self._config_timeout_tasks.pop(key, None)
         self._complete_config_operation(operation_id, agent_id, "expired")
 
@@ -223,6 +234,10 @@ class BridgeServer:
         """Update the server-side tag configuration."""
         self._config_items = list(items)
         self._config_version = version
+        for session in self._sessions.values():
+            session.config_items = list(items)
+            session.update_rate_ms = self.config.default_update_rate_ms
+            session.opc_prog_id = self.config.opc_prog_id
         logger.info("Config updated: version=%d, items=%d", version, len(items))
 
     def _allocate_request_id(self) -> int:
@@ -236,6 +251,7 @@ class BridgeServer:
 
     async def start(self) -> None:
         """Start the TLS server."""
+        self._event_loop = asyncio.get_running_loop()
         ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         if self.config.certfile and self.config.keyfile:
             ssl_ctx.load_cert_chain(self.config.certfile, self.config.keyfile)
@@ -249,13 +265,60 @@ class BridgeServer:
             self.config.port,
             ssl=ssl_ctx,
         )
+        try:
+            self._start_admin_api()
+        except Exception:
+            self._server.close()
+            await self._server.wait_closed()
+            self._server = None
+            raise
         self._running = True
         addrs = ", ".join(str(s.getsockname()) for s in self._server.sockets or [])
         logger.info("BridgeServer listening on %s", addrs)
 
+    def _start_admin_api(self) -> None:
+        """Embed the loopback admin API in this persisted BridgeServer runtime.
+
+        Setting ADMIN_API_TOKEN enables the writable API. The API receives this
+        exact BridgeServer and its Database instance; without the token, no
+        administrative HTTP listener is started.
+        """
+        if not os.environ.get("ADMIN_API_TOKEN"):
+            return
+        if self.config.persistence is None:
+            raise RuntimeError("The admin API requires BridgeServer persistence")
+        port_text = os.environ.get("ADMIN_API_PORT", "8081")
+        try:
+            port = int(port_text)
+        except ValueError as exc:
+            raise RuntimeError("ADMIN_API_PORT must be an integer") from exc
+        if not 0 <= port <= 65535:
+            raise RuntimeError("ADMIN_API_PORT must be between 0 and 65535")
+        from wsgiref.simple_server import make_server
+
+        from opc_bridge.server.admin import create_app
+
+        app = create_app(self.config.persistence, self)
+        self._admin_httpd = make_server("127.0.0.1", port, app)
+        self._admin_thread = threading.Thread(
+            target=self._admin_httpd.serve_forever,
+            name="opc-bridge-admin-api",
+            daemon=True,
+        )
+        self._admin_thread.start()
+        logger.info("Admin API listening on 127.0.0.1:%d", self._admin_httpd.server_port)
+
     async def stop(self) -> None:
         """Stop the server and close all sessions."""
         self._running = False
+        if self._admin_httpd is not None:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self._admin_httpd.shutdown)
+            self._admin_httpd.server_close()
+            if self._admin_thread is not None:
+                await loop.run_in_executor(None, self._admin_thread.join)
+            self._admin_httpd = None
+            self._admin_thread = None
         for task in list(self._scheduler_tasks.values()):
             task.cancel()
         if self._scheduler_tasks:
@@ -282,6 +345,7 @@ class BridgeServer:
             if timeout_task is not None:
                 timeout_task.cancel()
         self._pending_config_operations.clear()
+        self._pending_config_payloads.clear()
         self._sessions.clear()
         if self._server:
             self._server.close()
@@ -290,35 +354,77 @@ class BridgeServer:
 
     async def push_config_to_all(self) -> None:
         """Push current configuration to all connected agents."""
-        payload = ConfigPushPayload(
-            config_version=self._config_version,
-            update_rate_ms=self.config.default_update_rate_ms,
-            items=self._config_items,
-            opc_prog_id=self.config.opc_prog_id,
-        ).pack()
         for sid, session in list(self._sessions.items()):
-            key = (sid, self._config_version)
-            if key in self._pending_config_operations:
-                continue
             operation_id = None
             try:
                 operation_id = self._persist_config_operation(session)
-                if operation_id is not None:
-                    self._pending_config_operations[key] = operation_id
-                    self._config_timeout_tasks[key] = asyncio.create_task(
-                        self._expire_config_operation(key, operation_id, session.agent_id),
-                        name=f"config-ack-timeout-{session.session_id}-{self._config_version}",
-                    )
-                await session.send(MsgType.CONFIG_PUSH, payload)
-                logger.debug("Config pushed to session %s", sid)
+                config_payload = ConfigPushPayload(
+                    self._config_version,
+                    self.config.default_update_rate_ms,
+                    list(self._config_items),
+                    self.config.opc_prog_id,
+                )
+                await self._send_config_payload(session, config_payload, operation_id)
             except (OSError, ConnectionError, asyncio.TimeoutError) as exc:
                 logger.warning("Failed to push config to %s: %s", sid, exc)
-                if operation_id is not None:
-                    timeout_task = self._config_timeout_tasks.pop(key, None)
-                    if timeout_task is not None:
-                        timeout_task.cancel()
-                    self._pending_config_operations.pop(key, None)
-                    self._complete_config_operation(operation_id, session.agent_id, "failed")
+
+    async def _send_config_payload(
+        self,
+        session: AgentSession,
+        config_payload: ConfigPushPayload,
+        operation_id: str | None,
+    ) -> bool:
+        key = (session.session_id, config_payload.config_version)
+        if key in self._pending_config_operations:
+            return False
+        if operation_id is not None:
+            self._pending_config_operations[key] = operation_id
+            self._pending_config_payloads[key] = config_payload
+            self._config_timeout_tasks[key] = asyncio.create_task(
+                self._expire_config_operation(key, operation_id, session.agent_id),
+                name=f"config-ack-timeout-{session.session_id}-{config_payload.config_version}",
+            )
+        try:
+            await session.send(MsgType.CONFIG_PUSH, config_payload.pack())
+        except (OSError, ConnectionError, asyncio.TimeoutError):
+            self._pending_config_operations.pop(key, None)
+            self._pending_config_payloads.pop(key, None)
+            timeout_task = self._config_timeout_tasks.pop(key, None)
+            if timeout_task is not None:
+                timeout_task.cancel()
+            if operation_id is not None:
+                self._complete_config_operation(operation_id, session.agent_id, "failed")
+            raise
+        logger.debug("Config pushed to session %s", session.session_id)
+        return True
+
+    async def dispatch_admin_config_operation(
+        self, agent_id: str, operation_id: str, payload: ConfigPushPayload
+    ) -> bool | None:
+        """Send a persisted admin operation through the existing CONFIG_PUSH path."""
+        session = next(
+            (active for active in self._sessions.values() if active.agent_id == agent_id),
+            None,
+        )
+        if session is None:
+            return None
+        return await self._send_config_payload(session, payload, operation_id)
+
+    def dispatch_admin_config_operation_threadsafe(
+        self, agent_id: str, operation_id: str, payload: ConfigPushPayload
+    ) -> bool | None:
+        """Bridge the WSGI worker thread to the running server event loop."""
+        loop = self._event_loop
+        if loop is None or not loop.is_running():
+            return None
+        future = asyncio.run_coroutine_threadsafe(
+            self.dispatch_admin_config_operation(agent_id, operation_id, payload), loop
+        )
+        try:
+            return future.result(timeout=max(1, self.config.read_cycle_timeout_ms / 1000))
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            return None
 
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -420,6 +526,9 @@ class BridgeServer:
 
         auth = AuthPayload.unpack(payload)
         applied_version: int | None = None
+        session_items = list(self._config_items)
+        session_update_rate_ms = self.config.default_update_rate_ms
+        session_opc_prog_id = self.config.opc_prog_id
         if self.config.persistence is None:
             success = hmac.compare_digest(auth.token_hash, self.config.auth_token_hash)
         else:
@@ -437,7 +546,11 @@ class BridgeServer:
                     previous_snapshot = repo.latest_applied_snapshot(hello.agent_id)
                     if previous_snapshot is not None:
                         try:
-                            applied_version = int(json.loads(previous_snapshot.payload_json)["config_version"])
+                            previous_config = json.loads(previous_snapshot.payload_json)
+                            applied_version = int(previous_config["config_version"])
+                            session_items = [ItemRef(**item) for item in previous_config["items"]]
+                            session_update_rate_ms = int(previous_config["update_rate_ms"])
+                            session_opc_prog_id = str(previous_config["opc_prog_id"])
                         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                             logger.exception("Persisted applied config for %s is invalid", hello.agent_id)
         auth_ack = AuthAckPayload(success=success, policies_version=1).pack()
@@ -484,6 +597,9 @@ class BridgeServer:
             capabilities=hello.capabilities,
             config_version=applied_version or 0,
             seq_in=header.seq,
+            config_items=session_items,
+            update_rate_ms=session_update_rate_ms,
+            opc_prog_id=session_opc_prog_id,
         )
 
     async def _message_loop(self, session: AgentSession, reader: asyncio.StreamReader) -> None:
@@ -522,12 +638,17 @@ class BridgeServer:
                 ack = ConfigAckPayload.unpack(payload)
                 key = (session.session_id, ack.config_version)
                 operation_id = self._pending_config_operations.pop(key, None)
+                config_payload = self._pending_config_payloads.pop(key, None)
                 timeout_task = self._config_timeout_tasks.pop(key, None)
                 if timeout_task is not None:
                     timeout_task.cancel()
                 persisted = self.config.persistence is not None
                 if ack.applied and (not persisted or operation_id is not None):
                     session.config_version = ack.config_version
+                    if config_payload is not None:
+                        session.config_items = list(config_payload.items)
+                        session.update_rate_ms = config_payload.update_rate_ms
+                        session.opc_prog_id = config_payload.opc_prog_id
                     if operation_id is not None:
                         self._complete_config_operation(operation_id, session.agent_id, "applied")
                         with self.config.persistence.session() as repo:
@@ -573,10 +694,10 @@ class BridgeServer:
 
     async def _schedule_reads(self, session: AgentSession) -> None:
         """Run one non-overlapping read cycle per configured agent group."""
-        interval_ms = max(1, self.config.default_update_rate_ms)
+        interval_ms = max(1, session.update_rate_ms)
         next_tick = time.monotonic() + interval_ms / 1000
         while self._running and session.session_id in self._sessions:
-            interval_ms = max(1, self.config.default_update_rate_ms)
+            interval_ms = max(1, session.update_rate_ms)
             interval = interval_ms / 1000
             timeout = max(1, self.config.read_cycle_timeout_ms) / 1000
             delay = next_tick - time.monotonic()
@@ -591,7 +712,7 @@ class BridgeServer:
             key = (session.session_id, request_id)
             self._pending_reads[key] = future
             try:
-                request = ReadRequestPayload(request_id=request_id, items=list(self._config_items))
+                request = ReadRequestPayload(request_id=request_id, items=list(session.config_items))
                 await session.send(MsgType.READ_REQUEST, request.pack())
                 await asyncio.wait_for(future, timeout=timeout)
             except asyncio.TimeoutError:
