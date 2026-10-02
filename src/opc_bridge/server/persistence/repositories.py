@@ -146,6 +146,15 @@ class PersistenceRepository:
         )
         return AgentCredential(credential_id, agent_id, credential_hash)
 
+    def revoke_active_credentials(self, agent_id: str) -> int:
+        """Revoke all currently active credentials for one agent."""
+        cursor = self._execute(
+            "UPDATE agent_credentials SET revoked_at = CURRENT_TIMESTAMP "
+            "WHERE agent_id = ? AND revoked_at IS NULL",
+            (agent_id,),
+        )
+        return cursor.rowcount
+
     def add_session(
         self,
         agent_id: str,

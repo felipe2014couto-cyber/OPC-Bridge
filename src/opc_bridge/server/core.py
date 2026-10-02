@@ -28,6 +28,7 @@ from opc_bridge.protocol import (
     frame_message,
     unframe_message,
 )
+from opc_bridge.server.credentials import verify_agent_credential_hash
 from opc_bridge.server.persistence import Database
 
 logger = logging.getLogger(__name__)
@@ -537,12 +538,7 @@ class BridgeServer:
                 agent = repo.get_agent(hello.agent_id)
                 if agent is not None and agent.enabled:
                     for stored_hash in repo.active_credential_hashes(hello.agent_id):
-                        encoded_hash = stored_hash.split(":", 1)[-1]
-                        try:
-                            expected_hash = bytes.fromhex(encoded_hash)
-                        except ValueError:
-                            expected_hash = b""
-                        success = hmac.compare_digest(auth.token_hash, expected_hash) or success
+                        success = verify_agent_credential_hash(auth.token_hash, stored_hash) or success
                     previous_snapshot = repo.latest_applied_snapshot(hello.agent_id)
                     if previous_snapshot is not None:
                         try:
