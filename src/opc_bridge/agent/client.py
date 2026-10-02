@@ -15,6 +15,7 @@ from dataclasses import replace
 from typing import Callable
 
 from opc_bridge.adapters.base import OpcAdapter
+from opc_bridge.agent.inspection import inspect_opc
 from opc_bridge.protocol import (
     HEADER_SIZE,
     TRAILER_SIZE,
@@ -35,6 +36,7 @@ from opc_bridge.protocol import (
     frame_message,
     unframe_message,
 )
+from opc_bridge.protocol.inspection import CAPABILITY, InspectionRequest, InspectionResponse
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +79,7 @@ class AgentClient:
         self._last_received = time.monotonic()
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._heartbeat_expired = False
+        self._inspection_task: asyncio.Task | None = None
 
     @property
     def session_id(self) -> str | None:
@@ -118,7 +121,7 @@ class AgentClient:
             agent_id=self._agent_id,
             hostname="agent-host",
             os_version="Python",
-            capabilities=["opc-da-sim"],
+            capabilities=[CAPABILITY] if self._adapter_factory is not None else [],
         )
         await self._send(MsgType.HELLO, hello.pack())
 
@@ -164,6 +167,8 @@ class AgentClient:
 
             if header.msg_type == MsgType.CONFIG_PUSH:
                 await self._handle_config_push(payload)
+            elif header.msg_type == MsgType.OPC_INSPECT_REQUEST:
+                await self._handle_inspection_request(payload)
             elif header.msg_type == MsgType.READ_REQUEST:
                 await self._handle_read_request(payload)
             elif header.msg_type == MsgType.HEARTBEAT:
@@ -176,6 +181,9 @@ class AgentClient:
             else:
                 logger.warning("Unexpected message type: %s", header.msg_type)
         self._running = False
+        if self._inspection_task is not None:
+            self._inspection_task.cancel()
+            await asyncio.gather(self._inspection_task, return_exceptions=True)
         if self._heartbeat_task:
             self._heartbeat_task.cancel()
             await asyncio.gather(self._heartbeat_task, return_exceptions=True)
@@ -197,6 +205,24 @@ class AgentClient:
             except (OSError, ConnectionError):
                 self._running = False
                 return
+
+    async def _handle_inspection_request(self, payload: bytes) -> None:
+        request = InspectionRequest.unpack(payload)
+        if self._inspection_task is not None and not self._inspection_task.done():
+            await self._send(MsgType.OPC_INSPECT_RESPONSE,
+                             InspectionResponse(request.request_id, error="busy").pack())
+            return
+
+        async def execute() -> None:
+            try:
+                response = await asyncio.get_running_loop().run_in_executor(
+                    None, inspect_opc, request, self._adapter_factory, self._adapter
+                )
+                await self._send(MsgType.OPC_INSPECT_RESPONSE, response.pack())
+            except Exception:  # noqa: BLE001 - transport cleanup; never log provider details.
+                logger.warning("Inspection response could not be delivered")
+
+        self._inspection_task = asyncio.create_task(execute())
 
     async def _handle_config_push(self, payload: bytes) -> None:
         """Process CONFIG_PUSH and send CONFIG_ACK."""

@@ -28,6 +28,8 @@ class MsgType(IntEnum):
     READ_RESPONSE = 0x08
     HEARTBEAT = 0x09
     ERROR = 0x0A
+    OPC_INSPECT_REQUEST = 0x0B
+    OPC_INSPECT_RESPONSE = 0x0C
 
 
 class ItemStatus(IntEnum):

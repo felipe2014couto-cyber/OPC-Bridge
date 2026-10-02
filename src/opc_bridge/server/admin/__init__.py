@@ -12,6 +12,7 @@ from urllib.parse import parse_qs
 from wsgiref.simple_server import make_server
 
 from opc_bridge.protocol import ConfigPushPayload, ItemRef
+from opc_bridge.server.admin.tags import TagAdministration
 from opc_bridge.server.core import BridgeServer
 from opc_bridge.server.persistence import Database, database_from_env
 
@@ -96,7 +97,7 @@ def _same_database(left: Database, right: Database) -> bool:
     return left.database_url == right.database_url
 
 
-class AdminApplication:
+class AdminApplication(TagAdministration):
     """WSGI application with explicit bearer authentication and safe projections."""
 
     def __init__(self, database: Database, bridge_server: BridgeServer | None = None) -> None:
@@ -104,6 +105,7 @@ class AdminApplication:
         self._bridge_server = bridge_server
         self._admin_token = _configured_admin_token().encode("utf-8")
         self._service_version = _service_version()
+        self.init_tag_ui()
 
     def _authorized(self, environ: dict[str, Any]) -> bool:
         authorization = str(environ.get("HTTP_AUTHORIZATION", ""))
@@ -133,6 +135,9 @@ class AdminApplication:
     def _read_request(
         self, method: str, path: str, query: str, environ: dict[str, Any], start_response: Callable[..., Any]
     ) -> list[bytes]:
+        tag_response = self.tag_route(method, path, query, environ, start_response)
+        if tag_response is not None:
+            return tag_response
         if (method == "POST" and self._bridge_server is not None and
                 path.startswith("/api/v1/agents/") and path.endswith("/config-operations")):
             agent_id = path[len("/api/v1/agents/") : -len("/config-operations")].rstrip("/")
@@ -181,6 +186,15 @@ class AdminApplication:
                 "200 OK",
                 {"operations": [_operation_view(row) for row in rows]},
             )
+        if path.startswith("/api/v1/config-operations/") and not query:
+            operation_id = path[len("/api/v1/config-operations/"):]
+            if not operation_id or "/" in operation_id:
+                return self._json_response(start_response, "404 Not Found", {"error": "not_found"})
+            with self._database.session() as repo:
+                operation = repo.get_admin_config_operation(operation_id)
+            if operation is None:
+                return self._json_response(start_response, "404 Not Found", {"error": "not_found"})
+            return self._json_response(start_response, "200 OK", {"operation": _operation_view(operation)})
         return self._json_response(start_response, "404 Not Found", {"error": "not_found"})
 
     @staticmethod
@@ -284,7 +298,8 @@ class AdminApplication:
                 repo.add_audit_event(
                     agent_id, str(uuid.uuid4()), "config.requested",
                     json.dumps({"operation_id": operation_id, "version": config_version,
-                                "item_count": len(config["items"])}),
+                                "item_count": len(config["items"]),
+                                "ui_confirmed": environ.get("opc_bridge.validated_context") is not None}),
                 )
         except Exception as exc:
             if isinstance(exc, (ValueError, sqlite3.IntegrityError)) or getattr(exc, "pgcode", None) == "23505":
@@ -294,9 +309,15 @@ class AdminApplication:
             config_version, config["update_rate_ms"], config["items"], config["opc_prog_id"]
         )
         try:
-            dispatched = self._bridge_server.dispatch_admin_config_operation_threadsafe(
-                agent_id, operation_id, push
-            )
+            expected_context = environ.get("opc_bridge.validated_context")
+            if expected_context is not None:
+                dispatched = self._bridge_server.dispatch_admin_config_operation_threadsafe(
+                    agent_id, operation_id, push, expected_context=expected_context
+                )
+            else:
+                dispatched = self._bridge_server.dispatch_admin_config_operation_threadsafe(
+                    agent_id, operation_id, push
+                )
             if dispatched is False:
                 with self._database.session() as repo:
                     repo.complete_operation(operation_id, "failed")
@@ -320,6 +341,9 @@ class AdminApplication:
     def __call__(
         self, environ: dict[str, Any], start_response: Callable[..., Any]
     ) -> Iterable[bytes]:
+        asset = self.ui_asset(str(environ.get("PATH_INFO", "/")), environ, start_response)
+        if asset is not None:
+            return asset
         if not self._authorized(environ):
             return self._json_response(start_response, "401 Unauthorized", {"error": "unauthorized"})
         try:

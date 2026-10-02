@@ -28,6 +28,7 @@ from opc_bridge.protocol import (
     frame_message,
     unframe_message,
 )
+from opc_bridge.protocol.inspection import CAPABILITY, InspectionRequest, InspectionResponse
 from opc_bridge.server.credentials import verify_agent_credential_hash
 from opc_bridge.server.persistence import Database
 
@@ -110,6 +111,7 @@ class BridgeServer:
         self._pending_config_operations: dict[tuple[str, int], str] = {}
         self._config_timeout_tasks: dict[tuple[str, int], asyncio.Task[None]] = {}
         self._pending_config_payloads: dict[tuple[str, int], ConfigPushPayload] = {}
+        self._pending_inspections: dict[tuple[str, str], asyncio.Future] = {}
         if self.config.persistence is not None:
             self._recover_persisted_state()
 
@@ -329,6 +331,10 @@ class BridgeServer:
             if not future.done():
                 future.cancel()
         self._pending_reads.clear()
+        for future in self._pending_inspections.values():
+            if not future.done():
+                future.cancel()
+        self._pending_inspections.clear()
         for session in list(self._sessions.values()):
             try:
                 session.writer.close()
@@ -400,26 +406,67 @@ class BridgeServer:
         return True
 
     async def dispatch_admin_config_operation(
-        self, agent_id: str, operation_id: str, payload: ConfigPushPayload
+        self, agent_id: str, operation_id: str, payload: ConfigPushPayload,
+        expected_context: tuple[str, int] | None = None,
     ) -> bool | None:
         """Send a persisted admin operation through the existing CONFIG_PUSH path."""
         session = next(
             (active for active in self._sessions.values() if active.agent_id == agent_id),
             None,
         )
+        if expected_context is not None and (
+                session is None or (session.session_id, session.config_version) != expected_context):
+            return False
         if session is None:
             return None
         return await self._send_config_payload(session, payload, operation_id)
 
+    async def inspect_agent(self, agent_id: str, request: InspectionRequest) -> InspectionResponse:
+        """Correlate inspection with the current authenticated session only."""
+        session = next((s for s in self._sessions.values() if s.agent_id == agent_id), None)
+        if session is None:
+            raise ValueError("agent_disconnected")
+        if CAPABILITY not in session.capabilities:
+            raise ValueError("inspection_unsupported")
+        if any(sid == session.session_id for sid, _ in self._pending_inspections):
+            raise ValueError("inspection_busy")
+        key = (session.session_id, request.request_id)
+        future = asyncio.get_running_loop().create_future()
+        self._pending_inspections[key] = future
+        try:
+            await session.send(MsgType.OPC_INSPECT_REQUEST, request.pack())
+            response = await asyncio.wait_for(future, timeout=45)
+            if (request.action == "tags" and response.error is None and
+                    (response.servers is not None or response.results is None or
+                     [r["opc_item_path"] for r in response.results] != request.tags)):
+                raise ValueError("inspection_failed")
+            if request.action == "servers" and response.error is None and response.servers is None:
+                raise ValueError("inspection_failed")
+            return response
+        finally:
+            self._pending_inspections.pop(key, None)
+
+    def inspect_agent_threadsafe(self, agent_id: str, request: InspectionRequest) -> InspectionResponse:
+        loop = self._event_loop
+        if loop is None or not loop.is_running():
+            raise ValueError("runtime_unavailable")
+        future = asyncio.run_coroutine_threadsafe(self.inspect_agent(agent_id, request), loop)
+        try:
+            return future.result(timeout=47)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            raise ValueError("inspection_timeout") from None
+
     def dispatch_admin_config_operation_threadsafe(
-        self, agent_id: str, operation_id: str, payload: ConfigPushPayload
+        self, agent_id: str, operation_id: str, payload: ConfigPushPayload,
+        expected_context: tuple[str, int] | None = None,
     ) -> bool | None:
         """Bridge the WSGI worker thread to the running server event loop."""
         loop = self._event_loop
         if loop is None or not loop.is_running():
-            return None
+            return False if expected_context is not None else None
         future = asyncio.run_coroutine_threadsafe(
-            self.dispatch_admin_config_operation(agent_id, operation_id, payload), loop
+            self.dispatch_admin_config_operation(agent_id, operation_id, payload, expected_context), loop
         )
         try:
             return future.result(timeout=max(1, self.config.read_cycle_timeout_ms / 1000))
@@ -461,6 +508,9 @@ class BridgeServer:
                 scheduler_task.cancel()
                 await asyncio.gather(scheduler_task, return_exceptions=True)
             if session:
+                for key, future in list(self._pending_inspections.items()):
+                    if key[0] == session.session_id and not future.done():
+                        future.set_exception(ConnectionError("Agent disconnected"))
                 for key, future in list(self._pending_reads.items()):
                     if key[0] == session.session_id:
                         self._pending_reads.pop(key, None)
@@ -628,6 +678,15 @@ class BridgeServer:
                     resp.duration_us,
                     len(resp.results),
                 )
+            elif header.msg_type == MsgType.OPC_INSPECT_RESPONSE:
+                try:
+                    response = InspectionResponse.unpack(payload)
+                except (ValueError, TypeError, UnicodeError):
+                    logger.warning("Invalid inspection response from session %s", session.session_id)
+                    continue
+                future = self._pending_inspections.get((session.session_id, response.request_id))
+                if future is not None and not future.done():
+                    future.set_result(response)
             elif header.msg_type == MsgType.CONFIG_ACK:
                 from opc_bridge.protocol.messages import ConfigAckPayload
 

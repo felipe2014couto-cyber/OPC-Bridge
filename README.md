@@ -15,6 +15,7 @@ seleção do OPC, endereços dos itens e intervalos de coleta.
 - [docs/tasks/plan-v0.md](docs/tasks/plan-v0.md) — plano de tarefas da prova de conceito.
 - [docs/operations/autou3-linux-server.md](docs/operations/autou3-linux-server.md) — execução central no AUTOU3 Linux.
 - [docs/operations/agent-credentials.md](docs/operations/agent-credentials.md) — provisionamento seguro de credenciais individuais.
+- [docs/operations/tag-ui.md](docs/operations/tag-ui.md) — interface local para seleção de servidor OPC, validação isolada e aplicação confirmada de tags.
 
 ## Estrutura
 

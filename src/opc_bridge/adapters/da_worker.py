@@ -13,7 +13,7 @@ import sys
 import time
 from multiprocessing.connection import Client
 
-from opc_bridge.adapters.base import group_handle_from_ipc, group_handle_to_ipc
+from opc_bridge.adapters.base import group_handle_from_ipc, group_handle_to_ipc, opc_hresult
 
 # Configure basic logging for child process
 logging.basicConfig(
@@ -23,6 +23,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 IPC_AUTHKEY = b"opc-bridge-supervised-worker"
+
+
+def worker_error_response(exc: Exception) -> dict:
+    """Preserve a provider HRESULT without serializing the provider exception."""
+    return {"ok": False, "error": str(exc), "type": type(exc).__name__,
+            "hresult": opc_hresult(exc)}
 
 
 def process_worker_command(adapter, msg: dict) -> dict:
@@ -134,7 +140,7 @@ def main() -> None:
                 break
         except Exception as exc:
             logger.exception("Error executing operation %r", op)
-            conn.send({"ok": False, "error": str(exc), "type": type(exc).__name__})
+            conn.send(worker_error_response(exc))
 
     try:
         adapter.disconnect()

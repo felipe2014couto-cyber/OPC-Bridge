@@ -24,6 +24,9 @@ persistence = ["psycopg2-binary>=2.9"]
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"opc_bridge.server.admin" = ["static/*.html", "static/*.css", "static/*.js"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py38"

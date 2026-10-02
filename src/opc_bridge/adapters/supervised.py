@@ -29,6 +29,20 @@ from opc_bridge.protocol import ItemResult, ItemStatus, ValueType
 logger = logging.getLogger(__name__)
 
 
+class OpcWorkerError(RuntimeError):
+    """Worker failure with an optional primitive provider HRESULT."""
+
+    def __init__(self, message: str, hresult: int | None = None) -> None:
+        super().__init__(message)
+        self.hresult = hresult
+
+
+class OpcWorkerConnectionError(ConnectionError):
+    def __init__(self, message: str, hresult: int | None = None) -> None:
+        super().__init__(message)
+        self.hresult = hresult
+
+
 class SupervisedOpcAdapter:
     """Supervised OPC DA adapter running COM in an isolated child process.
 
@@ -45,6 +59,7 @@ class SupervisedOpcAdapter:
         command_timeout: float = 10.0,
         connect_timeout: float = 15.0,
         worker_architecture: str | None = None,
+        startup_timeout: float | None = None,
     ) -> None:
         if not worker_executable:
             exe = sys.executable
@@ -65,6 +80,7 @@ class SupervisedOpcAdapter:
         self.worker_module = worker_module
         self.command_timeout = command_timeout
         self.connect_timeout = connect_timeout
+        self.startup_timeout = startup_timeout
         self._prog_id = prog_id
 
         # Desired state tracking for automatic recovery
@@ -127,6 +143,8 @@ class SupervisedOpcAdapter:
         try:
             # Wait for child to connect with timeout
             if listener._listener._socket.fileno() != -1:
+                if self.startup_timeout is not None:
+                    listener._listener._socket.settimeout(self.startup_timeout)
                 self._conn = listener.accept()
                 logger.info("OPC worker connected successfully pid=%s", self._process.pid)
             else:
@@ -229,10 +247,10 @@ class SupervisedOpcAdapter:
                     err_msg = resp.get("error", "Unknown error")
                     err_type = resp.get("type", "RuntimeError")
                     if err_type == "ConnectionError":
-                        raise ConnectionError(err_msg)
+                        raise OpcWorkerConnectionError(err_msg, resp.get("hresult"))
                     elif err_type == "ValueError":
                         raise ValueError(err_msg)
-                    raise RuntimeError(err_msg)
+                    raise OpcWorkerError(err_msg, resp.get("hresult"))
                 return resp
             except TimeoutError as exc:
                 # Do not retry on timeout; re-raise immediately to enforce deadline

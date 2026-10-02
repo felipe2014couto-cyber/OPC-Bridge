@@ -29,6 +29,20 @@ OPC_STATUS_SUSPENDED = "SUSPENDED"
 OPC_STATUS_TEST = "TEST"
 
 
+def opc_hresult(exc: BaseException) -> int | None:
+    """Extract only the numeric HRESULT, including provider exception causes."""
+    for _ in range(8):
+        code = getattr(exc, "hresult", None)
+        if code is None and exc.args and type(exc.args[0]) is int:
+            code = exc.args[0]
+        if type(code) is int:
+            return code & 0xFFFFFFFF
+        if exc.__cause__ is None:
+            break
+        exc = exc.__cause__
+    return None
+
+
 @dataclass
 class BrowseEntry:
     """Information about an item or branch in the OPC server namespace."""

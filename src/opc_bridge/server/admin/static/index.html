@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OPC-Bridge · Tags</title>
+  <link rel="stylesheet" href="/ui/style.css"><script src="/ui/app.js" defer></script>
+</head>
+<body>
+<header><div><span class="eyebrow">OPC-BRIDGE / CONTROL PLANE</span><h1>Planos de leitura OPC</h1></div><button id="logout" hidden>Sair</button></header>
+<main>
+  <section id="login" class="card narrow"><h2>Acesso administrativo</h2><p>Use o token administrativo deste central. Ele permanece apenas na memória desta página.</p>
+    <form id="login-form"><label for="token">Token administrativo</label><input id="token" type="password" autocomplete="off" required><button type="submit">Entrar</button></form>
+  </section>
+  <p id="message" role="status" aria-live="polite"></p>
+  <div id="workspace" hidden>
+    <section class="card"><div class="section-title"><h2>Agente</h2><button id="refresh">Atualizar</button></div>
+      <label for="agents">Selecione um agente cadastrado</label><select id="agents"></select>
+      <dl id="agent-state"></dl><h3>Configuração aplicada</h3><div id="active-config"></div>
+      <button id="load-active">Carregar no formulário</button>
+    </section>
+    <section class="card"><div class="section-title"><h2>Plano de leitura</h2><span class="badge">Escrita OPC indisponível</span></div>
+      <p>Valide as tags antes de aplicar. A validação usa um worker temporário e preserva a coleta ativa.</p>
+      <div class="fields"><div><label for="servers">Servidor OPC disponível no agente</label><select id="servers"><option value="">ProgID manual</option></select><button id="find-servers">Consultar servidores</button></div>
+        <div><label for="prog-id">Endereço / ProgID OPC</label><input id="prog-id" placeholder="ABB.AfwOpcDaSurrogate.1" maxlength="256"></div>
+        <div><label for="interval">Intervalo (ms)</label><input id="interval" type="number" min="1000" max="60000" step="1" value="5000"></div></div>
+      <div class="table-wrap"><table><thead><tr><th>Endereço OPC / item path</th><th>Validação</th><th>Ações</th></tr></thead><tbody id="tags"></tbody></table></div>
+      <div class="actions"><button id="add-tag">Adicionar tag</button><button id="validate-all">Validar lista</button><button id="apply" class="primary" disabled>Aplicar configuração</button></div>
+      <p class="muted">Máximo de 50 tags por plano. Somente leitura Device. Nenhuma integração PI Point.</p>
+    </section>
+    <section class="card"><h2>Histórico de aplicações</h2><div class="table-wrap"><table><thead><tr><th>Versão</th><th>Estado</th><th>Solicitada</th><th>Concluída</th><th>Operação / erro seguro</th></tr></thead><tbody id="operations"></tbody></table></div></section>
+  </div>
+</main>
+</body></html>
