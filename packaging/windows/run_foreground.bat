@@ -10,19 +10,8 @@ set "PYTHON_EXE="
 if exist "%~dp0runtime\python.exe" (
     set "PYTHON_EXE=%~dp0runtime\python.exe"
 ) else (
-    where py >nul 2>&1
-    if !errorlevel! equ 0 (
-        set "PYTHON_EXE=py -3"
-    ) else (
-        where python >nul 2>&1
-        if !errorlevel! equ 0 (
-            set "PYTHON_EXE=python"
-        ) else (
-            echo [ERROR] Python 3 was not found.
-            pause
-            exit /b 1
-        )
-    )
+    echo [ERROR] Bundled x64 runtime is missing.
+    exit /b 1
 )
 
 set "PYTHONPATH=%~dp0src;!PYTHONPATH!"
@@ -35,6 +24,6 @@ echo [INFO] Running in foreground with configuration: !CONFIG_PATH!
 echo Press Ctrl+C to stop.
 echo.
 
-!PYTHON_EXE! -m opc_bridge.agent.service --run --config "!CONFIG_PATH!"
+"!PYTHON_EXE!" -m opc_bridge.agent.service --run --config "!CONFIG_PATH!"
 
 pause

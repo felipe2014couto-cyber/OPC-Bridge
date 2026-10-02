@@ -17,6 +17,7 @@ from typing import Any
 
 from opc_bridge.adapters.base import BrowseEntry, GroupHandle, ServerStatus
 from opc_bridge.adapters.da_worker import IPC_AUTHKEY
+from opc_bridge.adapters.worker_runtime import select_worker_runtime
 from opc_bridge.protocol import ItemResult, ItemStatus, ValueType
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,7 @@ class SupervisedOpcAdapter:
         worker_module: str = "opc_bridge.adapters.da_worker",
         command_timeout: float = 10.0,
         connect_timeout: float = 15.0,
+        worker_architecture: str | None = None,
     ) -> None:
         if not worker_executable:
             exe = sys.executable
@@ -47,6 +49,13 @@ class SupervisedOpcAdapter:
             self.worker_executable = exe
         else:
             self.worker_executable = worker_executable
+        self.worker_architecture = worker_architecture
+        if worker_architecture is not None:
+            if worker_executable is not None:
+                raise ValueError("Architecture selection requires bundled runtimes")
+            self.worker_architecture, self.worker_executable = select_worker_runtime(
+                worker_architecture, self.worker_executable
+            )
         self.worker_module = worker_module
         self.command_timeout = command_timeout
         self.connect_timeout = connect_timeout

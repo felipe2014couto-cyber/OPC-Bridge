@@ -15,11 +15,14 @@ import hashlib
 import json
 import logging
 import os
+import struct
 import subprocess
 import sys
+from functools import partial
 from typing import Any
 
 from opc_bridge.adapters.supervised import SupervisedOpcAdapter
+from opc_bridge.adapters.worker_runtime import validate_worker_architecture
 from opc_bridge.agent.client import AgentClient
 from opc_bridge.agent.supervisor import AgentSupervisor, configure_rotating_logging
 
@@ -51,6 +54,7 @@ def load_config(config_path: str | None = None) -> dict[str, Any]:
         "agent_id": "opc-agent-windows-01",
         "auth_token": "",
         "opc_prog_id": "",
+        "worker_architecture": "auto",
         "update_rate_ms": 1000,
         "certfile": None,
         "log_file": "agent.log",
@@ -79,6 +83,7 @@ def load_config(config_path: str | None = None) -> dict[str, Any]:
             except Exception as exc:  # noqa: BLE001 - provider-specific exception boundary.
                 logger.warning("Failed to parse config file %s: %s", path, exc)
 
+    validate_worker_architecture(default_config["worker_architecture"])
     return default_config
 
 
@@ -147,6 +152,9 @@ def configure_service_recovery(service_name: str = SERVICE_NAME) -> bool:
 
 def run_agent_main(config: dict[str, Any], stop_event: asyncio.Event | None = None) -> None:
     """Core agent runtime loop using SupervisedOpcAdapter and AgentSupervisor."""
+    worker_architecture = validate_worker_architecture(config.get("worker_architecture", "auto"))
+    if sys.platform == "win32" and struct.calcsize("P") != 8:
+        raise RuntimeError("The OPC-Bridge main service requires its bundled x64 runtime")
     raw_token = config.get("auth_token")
     if not raw_token:
         logger.critical("Fatal: 'auth_token' is missing or empty in configuration. Failing closed.")
@@ -168,7 +176,11 @@ def run_agent_main(config: dict[str, Any], stop_event: asyncio.Event | None = No
     logger.info("Starting OPC-Bridge Agent with config: %s", safe_config)
 
     prog_id = config.get("opc_prog_id") or None
-    adapter = SupervisedOpcAdapter(prog_id=prog_id)
+    adapter_factory = partial(
+        SupervisedOpcAdapter,
+        worker_architecture=worker_architecture if sys.platform == "win32" else None,
+    )
+    adapter = adapter_factory(prog_id=prog_id)
 
     auth_token_hash = hashlib.sha256(raw_token.encode("utf-8")).digest()
 
@@ -179,7 +191,7 @@ def run_agent_main(config: dict[str, Any], stop_event: asyncio.Event | None = No
             agent_id=config["agent_id"],
             auth_token_hash=auth_token_hash,
             adapter=adapter,
-            adapter_factory=SupervisedOpcAdapter,
+            adapter_factory=adapter_factory,
             server_hostname=config.get("server_hostname"),
             certfile=config.get("certfile"),
         )

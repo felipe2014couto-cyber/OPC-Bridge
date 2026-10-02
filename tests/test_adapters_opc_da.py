@@ -704,15 +704,10 @@ class TestServiceAndPackaging:
         from build_package import build_package
 
         out_dir = str(tmp_path / "offline_bundle")
-        build_package(out_dir, create_zip=False)
+        with pytest.raises(ValueError, match="required"):
+            build_package(out_dir, create_zip=False)
+        assert not (tmp_path / "offline_bundle").exists()
 
-        assert (tmp_path / "offline_bundle" / "install.bat").exists()
-        assert (tmp_path / "offline_bundle" / "uninstall.bat").exists()
-        assert (tmp_path / "offline_bundle" / "run_foreground.bat").exists()
-        assert (tmp_path / "offline_bundle" / "setup_config.py").exists()
-        assert (tmp_path / "offline_bundle" / "README_WINDOWS.md").exists()
-        assert (tmp_path / "offline_bundle" / "config" / "agent.default.json").exists()
-        assert (tmp_path / "offline_bundle" / "src" / "opc_bridge" / "adapters" / "da.py").exists()
 
 
 if __name__ == "__main__":

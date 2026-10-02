@@ -47,12 +47,13 @@ OPC_E_UNKNOWNITEMID = 0xC0040007
 OPC_E_INVALIDITEMID = 0xC0040008
 
 
-def _validate_automation_registration() -> None:
-    """Require an activatable wrapper in the worker's own registry view."""
+def automation_wrapper_registered(architecture: str) -> bool:
+    """Inspect a registry view without activating COM."""
     import winreg
 
-    bits = struct.calcsize("P") * 8
-    architecture = "x64" if bits == 64 else "x86"
+    if architecture not in ("x64", "x86"):
+        raise ValueError("Registry architecture must be x64 or x86")
+    bits = 64 if architecture == "x64" else 32
     view = winreg.KEY_WOW64_64KEY if bits == 64 else winreg.KEY_WOW64_32KEY
 
     def default_value(path: str) -> str:
@@ -65,16 +66,21 @@ def _validate_automation_registration() -> None:
 
     try:
         clsid = default_value(r"OPC.Automation\CLSID")
-        if clsid and any(
+        return bool(clsid) and any(
             default_value("CLSID\\" + clsid + "\\" + server_key)
             for server_key in ("InprocServer32", "LocalServer32")
-        ):
-            return
+        )
     except OSError:
         raise ConnectionError(
             f"Could not verify OPC Automation wrapper registration for the {architecture} worker."
         ) from None
 
+
+def _validate_automation_registration() -> None:
+    """Require an activatable wrapper in the worker's own registry view."""
+    architecture = "x64" if struct.calcsize("P") == 8 else "x86"
+    if automation_wrapper_registered(architecture):
+        return
     raise ConnectionError(
         f"OPC Automation wrapper is not registered for the {architecture} worker; "
         "an isolated worker matching the installed wrapper architecture or an approved "

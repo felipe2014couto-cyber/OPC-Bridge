@@ -7,5 +7,6 @@
   "update_rate_ms": 1000,
   "certfile": null,
   "log_file": "C:\\ProgramData\\OPCBridge\\logs\\agent.log",
-  "log_level": "INFO"
+  "log_level": "INFO",
+  "worker_architecture": "auto"
 }
