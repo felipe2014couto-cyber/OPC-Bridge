@@ -47,6 +47,41 @@ OPC_E_UNKNOWNITEMID = 0xC0040007
 OPC_E_INVALIDITEMID = 0xC0040008
 
 
+def _validate_automation_registration() -> None:
+    """Require an activatable wrapper in the worker's own registry view."""
+    import winreg
+
+    bits = struct.calcsize("P") * 8
+    architecture = "x64" if bits == 64 else "x86"
+    view = winreg.KEY_WOW64_64KEY if bits == 64 else winreg.KEY_WOW64_32KEY
+
+    def default_value(path: str) -> str:
+        try:
+            with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, path, 0, winreg.KEY_READ | view) as key:
+                value, _ = winreg.QueryValueEx(key, "")
+                return value.strip() if isinstance(value, str) else ""
+        except FileNotFoundError:
+            return ""
+
+    try:
+        clsid = default_value(r"OPC.Automation\CLSID")
+        if clsid and any(
+            default_value("CLSID\\" + clsid + "\\" + server_key)
+            for server_key in ("InprocServer32", "LocalServer32")
+        ):
+            return
+    except OSError:
+        raise ConnectionError(
+            f"Could not verify OPC Automation wrapper registration for the {architecture} worker."
+        ) from None
+
+    raise ConnectionError(
+        f"OPC Automation wrapper is not registered for the {architecture} worker; "
+        "an isolated worker matching the installed wrapper architecture or an approved "
+        f"{architecture} OPC Automation component is required."
+    )
+
+
 def datetime_to_timestamp_us(ts: Any) -> int:
     """Convert COM timestamp (datetime, pywintypes.Time, float) to UTC epoch microseconds."""
     if ts is None:
@@ -348,6 +383,7 @@ class OpcDaAdapter:
             if self.com_factory is not None:
                 self._server = self.com_factory()
             elif sys.platform == "win32":
+                _validate_automation_registration()
                 import pythoncom
                 import win32com.client
 

@@ -15,6 +15,7 @@ import os
 import struct
 import sys
 import time
+from contextlib import nullcontext
 from types import ModuleType
 from typing import Any
 
@@ -236,7 +237,8 @@ def mock_com_adapter() -> OpcDaAdapter:
 class TestOpcDaAdapter:
     """Unit tests for OpcDaAdapter contract compliance."""
 
-    def test_connect_activates_automation_wrapper_before_abb(self, monkeypatch):
+    @pytest.mark.parametrize("registration", ["x64", "x86-only", "absent"])
+    def test_connect_activates_automation_wrapper_before_abb(self, monkeypatch, registration):
         """Simulate Windows activation without invoking COM or the ABB server."""
         calls = []
 
@@ -246,6 +248,37 @@ class TestOpcDaAdapter:
                 super().Connect(prog_id)
 
         server = RecordingComServer()
+
+        winreg = ModuleType("winreg")
+        winreg.HKEY_CLASSES_ROOT = "HKCR"
+        winreg.KEY_READ = 0x20019
+        winreg.KEY_WOW64_64KEY = 0x100
+        winreg.KEY_WOW64_32KEY = 0x200
+        clsid = "{28E68F9A-8D75-11D1-8DC3-3C302A000000}"
+        registry = {}
+        if registration != "absent":
+            registered_view = 0x100 if registration == "x64" else 0x200
+            registry[(registered_view, r"OPC.Automation\CLSID")] = clsid
+            registry[(registered_view, "CLSID\\" + clsid + r"\InprocServer32")] = "OPCDAAuto.dll"
+            # A ProgID name alone in the x64 view cannot activate a class.
+            registry[(0x100, "OPC.Automation")] = "OPC Automation"
+
+        def open_key(root, path, reserved, access):
+            assert root == winreg.HKEY_CLASSES_ROOT
+            assert reserved == 0
+            assert access == winreg.KEY_READ | winreg.KEY_WOW64_64KEY
+            key = (access & 0x300, path)
+            if key not in registry:
+                raise FileNotFoundError()
+            return nullcontext(key)
+
+        winreg.OpenKey = open_key
+        winreg.QueryValueEx = lambda key, name: (registry[key], 1)
+        monkeypatch.setitem(sys.modules, "winreg", winreg)
+        from opc_bridge.adapters import da
+
+        original_calcsize = da.struct.calcsize
+        monkeypatch.setattr(da.struct, "calcsize", lambda fmt: 8 if fmt == "P" else original_calcsize(fmt))
 
         def dispatch(prog_id):
             calls.append(("Dispatch", prog_id))
@@ -264,6 +297,13 @@ class TestOpcDaAdapter:
         monkeypatch.setattr(sys, "platform", "win32")
 
         adapter = OpcDaAdapter()
+        if registration != "x64":
+            with pytest.raises(ConnectionError, match="not registered for the x64 worker"):
+                adapter.connect("ABB.AfwOpcDaSurrogate.1")
+            assert calls == []
+            assert adapter._server is None
+            assert adapter._connected is False
+            return
         try:
             adapter.connect("ABB.AfwOpcDaSurrogate.1")
             assert adapter._connected is True
