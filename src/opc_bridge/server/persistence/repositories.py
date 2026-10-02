@@ -1,7 +1,7 @@
 """Small SQL repositories for initial control-plane persistence."""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, List, Optional, Type, TypeVar
 
 from .models import (
@@ -16,6 +16,34 @@ from .models import (
 
 T = TypeVar("T")
 
+_TERMINAL_CONFIG_STATUSES = "'applied', 'rejected', 'failed', 'expired'"
+_LATEST_APPLIED_OPERATION_IDS = """
+    SELECT active_op.operation_id
+    FROM config_operations active_op
+    JOIN config_snapshots active_snapshot
+      ON active_snapshot.snapshot_id = active_op.snapshot_id
+     AND active_snapshot.agent_id = active_op.agent_id
+    WHERE active_op.status = 'applied' AND active_op.completed_at IS NOT NULL
+      AND NOT EXISTS (
+          SELECT 1
+          FROM config_operations newer_op
+          JOIN config_snapshots newer_snapshot
+            ON newer_snapshot.snapshot_id = newer_op.snapshot_id
+           AND newer_snapshot.agent_id = newer_op.agent_id
+          WHERE newer_op.agent_id = active_op.agent_id
+            AND newer_op.status = 'applied'
+            AND newer_op.completed_at IS NOT NULL
+            AND (
+                newer_op.completed_at > active_op.completed_at
+                OR (newer_op.completed_at = active_op.completed_at
+                    AND newer_snapshot.version > active_snapshot.version)
+                OR (newer_op.completed_at = active_op.completed_at
+                    AND newer_snapshot.version = active_snapshot.version
+                    AND newer_op.operation_id > active_op.operation_id)
+            )
+      )
+"""
+
 
 class PersistenceRepository:
     """Repository bound to the transaction-scoped connection in Database.session()."""
@@ -29,6 +57,113 @@ class PersistenceRepository:
         cursor = self.connection.cursor()
         cursor.execute(query.replace("?", self.placeholder), parameters)
         return cursor
+
+    def _retention_cutoff_value(self, cutoff: datetime) -> Any:
+        if cutoff.tzinfo is None or cutoff.utcoffset() is None:
+            raise ValueError("retention cutoff must be timezone-aware")
+        utc_cutoff = cutoff.astimezone(timezone.utc)
+        if self.dialect == "sqlite":
+            return utc_cutoff.strftime("%Y-%m-%d %H:%M:%S.%f")
+        return utc_cutoff
+
+    def _retention_before(self, column: str) -> str:
+        if self.dialect == "sqlite":
+            return f"julianday({column}) < julianday(?)"
+        return column + " < ?"
+
+    def retention_counts(self, cutoff: datetime) -> dict[str, int]:
+        """Count expired rows without mutation, excluding current state and credentials."""
+        value = self._retention_cutoff_value(cutoff)
+        session_count = self._execute(
+            "SELECT COUNT(*) FROM agent_sessions WHERE ended_at IS NOT NULL AND "
+            + self._retention_before("ended_at"),
+            (value,),
+        ).fetchone()[0]
+        operation_predicate = (
+            "status IN (" + _TERMINAL_CONFIG_STATUSES + ") AND completed_at IS NOT NULL "
+            "AND "
+            + self._retention_before("completed_at")
+            + " AND operation_id NOT IN ("
+            + _LATEST_APPLIED_OPERATION_IDS
+            + ")"
+        )
+        operation_count = self._execute(
+            "SELECT COUNT(*) FROM config_operations WHERE " + operation_predicate,
+            (value,),
+        ).fetchone()[0]
+        snapshot_count = self._execute(
+            "SELECT COUNT(*) FROM config_snapshots s WHERE "
+            + self._retention_before("s.created_at")
+            + " "
+            "AND s.snapshot_id <> (SELECT newest.snapshot_id FROM config_snapshots newest "
+            "ORDER BY newest.created_at DESC, newest.snapshot_id DESC LIMIT 1) "
+            "AND NOT EXISTS (SELECT 1 FROM config_operations ref "
+            "WHERE ref.snapshot_id = s.snapshot_id AND ref.agent_id = s.agent_id "
+            "AND NOT (ref.status IN (" + _TERMINAL_CONFIG_STATUSES + ") "
+            "AND ref.completed_at IS NOT NULL AND "
+            + self._retention_before("ref.completed_at")
+            + " AND ref.operation_id NOT IN ("
+            + _LATEST_APPLIED_OPERATION_IDS
+            + ")))" ,
+            (value, value),
+        ).fetchone()[0]
+        audit_count = self._execute(
+            "SELECT COUNT(*) FROM audit_events WHERE "
+            + self._retention_before("occurred_at")
+            + " "
+            "AND event_type NOT LIKE ?",
+            (value, "agent.credential.%"),
+        ).fetchone()[0]
+        return {
+            "sessions": int(session_count),
+            "config_operations": int(operation_count),
+            "config_snapshots": int(snapshot_count),
+            "audit_events": int(audit_count),
+        }
+
+    def apply_retention(self, cutoff: datetime) -> dict[str, int]:
+        """Delete expired operational rows inside the caller's transaction."""
+        value = self._retention_cutoff_value(cutoff)
+        sessions = self._execute(
+            "DELETE FROM agent_sessions WHERE ended_at IS NOT NULL AND "
+            + self._retention_before("ended_at"),
+            (value,),
+        ).rowcount
+        operation_predicate = (
+            "status IN (" + _TERMINAL_CONFIG_STATUSES + ") AND completed_at IS NOT NULL "
+            "AND "
+            + self._retention_before("completed_at")
+            + " AND operation_id NOT IN ("
+            + _LATEST_APPLIED_OPERATION_IDS
+            + ")"
+        )
+        operations = self._execute(
+            "DELETE FROM config_operations WHERE " + operation_predicate,
+            (value,),
+        ).rowcount
+        snapshots = self._execute(
+            "DELETE FROM config_snapshots WHERE "
+            + self._retention_before("created_at")
+            + " "
+            "AND snapshot_id <> (SELECT newest.snapshot_id FROM config_snapshots newest "
+            "ORDER BY newest.created_at DESC, newest.snapshot_id DESC LIMIT 1) "
+            "AND NOT EXISTS (SELECT 1 FROM config_operations ref "
+            "WHERE ref.snapshot_id = config_snapshots.snapshot_id "
+            "AND ref.agent_id = config_snapshots.agent_id)",
+            (value,),
+        ).rowcount
+        audit_events = self._execute(
+            "DELETE FROM audit_events WHERE "
+            + self._retention_before("occurred_at")
+            + " AND event_type NOT LIKE ?",
+            (value, "agent.credential.%"),
+        ).rowcount
+        return {
+            "sessions": int(sessions),
+            "config_operations": int(operations),
+            "config_snapshots": int(snapshots),
+            "audit_events": int(audit_events),
+        }
 
     def _one(self, cursor: Any, model: Type[T]) -> Optional[T]:
         row = cursor.fetchone()

@@ -14,6 +14,7 @@ dependencies = []
 [project.scripts]
 opc-bridge-server = "opc_bridge.server.launcher:main"
 opc-bridge-agent-credential = "opc_bridge.server.credential_admin:main"
+opc-bridge-retention = "opc_bridge.server.retention_cli:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "pytest-asyncio>=0.23", "ruff>=0.4"]

@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from typing import Any, List
 
-REVISION = "0002_bridge_server_state"
+REVISION = "0003_retention_policy"
+_BRIDGE_STATE_REVISION = "0002_bridge_server_state"
 _INITIAL_REVISION = "0001_initial"
 
 _SCHEMA: List[str] = [
@@ -129,7 +130,23 @@ def _apply_bridge_state(cursor: Any, database: Any, marker: str, timestamp_type:
             "CHECK (status IN ('pending', 'applied', 'rejected', 'failed', 'expired'))"
         )
     cursor.execute(
-        "INSERT INTO schema_migrations(revision) VALUES (" + marker + ")", (REVISION,)
+        "INSERT INTO schema_migrations(revision) VALUES (" + marker + ")",
+        (_BRIDGE_STATE_REVISION,),
+    )
+
+
+def _apply_retention_policy(cursor: Any, database: Any, marker: str) -> None:
+    if database.dialect == "sqlite":
+        cursor.execute("DROP TRIGGER IF EXISTS config_snapshots_no_delete")
+    else:
+        cursor.execute("DROP TRIGGER IF EXISTS config_snapshots_immutable ON config_snapshots")
+        cursor.execute(
+            "CREATE TRIGGER config_snapshots_immutable BEFORE UPDATE ON config_snapshots "
+            "FOR EACH ROW EXECUTE FUNCTION reject_config_snapshot_mutation()"
+        )
+    cursor.execute(
+        "INSERT INTO schema_migrations(revision) VALUES (" + marker + ")",
+        (REVISION,),
     )
 
 
@@ -152,8 +169,10 @@ def upgrade_database(database: Any) -> None:
         applied = {row[0] for row in cursor.fetchall()}
         if _INITIAL_REVISION not in applied:
             _apply_initial(cursor, database, marker, timestamp_type)
-        if REVISION not in applied:
+        if _BRIDGE_STATE_REVISION not in applied:
             _apply_bridge_state(cursor, database, marker, timestamp_type)
+        if REVISION not in applied:
+            _apply_retention_policy(cursor, database, marker)
         connection.commit()
     except Exception:
         connection.rollback()

@@ -24,6 +24,7 @@ exemplo `root:opc-bridge` e modo `0640`. Proteja o arquivo de ambiente com modo
 | `OPC_BRIDGE_TLS_KEYFILE` | Chave privada correspondente | nenhum |
 | `OPC_BRIDGE_LOG_LEVEL` | `DEBUG`, `INFO`, `WARNING`, `ERROR` ou `CRITICAL` | `INFO` |
 | `OPC_BRIDGE_LOG_FORMAT` | Formato Python logging em uma linha | formato do exemplo |
+| `OPC_BRIDGE_RETENTION_DAYS` | Prazo de retenção operacional, de 1 a 7 dias | `7` |
 | `ADMIN_API_TOKEN` | Habilita a API administrativa local | desabilitada |
 | `ADMIN_API_PORT` | Porta da API administrativa em loopback | `8081` |
 

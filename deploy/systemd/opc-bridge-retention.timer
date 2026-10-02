@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily OPC-Bridge control-plane retention
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=15m
+AccuracySec=1m
+Unit=opc-bridge-retention.service
+
+[Install]
+WantedBy=timers.target

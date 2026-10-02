@@ -1,0 +1,19 @@
+[Unit]
+Description=Prune expired OPC-Bridge control-plane history
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=opc-bridge
+Group=opc-bridge
+WorkingDirectory=/opt/opc-bridge
+EnvironmentFile=/etc/opc-bridge/opc-bridge-server.env
+ExecStart=/opt/opc-bridge/venv/bin/opc-bridge-retention --apply
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+UMask=0077
