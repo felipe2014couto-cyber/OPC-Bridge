@@ -13,6 +13,7 @@ seleção do OPC, endereços dos itens e intervalos de coleta.
 - [docs/contracts/protocol.md](docs/contracts/protocol.md) — contrato do protocolo de comunicação.
 - [docs/contracts/opc-adapter.md](docs/contracts/opc-adapter.md) — contrato do adaptador OPC DA.
 - [docs/tasks/plan-v0.md](docs/tasks/plan-v0.md) — plano de tarefas da prova de conceito.
+- [docs/operations/autou3-linux-server.md](docs/operations/autou3-linux-server.md) — execução central no AUTOU3 Linux.
 
 ## Estrutura
 

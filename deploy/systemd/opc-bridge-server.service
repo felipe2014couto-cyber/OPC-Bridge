@@ -1,0 +1,26 @@
+[Unit]
+Description=OPC-Bridge central server
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=opc-bridge
+Group=opc-bridge
+WorkingDirectory=/opt/opc-bridge
+EnvironmentFile=/etc/opc-bridge/opc-bridge-server.env
+ExecStart=/opt/opc-bridge/venv/bin/opc-bridge-server
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
