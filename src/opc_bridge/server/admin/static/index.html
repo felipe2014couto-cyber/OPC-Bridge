@@ -6,13 +6,10 @@
   <link rel="stylesheet" href="/ui/style.css"><script src="/ui/app.js" defer></script>
 </head>
 <body>
-<header><div><span class="eyebrow">OPC-BRIDGE / CONTROL PLANE</span><h1>Planos de leitura OPC</h1></div><button id="logout" hidden>Sair</button></header>
+<header><div><span class="eyebrow">OPC-BRIDGE / CONTROL PLANE</span><h1>Planos de leitura OPC</h1></div></header>
 <main>
-  <section id="login" class="card narrow"><h2>Acesso administrativo</h2><p>Use o token administrativo deste central. Ele permanece apenas na memória desta página.</p>
-    <form id="login-form"><label for="token">Token administrativo</label><input id="token" type="password" autocomplete="off" required><button type="submit">Entrar</button></form>
-  </section>
   <p id="message" role="status" aria-live="polite"></p>
-  <div id="workspace" hidden>
+  <div id="workspace">
     <section class="card"><div class="section-title"><h2>Agente</h2><button id="refresh">Atualizar</button></div>
       <label for="agents">Selecione um agente cadastrado</label><select id="agents"></select>
       <dl id="agent-state"></dl><h3>Configuração aplicada</h3><div id="active-config"></div>

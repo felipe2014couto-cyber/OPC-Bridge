@@ -1,140 +1,116 @@
-# Administração de planos de leitura OPC
+# Administração de planos de leitura OPC e Interface Web
 
-A interface é servida pelo control plane existente em `http://127.0.0.1:8081/ui`.
-Use o launcher `opc-bridge-server` com PostgreSQL, TLS do listener de agentes e
-`ADMIN_API_TOKEN` configurados conforme a documentação operacional do central.
-O listener HTTP administrativo continua fixo em `127.0.0.1`; `ADMIN_API_PORT`
-tem padrão 8081. Nenhum componente web externo, Node, npm ou CDN é necessário.
+A interface web administrativa do control plane do OPC-Bridge é servida pelo daemon interno do central em `http://127.0.0.1:8081/ui` e disponibilizada externamente de forma segura via **proxy reverso HTTPS com autenticação Basic no Nginx**.
 
-Abra `/ui` e informe o token administrativo. A página inicial é uma estrutura
-estática de login, retornada com HTTP 401 enquanto não há Bearer válido. Os
-arquivos CSS/JS estáticos não contêm dados operacionais. Os dados e operações
-exigem `Authorization: Bearer <ADMIN_API_TOKEN>`. O token fica apenas na memória
-da página, é apagado ao sair e não é colocado em URL, cookies ou storage do
-navegador. Feche a aba ao terminar. Não use equipamento compartilhado para
-guardar o token. Respostas usam `no-store`; a UI usa CSP restrita e renderiza os
-campos operacionais como texto.
+Nenhum componente web externo, Node.js, npm ou dependência de CDN é utilizado.
 
-Para acesso de outra máquina, crie um túnel autorizado até o AUTOU3:
+---
 
-```sh
-ssh -N -L 8081:127.0.0.1:8081 usuario@AUTOU3
-```
+## 1. Arquitetura de Acesso e Proxy Reverso HTTPS
 
-Abra `http://127.0.0.1:8081/ui` na máquina que mantém esse túnel. Não publique a
-porta HTTP administrativa na rede. Esta entrega não altera SSH, firewall,
-certificados ou serviços.
+O servidor central mantém a API administrativa interna privada no loopback (`127.0.0.1:8081`), acessível apenas localmente ou através do proxy reverso configurado no Nginx.
 
-## Seleção de servidor e validação
+* **URL externa oficial:** `https://10.247.168.43:8081/ui`
+* **Porta exposta na rede:** `10.247.168.43:8081` (exclusivamente HTTPS/TLS)
+* **ACL de rede:** Acesso restrito via diretivas Nginx exclusivamente à estação de operação/engenharia (`10.247.87.39`), com descarte (`deny all;`) para quaisquer outros IPs.
+* **Autenticação no navegador:** HTTP Basic Authentication gerenciada pelo Nginx, utilizando o arquivo de credenciais `/etc/opc-bridge/nginx-admin.htpasswd`.
+* **Injeção de Bearer Token:** O Nginx injeta o cabeçalho técnico `Authorization: Bearer <ADMIN_API_TOKEN>` ao encaminhar a requisição para o backend WSGI interno (`127.0.0.1:8081`), sobrescrevendo qualquer cabeçalho de autorização enviado pelo cliente.
+* **Segurança no navegador:** O navegador **não recebe, não solicita, não armazena (sem uso de `localStorage` ou `sessionStorage`), não imprime e não envia** o token `ADMIN_API_TOKEN`. As requisições executadas pelo JavaScript da UI utilizam caminhos relativos same-origin (`/api/v1/...`) sem cabeçalho `Authorization` nem credenciais no código-fonte.
+* **Proteção contra exposição direta:** A exposição direta da porta HTTP interna sem criptografia ou em bind amplo (`0.0.0.0` sem TLS) é estritamente proibida.
 
-1. Selecione um agente cadastrado. A tela mostra estado, sessão, heartbeat e a
-   configuração aplicada sanitizada, separada do plano ainda em edição.
-2. Use **Consultar servidores** para selecionar um ProgID anunciado pelo agente,
-   ou informe manualmente o endereço/ProgID, por exemplo
-   `ABB.AfwOpcDaSurrogate.1`. A descoberta consulta o registro existente; não
-   registra COM nem garante que cada ProgID possa conectar.
-3. Informe intervalo inteiro de 1000 a 60000 ms e de 1 a 50 endereços únicos,
-   por exemplo `Pims_A40:gUsw.ToPims.DIAMETRO_CALC_BOBIN`. IDs internos são
-   atribuídos pelo backend: caminhos ordenados lexicograficamente recebem IDs
-   1..N. O mesmo conjunto tem os mesmos IDs independentemente da ordem digitada.
-4. **Validar** verifica uma tag; **Validar lista** verifica o plano completo.
-   O agente precisa estar conectado e anunciar `opc-inspection-v1`.
+---
 
-A inspeção usa outro adapter/worker temporário, com a mesma seleção de
-arquitetura aprovada para o agente. O wrapper continua `OPC.Automation`, seguido
-de `Connect(prog_id)`. O worker conecta, cria um grupo próprio e tenta AddItem
-para cada tag. Não lê valores, não escreve OPC, não envia CONFIG_PUSH, não
-interrompe nem reconfigura o worker ativo. Objetos COM ficam nesse worker; o IPC
-transporta identidades e resultados primitivos. Há uma inspeção por agente,
-limite de 50 tags, prazo do central de 45 segundos, orçamento de 30 segundos no
-inspector e deadlines próprios do worker temporário. Um timeout de AddItem
-interrompe novas tentativas desse lote. A limpeza libera a conexão temporária.
-Conectar um segundo cliente depende da capacidade/licenciamento do servidor OPC;
-isso precisa ser validado no Windows em uma etapa autorizada.
+## 2. Configuração Operacional do Nginx e Segredos no Host Central (AUTOU3)
 
-Cada resultado é `valid`, `invalid` ou `error`, com HRESULT numérico quando
-disponível; mensagens internas de provider, valores de processo e segredos não
-são retornados. Um ProgID que não conecta produz erros individuais sem aprovar
-o plano. A descoberta e a validação são capacidades novas: agentes anteriores
-retornam `inspection_unsupported`, sem tentativa de usar CONFIG_PUSH como teste.
-Será necessário atualizar o pacote do agente em etapa separada antes de usar
-essas funções no PIMS; esta entrega não gera nem instala pacote Windows.
+O template de configuração do Nginx é versionado em [`deploy/nginx/opc-bridge-admin-ui.conf.example`](file:///C:/OPCBridge-build/deploy/nginx/opc-bridge-admin-ui.conf.example).
 
-## Aplicação e histórico
+### 2.1. Arquivo de credenciais Basic Auth (`nginx-admin.htpasswd`)
 
-Depois de **Validar lista** com todas as tags válidas, **Aplicar configuração**
-pede confirmação explícita. A aprovação vale por cinco minutos, uma única vez,
-e é vinculada ao agente, sessão, versão aplicada e conteúdo exato do plano.
-Alterar qualquer campo, reconectar, reiniciar o central ou mudar a configuração
-aplicada exige nova validação. Validar apenas uma tag não habilita a aplicação
-da lista. A confirmação também é exigida pelo backend (`confirmed: true`).
-
-A aplicação reutiliza snapshots, operações, auditoria e o despacho CONFIG_PUSH
-existentes. O histórico é atualizado a cada cinco segundos e mostra
-`pending`, `applied`, `rejected`, `expired` (ou `failed` em falha de transporte).
-Falha no estágio de conexão/grupo/itens mantém a configuração anterior ativa.
-Uma validação bem-sucedida não garante que o servidor OPC continue disponível
-até a aplicação. O modo HTTP standalone sem BridgeServer é somente leitura;
-a UI indica essa condição e as rotas de inspeção/aplicação retornam 405.
-
-Escrita OPC está indisponível. Não há botão, campo, endpoint ou mensagem de
-escrita OPC. PI Web API e PI Point não fazem parte desta entrega.
-
-## Endpoints e auditoria
-
-Todos os endpoints abaixo exigem Bearer e usam os repositórios do control plane:
-
-| Método / rota | Conteúdo |
-| --- | --- |
-| GET `/api/v1/ui-capabilities` | Disponibilidade do runtime com despacho |
-| GET `/api/v1/agents/{agent_id}/active-config` | Versão, ProgID, intervalo e caminhos, sem snapshot bruto |
-| GET `/api/v1/agents/{agent_id}/opc-servers` | ProgIDs descobertos por inspeção isolada |
-| POST `/api/v1/agents/{agent_id}/tag-validations` | Validação de um plano e aprovação opcional |
-| POST `/api/v1/agents/{agent_id}/tag-config-operations` | Aplicação confirmada do plano validado |
-| GET `/api/v1/config-operations?agent_id=...` | Histórico e status do fluxo existente |
-| GET `/api/v1/config-operations/{operation_id}` | Status individual sanitizado |
-
-Payload de validação (o corpo JSON é limitado a 64 KiB):
-
-```json
-{
-  "opc_prog_id": "ABB.AfwOpcDaSurrogate.1",
-  "update_rate_ms": 5000,
-  "tags": ["Pims_A40:gUsw.ToPims.DIAMETRO_CALC_BOBIN"]
-}
-```
-
-Na aplicação, envie o mesmo plano e acrescente `validation_id` recebido na
-validação completa e `confirmed: true`. Campos extras, IDs/versões do cliente,
-duplicatas e tipos inválidos são recusados. Sem aprovação atual: 409; sem
-confirmação: 400; agente inexistente: 404; timeout: 504; falta de Bearer: 401.
-O despacho verifica novamente sessão e versão aplicada no event loop do
-BridgeServer, para recusar uma mudança de estado ocorrida durante a solicitação.
-O endpoint legado `POST .../config-operations` mantém seu contrato de API para
-clientes administrativos existentes; a UI usa exclusivamente a rota confirmada
-`tag-config-operations`.
-
-Os eventos `inspection.tags` e `inspection.servers` registram contagem e
-resultado seguro. Aplicações reutilizam `config.requested` e seus resultados
-`config.applied/rejected/expired`. Nenhum evento registra token ou valor OPC.
-Solicitações originadas na UI registram `ui_confirmed: true` na auditoria.
-O histórico continua sujeito à retenção operacional existente; backups do
-PostgreSQL continuam necessários.
-
-## Verificação simulada
-
-Os testes usam SQLite isolado e objetos OPC/COM falsos, inclusive objetos que
-recusam pickle. Não representam validação COM/OPC em Windows industrial.
+No host AUTOU3, crie manualmente o arquivo de credenciais Basic Auth para o operador/administrador:
 
 ```sh
-PYTHONPATH=src python -m pytest -q tests/test_tag_ui.py tests/test_admin_api.py tests/test_worker_ipc.py
+sudo htpasswd -c -B /etc/opc-bridge/nginx-admin.htpasswd admin
+# Para fins de homologação e testes iniciais, defina a senha temporária combinada.
+sudo chown root:root /etc/opc-bridge/nginx-admin.htpasswd
+sudo chmod 600 /etc/opc-bridge/nginx-admin.htpasswd
 ```
 
-Há também um smoke test opcional com Firefox/geckodriver já instalados. Ele usa
-somente listeners locais temporários, SQLite e OPC simulado, não instala
-dependências e confirma login, seleção de ProgID, validação, cancelamento e
-aceitação da confirmação, histórico e logout:
+### 2.2. Arquivo de injeção de token técnico (`nginx-api-token.conf`)
+
+O `ADMIN_API_TOKEN` técnico nunca deve ser versionado no Git nem inserido no template público. No AUTOU3, crie manualmente o arquivo protegido lido exclusivamente pelo processo do Nginx:
 
 ```sh
-OPC_BRIDGE_TEST_BROWSER=1 PYTHONPATH=src python -m pytest -q tests/test_tag_ui_browser.py
+sudo bash -c 'cat << "EOF" > /etc/opc-bridge/nginx-api-token.conf
+proxy_set_header Authorization "Bearer <VALOR_DO_ADMIN_API_TOKEN_REAL>";
+EOF'
+sudo chown root:root /etc/opc-bridge/nginx-api-token.conf
+sudo chmod 600 /etc/opc-bridge/nginx-api-token.conf
 ```
+
+### 2.3. Instalação e validação do Nginx
+
+```sh
+# Copiar o template para a pasta de sites disponíveis do Nginx
+sudo cp deploy/nginx/opc-bridge-admin-ui.conf.example /etc/nginx/sites-available/opc-bridge-admin-ui.conf
+sudo ln -sf /etc/nginx/sites-available/opc-bridge-admin-ui.conf /etc/nginx/sites-enabled/
+
+# Validar a sintaxe da configuração antes de aplicar
+sudo nginx -t
+
+# Recarregar o serviço Nginx
+sudo systemctl reload nginx
+```
+
+---
+
+## 3. Instalação da CA Interna no Windows Local
+
+Para que a conexão HTTPS em `https://10.247.168.43:8081/ui` seja reconhecida como confiável pelo navegador no Windows sem alertas de segurança TLS:
+
+1. Obtenha o certificado da autoridade certificadora interna do servidor central (`ca.crt` ou `ca.pem`).
+2. No Windows local (estação `10.247.87.39`):
+   * Pressione `Win + R`, digite `certmgr.msc` e tecle Enter;
+   * Navegue até **Autoridades de Certificação Raiz Confiáveis** -> **Certificados**;
+   * Clique com o botão direito -> **Todas as tarefas** -> **Importar...**;
+   * Selecione o arquivo `ca.crt` / `ca.pem` e confirme a importação no repositório de Raízes Confiáveis;
+   * Alternativamente, via PowerShell administrativo:
+     ```powershell
+     Import-Certificate -FilePath "C:\caminho\para\ca.pem" -CertStoreLocation "Cert:\LocalMachine\Root"
+     ```
+3. Reinicie o navegador e acesse `https://10.247.168.43:8081/ui`.
+
+---
+
+## 4. Seleção de Servidor e Validação de Tags
+
+1. Abra `https://10.247.168.43:8081/ui`. O navegador solicitará o usuário e senha (Basic Auth).
+2. A interface carrega automaticamente o workspace com a lista de agentes conectados.
+3. Selecione um agente cadastrado. A tela mostra estado, sessão, heartbeat e a configuração aplicada sanitizada, separada do plano em edição.
+4. Use **Consultar servidores** para listar os ProgIDs anunciados pelo agente via descoberta local, ou informe manualmente o ProgID (ex: `ABB.AfwOpcDaSurrogate.1`).
+5. Informe o intervalo desejado (inteiro de 1000 a 60000 ms) e de 1 a 50 endereços únicos de tags OPC DA (ex: `Pims_A40:gUsw.ToPims.DIAMETRO_CALC_BOBIN`).
+6. **Validar** verifica uma tag pontual; **Validar lista** verifica o plano completo. O agente deve estar conectado e anunciar suporte à capability `opc-inspection-v1`.
+
+### Propriedades da inspeção OPC:
+* A validação instancia um processo worker secundário temporário, respeitando a arquitetura definida para o agente (x64 ou x86).
+* O worker conecta ao servidor OPC DA via `OPC.Automation`, cria um grupo transitório e executa `AddItem` para cada tag em modo Device.
+* **Isolamento rigoroso:** A inspeção não lê valores, não escreve valores, não gera `CONFIG_PUSH`, e não interfere nem interrompe o worker principal de leitura ativa.
+* Cada tag retorna o status seguro `valid`, `invalid` ou `error`, acompanhado de HRESULT numérico caso ocorra erro. Nenhum segredo, valor de processo ou caminho interno do servidor OPC é exposto.
+
+---
+
+## 5. Aplicação e Histórico de Configurações
+
+1. Após executar **Validar lista** com 100% das tags com status `valid`, o botão **Aplicar configuração** é habilitado.
+2. Ao clicar em **Aplicar configuração**, uma caixa de confirmação explícita do navegador é exibida (`window.confirm`).
+3. O ticket de validação possui validade de 5 minutos, é de uso único e é atrelado estritamente à sessão ativa do agente e ao fingerprint criptográfico do plano validado.
+4. Qualquer alteração nas tags, ProgID, intervalo, reinício do central ou reconexão do agente invalida imediatamente a aprovação e exige nova validação completa.
+5. A aplicação confirmada gera uma nova versão de configuração despachada via `CONFIG_PUSH` ao worker ativo do agente. O histórico de operações é atualizado a cada 5 segundos na tabela da interface.
+
+---
+
+## 6. Restrições e Garantias de Segurança
+
+* **Escrita OPC:** Totalmente indisponível. Não existem botões, campos, rotas de API nem suporte de protocolo para escrita de tags.
+* **Integração PI Point:** A interface não realiza criação, edição ou vinculação a PI Points ou PI Web API.
+* **Limites de Capacidade:** Máximo de 50 tags por plano e intervalos entre 1.000 ms e 60.000 ms.
+* **Acesso Direto à API:** Chamadas diretas à API em `127.0.0.1:8081` (como scripts de automação interna ou curl) continuam exigindo obrigatoriamente `Authorization: Bearer <ADMIN_API_TOKEN>`.

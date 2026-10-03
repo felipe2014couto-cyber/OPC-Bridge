@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import io
 import json
+from pathlib import Path
 import pickle
 import uuid
 
@@ -24,6 +26,14 @@ from tests.test_admin_api import ADMIN_TOKEN, request
 from tests.test_worker_ipc import NonPicklableComGroup, NonPicklableComServer, NonPicklableGroups
 
 PROG_ID = "ABB.AfwOpcDaSurrogate.1"
+ROOT_DIR = Path(__file__).resolve().parent.parent
+
+
+def async_test(coro_fn):
+    @functools.wraps(coro_fn)
+    def wrapper(*args, **kwargs):
+        return asyncio.run(coro_fn(*args, **kwargs))
+    return wrapper
 
 
 class ComFailure(Exception):
@@ -172,7 +182,7 @@ def test_ui_authentication_and_static_page(runtime):
     for token in (None, "wrong"):
         status, headers, page = asset(app, "/ui", token)
         assert status.startswith("401")
-        assert "login-form" in page and "workspace\" hidden" in page
+        assert "login-form" not in page and "password" not in page
         assert "PRIVATE" not in page and "SECRET-HASH" not in page
         assert "frame-ancestors 'none'" in headers["Content-Security-Policy"]
     status, _, page = asset(app, "/ui", ADMIN_TOKEN)
@@ -182,6 +192,58 @@ def test_ui_authentication_and_static_page(runtime):
     assert status.startswith("200")
     assert "window.confirm" in script and "confirmed: true" in script
     assert "localStorage" not in script and "sessionStorage" not in script
+    assert "Authorization" not in script and "Bearer" not in script
+
+
+def test_ui_has_no_token_prompts_and_no_authorization_headers(runtime):
+    app, _, _, _, _ = runtime
+    status, _, page = asset(app, "/ui", ADMIN_TOKEN)
+    assert status.startswith("200")
+    assert "<form id=\"login-form\">" not in page
+    assert "id=\"token\"" not in page
+    assert "type=\"password\"" not in page
+    assert "id=\"logout\"" not in page
+    assert "id=\"workspace\"" in page
+    assert "hidden" not in page.split("id=\"workspace\"", 1)[0].split("<div")[-1]
+
+    status, _, script = asset(app, "/ui/app.js")
+    assert status.startswith("200")
+    assert "Authorization" not in script
+    assert "Bearer" not in script
+    assert "ADMIN_API_TOKEN" not in script
+    assert "localStorage" not in script
+    assert "sessionStorage" not in script
+    assert "/api/v1/agents" in script
+    assert "/api/v1/ui-capabilities" in script
+    assert "window.confirm" in script
+
+
+def test_nginx_template_configuration():
+    nginx_conf = ROOT_DIR / "deploy" / "nginx" / "opc-bridge-admin-ui.conf.example"
+    assert nginx_conf.is_file(), f"Nginx template not found at {nginx_conf}"
+    content = nginx_conf.read_text(encoding="utf-8")
+
+    assert "listen 10.247.168.43:8081 ssl;" in content
+    assert "proxy_pass http://127.0.0.1:8081;" in content
+    assert "auth_basic " in content
+    assert "auth_basic_user_file /etc/opc-bridge/nginx-admin.htpasswd;" in content
+    assert "allow 10.247.87.39;" in content
+    assert "deny all;" in content
+    assert "include /etc/opc-bridge/nginx-api-token.conf;" in content
+    assert "limit_except GET POST HEAD" in content
+    assert "autoindex off;" in content
+    assert "/etc/opc-bridge/tls/server/server.crt" in content
+    assert "/etc/opc-bridge/tls/server/server.key" in content
+    assert "<VALOR_DO_ADMIN_API_TOKEN" in content or "ADMIN_API_TOKEN" not in content
+
+
+def test_opc_write_remains_strictly_unavailable(runtime):
+    assert all("WRITE" not in msg.name for msg in MsgType)
+    status, _, body = request(runtime[0], "/api/v1/agents/agent-a/write", method="POST", payload={"value": 123})
+    assert status.startswith(("404", "405"))
+    status, _, page = asset(runtime[0], "/ui", ADMIN_TOKEN)
+    assert "Escrita OPC indisponível" in page
+    assert "Nenhuma integração PI Point" in page
 
 
 @pytest.mark.parametrize("endpoint,method", [("tag-validations", "POST"),
@@ -344,7 +406,7 @@ def test_dispatch_conflict_is_explicit_and_audited(runtime, monkeypatch):
         assert repo.latest_applied_snapshot("agent-a").version == 1
 
 
-@pytest.mark.asyncio
+@async_test
 async def test_dispatch_rechecks_session_context_in_event_loop(runtime):
     bridge = runtime[1]
     session = bridge._sessions["connected"]
@@ -355,7 +417,7 @@ async def test_dispatch_rechecks_session_context_in_event_loop(runtime):
     assert session.writer.frames == []
 
 
-@pytest.mark.asyncio
+@async_test
 async def test_ui_operation_expiry_and_safe_status_query(runtime):
     app, bridge, _, _, _ = runtime
     bridge._event_loop = asyncio.get_running_loop()
@@ -417,7 +479,7 @@ def test_validation_ticket_isolated_by_agent(runtime):
         assert repo.list_admin_config_operations("agent-b") == []
 
 
-@pytest.mark.asyncio
+@async_test
 async def test_inspection_end_to_end_messages_never_send_config_push(runtime, monkeypatch):
     _, bridge, _, _, _ = runtime
     session = bridge._sessions["connected"]
@@ -457,7 +519,7 @@ async def test_inspection_end_to_end_messages_never_send_config_push(runtime, mo
         bridge._running = False
 
 
-@pytest.mark.asyncio
+@async_test
 async def test_inspection_timeout_cleans_pending_future(runtime, monkeypatch):
     bridge = runtime[1]
     wait_for = asyncio.wait_for
@@ -543,7 +605,7 @@ def test_temporary_worker_startup_deadline_reaps_failed_child(monkeypatch):
     assert adapter._process is None and adapter._conn is None
 
 
-@pytest.mark.asyncio
+@async_test
 async def test_agent_inspection_message_does_not_apply_configuration():
     active = SimulatedOpcAdapter()
     active.connect("Simulated.OPC")
@@ -563,7 +625,7 @@ async def test_agent_inspection_message_does_not_apply_configuration():
     assert client._adapter is active and client.config_version == 0
 
 
-@pytest.mark.asyncio
+@async_test
 async def test_bridge_inspection_capability_and_correlation(runtime):
     _, bridge, _, _, _ = runtime
     session = bridge._sessions["connected"]
@@ -587,7 +649,7 @@ async def test_bridge_inspection_capability_and_correlation(runtime):
     assert bridge._pending_inspections == {} and session.config_version == 1
 
 
-@pytest.mark.asyncio
+@async_test
 async def test_confirmed_ui_apply_ack_and_atomic_rejection(runtime, monkeypatch):
     app, bridge, database, _, _ = runtime
     session = bridge._sessions["connected"]
@@ -643,7 +705,7 @@ async def test_confirmed_ui_apply_ack_and_atomic_rejection(runtime, monkeypatch)
         bridge._running = False
 
 
-@pytest.mark.parametrize("raw", [b"{}", b"[]", b'{"request_id":null}', b"x" * 131073])
+@pytest.mark.parametrize("raw", [b"{}", b"[]", b'{"request_id":null}', pytest.param(b"x" * 131073, id="oversized_payload")])
 def test_protocol_rejects_invalid_inspection(raw):
     with pytest.raises((ValueError, TypeError)):
         InspectionRequest.unpack(raw)

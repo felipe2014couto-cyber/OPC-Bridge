@@ -24,7 +24,7 @@ PROG_ID = test_tag_ui.PROG_ID
 
 @pytest.mark.skipif(os.environ.get("OPC_BRIDGE_TEST_BROWSER") != "1",
                     reason="Opt-in smoke test uses existing Firefox/geckodriver")
-def test_browser_login_validate_confirm_apply(runtime, tmp_path, monkeypatch):
+def test_browser_validate_confirm_apply(runtime, tmp_path, monkeypatch):
     driver = shutil.which("geckodriver")
     if driver is None or shutil.which("firefox") is None:
         pytest.skip("Firefox/geckodriver are not installed; no dependencies are installed by this test")
@@ -32,7 +32,12 @@ def test_browser_login_validate_confirm_apply(runtime, tmp_path, monkeypatch):
     pushed = []
     monkeypatch.setattr(bridge, "dispatch_admin_config_operation_threadsafe",
                         lambda agent, operation, payload, **kwargs: pushed.append(payload))
-    httpd = make_server("127.0.0.1", 0, app)
+
+    def proxy_app(environ, start_response):
+        environ["HTTP_AUTHORIZATION"] = "Bearer " + ADMIN_TOKEN
+        return app(environ, start_response)
+
+    httpd = make_server("127.0.0.1", 0, proxy_app)
     server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     server_thread.start()
     with socket.socket() as sock:
@@ -85,10 +90,9 @@ def test_browser_login_validate_confirm_apply(runtime, tmp_path, monkeypatch):
             "browserName": "firefox", "unhandledPromptBehavior": "ignore",
             "moz:firefoxOptions": {"args": ["-headless"]}}}})["sessionId"]
         command("POST", "/url", {"url": "http://127.0.0.1:" + str(httpd.server_port) + "/ui"})
-        assert execute("return document.getElementById('workspace').hidden") is True
-        command("POST", "/execute/sync", {
-            "script": "document.getElementById('token').value = arguments[0];", "args": [ADMIN_TOKEN]})
-        click("#login-form button")
+        assert execute("return document.getElementById('login-form') === null") is True
+        assert execute("return document.getElementById('token') === null") is True
+        assert execute("return document.getElementById('logout') === null") is True
         wait("!document.getElementById('workspace').hidden")
         wait("!document.getElementById('find-servers').disabled")
         click("#find-servers")
@@ -110,14 +114,12 @@ def test_browser_login_validate_confirm_apply(runtime, tmp_path, monkeypatch):
         command("POST", "/alert/accept", {})
         wait("document.getElementById('operations').textContent.includes('pending')")
         assert len(pushed) == 1 and pushed[0].opc_prog_id == PROG_ID
-        assert execute("return document.getElementById('token').value") == ""
+        assert execute("return document.getElementById('token') === null") is True
         html = execute("return document.documentElement.outerHTML")
         assert ADMIN_TOKEN not in html and "PRIVATE-TOKEN" not in html and "SECRET-HASH" not in html
         (tmp_path / "tag-ui.png").write_bytes(base64.b64decode(command("GET", "/screenshot")))
         with database.session() as repo:
             assert repo.latest_applied_snapshot("agent-a").version == 1
-        click("#logout")
-        assert execute("return document.getElementById('workspace').hidden") is True
     finally:
         if session is not None:
             call("DELETE", "/session/" + session)

@@ -1,0 +1,89 @@
+# ==============================================================================
+# OPC-Bridge Control Plane - Template Nginx HTTPS Reverse Proxy para UI Administrativa
+# Arquivo: deploy/nginx/opc-bridge-admin-ui.conf.example
+#
+# Arquitetura e Fluxo de Autenticação:
+# 1. Navegador acessa: https://10.247.168.43:8081/ui
+# 2. Nginx valida TLS com o certificado de servidor em /etc/opc-bridge/tls/server/
+# 3. Nginx exige HTTP Basic Authentication através do arquivo /etc/opc-bridge/nginx-admin.htpasswd
+# 4. Nginx restringe a origem de rede via ACL permitindo apenas a estação 10.247.87.39
+# 5. Nginx sobrescreve o cabeçalho Authorization do cliente injetando o Bearer token
+#    técnico administrativo obtido a partir de arquivo protegido fora do controle de versão
+# 6. Backend WSGI interno em 127.0.0.1:8081 recebe a requisição autenticada
+#    sem nunca expor o ADMIN_API_TOKEN ao navegador ou logs do cliente
+#
+# REGRAS E PROCEDIMENTOS DE SEGURANÇA:
+# - NENHUM TOKEN TÉCNICO, SENHA OU HASH REAL DEVE CONSTAR NESTE TEMPLATE VERSIONADO.
+# - O arquivo /etc/opc-bridge/nginx-api-token.conf deve ser criado manualmente no AUTOU3:
+#     sudo bash -c 'cat << "EOF" > /etc/opc-bridge/nginx-api-token.conf
+#     proxy_set_header Authorization "Bearer <VALOR_DO_ADMIN_API_TOKEN>";
+#     EOF'
+#     sudo chown root:root /etc/opc-bridge/nginx-api-token.conf
+#     sudo chmod 600 /etc/opc-bridge/nginx-api-token.conf
+# - O arquivo /etc/opc-bridge/nginx-admin.htpasswd deve ser criado manualmente no AUTOU3:
+#     sudo htpasswd -c -B /etc/opc-bridge/nginx-admin.htpasswd admin
+#     sudo chown root:root /etc/opc-bridge/nginx-admin.htpasswd
+#     sudo chmod 600 /etc/opc-bridge/nginx-admin.htpasswd
+# - Validar a configuração após instalação:
+#     sudo nginx -t
+#     sudo systemctl reload nginx
+# ==============================================================================
+
+server {
+    listen 10.247.168.43:8081 ssl;
+    server_name 10.247.168.43;
+
+    # Certificados TLS do servidor central
+    ssl_certificate     /etc/opc-bridge/tls/server/server.crt;
+    ssl_certificate_key /etc/opc-bridge/tls/server/server.key;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers on;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;
+
+    # Desativa listagem de arquivos
+    autoindex off;
+
+    # ACL de rede: permitir exclusivamente a estação de engenharia autorizada
+    allow 10.247.87.39;
+    deny all;
+
+    # HTTP Basic Authentication gerenciada no proxy reverso
+    auth_basic "OPC-Bridge Control Plane - Acesso Administrativo";
+    auth_basic_user_file /etc/opc-bridge/nginx-admin.htpasswd;
+
+    # Cabeçalhos básicos de segurança compatíveis com a UI administrativa
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "no-referrer" always;
+
+    # Redirecionamento da raiz para a interface administrativa
+    location = / {
+        return 302 /ui;
+    }
+
+    # Encaminhamento para a API interna e assets estáticos no loopback
+    location / {
+        limit_except GET POST HEAD {
+            deny all;
+        }
+
+        proxy_pass http://127.0.0.1:8081;
+        proxy_http_version 1.1;
+
+        proxy_set_header Host 127.0.0.1:8081;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+
+        # Sobrescreve expressamente qualquer cabeçalho Authorization enviado pelo cliente.
+        # Utiliza exclusivamente o Bearer token técnico definido no arquivo protegido root:root 600:
+        include /etc/opc-bridge/nginx-api-token.conf;
+
+        proxy_buffering off;
+        proxy_read_timeout 60s;
+        proxy_connect_timeout 10s;
+    }
+}
