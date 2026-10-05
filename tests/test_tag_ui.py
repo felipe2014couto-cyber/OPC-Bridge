@@ -7,6 +7,8 @@ import io
 import json
 from pathlib import Path
 import pickle
+import struct
+import time
 import uuid
 
 import pytest
@@ -17,7 +19,17 @@ from opc_bridge.adapters.simulated import SimulatedOpcAdapter
 from opc_bridge.adapters.supervised import OpcWorkerConnectionError, SupervisedOpcAdapter
 from opc_bridge.agent.client import AgentClient
 from opc_bridge.agent.inspection import inspect_opc
-from opc_bridge.protocol import ConfigPushPayload, Header, ItemRef, MsgType
+from opc_bridge.protocol import (
+    ConfigPushPayload,
+    Header,
+    ItemRef,
+    ItemResult,
+    ItemStatus,
+    MsgType,
+    ReadResponsePayload,
+    ValueType,
+    decode_value,
+)
 from opc_bridge.protocol.inspection import CAPABILITY, InspectionRequest, InspectionResponse
 from opc_bridge.server.admin import create_app
 from opc_bridge.server.core import AgentSession, BridgeServer, ServerConfig
@@ -227,10 +239,9 @@ def test_nginx_template_configuration():
     assert "proxy_pass http://127.0.0.1:8081;" in content
     assert "auth_basic " in content
     assert "auth_basic_user_file /etc/opc-bridge/nginx-admin.htpasswd;" in content
-    assert "allow 10.247.87.39;" in content
-    assert "deny all;" in content
+    assert "allow 10.247.87.39;" not in content
     assert "include /etc/opc-bridge/nginx-api-token.conf;" in content
-    assert "limit_except GET POST HEAD" in content
+    assert "limit_except GET POST" in content
     assert "autoindex off;" in content
     assert "/etc/opc-bridge/tls/server/server.crt" in content
     assert "/etc/opc-bridge/tls/server/server.key" in content
@@ -711,3 +722,327 @@ def test_protocol_rejects_invalid_inspection(raw):
         InspectionRequest.unpack(raw)
     with pytest.raises((ValueError, TypeError)):
         InspectionResponse.unpack(raw)
+
+
+def test_decode_value_and_types():
+    assert decode_value(ValueType.I16, struct.pack("<h", 1234))[0] == 1234
+    assert decode_value(ValueType.I32, struct.pack("<i", 123456))[0] == 123456
+    assert abs(decode_value(ValueType.F32, struct.pack("<f", 12.5))[0] - 12.5) < 1e-4
+    assert abs(decode_value(ValueType.F64, struct.pack("<d", 98.765))[0] - 98.765) < 1e-5
+    assert decode_value(ValueType.BOOL, struct.pack("<?", True))[0] is True
+    assert decode_value(ValueType.BOOL, struct.pack("<?", False))[0] is False
+    assert decode_value(ValueType.STRING, "Hello OPC".encode("utf-8"))[0] == "Hello OPC"
+    assert decode_value(ValueType.BLOB, b"\x01\x02")[0] == "0102"
+    assert decode_value(ValueType.F64, b"")[0] is None
+    assert decode_value(ValueType.I32, b"\x01")[0] is None  # too short
+
+
+def test_live_values_unauthorized(runtime):
+    app, _, _, _, _ = runtime
+    status, _, data = request(app, "/api/v1/agents/agent-a/live-values", token="")
+    assert status.startswith("401")
+    assert data["error"] == "unauthorized"
+
+
+def test_live_values_unknown_agent(runtime):
+    app, _, _, _, _ = runtime
+    status, _, data = request(app, "/api/v1/agents/nonexistent/live-values")
+    assert status.startswith("404")
+    assert data["error"] == "not_found"
+
+
+def test_live_values_agent_disabled(runtime):
+    app, _, database, _, _ = runtime
+    with database.session() as repo:
+        repo.add_agent("disabled-agent", "Disabled Agent")
+        repo._execute("UPDATE agents SET enabled = 0 WHERE agent_id = ?", ("disabled-agent",))
+    status, _, data = request(app, "/api/v1/agents/disabled-agent/live-values")
+    assert status.startswith("409")
+    assert data["error"] == "agent_disabled"
+
+
+def test_live_values_agent_disconnected(runtime):
+    app, bridge, database, _, _ = runtime
+    with database.session() as repo:
+        repo.add_agent("disconnected-agent", "Disconnected Agent")
+    status, _, data = request(app, "/api/v1/agents/disconnected-agent/live-values")
+    assert status.startswith("200")
+    assert data["connected"] is False
+    assert data["status"] == "agent_disconnected"
+    assert data["items"] == []
+
+
+def test_live_values_waiting_first_read(runtime):
+    app, bridge, _, _, _ = runtime
+    session = bridge._sessions["connected"]
+    session.config_version = 1
+    session.config_items = [
+        ItemRef(item_id=1, opc_item_path="Tag.A"),
+        ItemRef(item_id=2, opc_item_path="Tag.B"),
+    ]
+    status, _, data = request(app, "/api/v1/agents/agent-a/live-values")
+    assert status.startswith("200")
+    assert data["connected"] is True
+    assert data["config_version"] == 1
+    assert data["status"] == "ok"
+    assert len(data["items"]) == 2
+    for it in data["items"]:
+        assert it["available"] is False
+        assert it["status"] == "waiting_first_read"
+        assert it["value"] is None
+        assert it["stale"] is False
+        assert it["error"] is None
+
+
+def test_live_values_simulated_read_response_and_types(runtime):
+    app, bridge, _, _, _ = runtime
+    session = bridge._sessions["connected"]
+    session.config_version = 1
+    session.config_items = [
+        ItemRef(item_id=1, opc_item_path="Tag.Pressure"),
+        ItemRef(item_id=2, opc_item_path="Tag.Count"),
+        ItemRef(item_id=3, opc_item_path="Tag.Running"),
+        ItemRef(item_id=4, opc_item_path="Tag.Faulty"),
+    ]
+    now_us = int(time.time() * 1_000_000)
+    resp = ReadResponsePayload(
+        request_id=101,
+        duration_us=1500,
+        results=[
+            ItemResult(
+                item_id=1,
+                status=ItemStatus.OK,
+                value_type=ValueType.F64,
+                quality=192,
+                timestamp_us=now_us,
+                value=struct.pack("<d", 42.5),
+                error_code=0,
+            ),
+            ItemResult(
+                item_id=2,
+                status=ItemStatus.OK,
+                value_type=ValueType.I32,
+                quality=192,
+                timestamp_us=now_us,
+                value=struct.pack("<i", 100),
+                error_code=0,
+            ),
+            ItemResult(
+                item_id=3,
+                status=ItemStatus.OK,
+                value_type=ValueType.BOOL,
+                quality=192,
+                timestamp_us=now_us,
+                value=struct.pack("<?", True),
+                error_code=0,
+            ),
+            ItemResult(
+                item_id=4,
+                status=ItemStatus.ERROR,
+                value_type=ValueType.STRING,
+                quality=0,
+                timestamp_us=now_us,
+                value=b"",
+                error_code=0xC0040007,  # OPC_E_UNKNOWNITEMID
+            ),
+        ],
+    )
+    bridge._record_live_values(session, resp)
+    status, _, data = request(app, "/api/v1/agents/agent-a/live-values")
+    assert status.startswith("200")
+    items = {it["opc_item_path"]: it for it in data["items"]}
+
+    # Tag.Pressure
+    p = items["Tag.Pressure"]
+    assert p["available"] is True
+    assert p["status"] == "ok"
+    assert p["value"] == 42.5
+    assert p["value_type"] == "F64"
+    assert p["quality"] == 192
+    assert p["quality_text"] == "Good"
+    assert p["stale"] is False
+    assert p["error"] is None
+    assert p["age_ms"] is not None and p["age_ms"] >= 0
+
+    # Tag.Count
+    c = items["Tag.Count"]
+    assert c["available"] is True
+    assert c["value"] == 100
+    assert c["value_type"] == "I32"
+
+    # Tag.Running
+    r = items["Tag.Running"]
+    assert r["available"] is True
+    assert r["value"] is True
+    assert r["value_type"] == "BOOL"
+
+    # Tag.Faulty (sanitized error)
+    f = items["Tag.Faulty"]
+    assert f["available"] is True
+    assert f["status"] == "error"
+    assert f["value"] is None
+    assert f["quality"] == 0
+    assert f["quality_text"] == "Bad"
+    assert "OPC_E_UNKNOWNITEMID" in f["error"]
+    assert "0xC0040007" in f["error"]
+
+
+def test_live_values_filters_strictly_active_configuration(runtime):
+    app, bridge, _, _, _ = runtime
+    session = bridge._sessions["connected"]
+    session.config_version = 1
+    session.config_items = [
+        ItemRef(item_id=1, opc_item_path="Active.Only"),
+    ]
+    resp = ReadResponsePayload(
+        request_id=102,
+        duration_us=1000,
+        results=[
+            ItemResult(item_id=1, status=ItemStatus.OK, value_type=ValueType.I32, quality=192,
+                       timestamp_us=int(time.time() * 1_000_000), value=struct.pack("<i", 10), error_code=0),
+            ItemResult(item_id=999, status=ItemStatus.OK, value_type=ValueType.I32, quality=192,
+                       timestamp_us=int(time.time() * 1_000_000), value=struct.pack("<i", 999), error_code=0),
+        ],
+    )
+    bridge._record_live_values(session, resp)
+    status, _, data = request(app, "/api/v1/agents/agent-a/live-values")
+    assert status.startswith("200")
+    paths = [it["opc_item_path"] for it in data["items"]]
+    assert paths == ["Active.Only"]
+    assert 999 not in [it["item_id"] for it in data["items"]]
+
+
+def test_live_values_stale_and_disconnect_cleanup(runtime, monkeypatch):
+    app, bridge, _, _, _ = runtime
+    session = bridge._sessions["connected"]
+    session.config_version = 1
+    session.update_rate_ms = 1000  # TTL = max(3*1000, 15000) = 15000 ms
+    session.config_items = [ItemRef(item_id=1, opc_item_path="Tag.A")]
+
+    now_wall = time.time()
+    now_mono = time.monotonic()
+    resp = ReadResponsePayload(
+        request_id=103,
+        duration_us=500,
+        results=[
+            ItemResult(item_id=1, status=ItemStatus.OK, value_type=ValueType.I32, quality=192,
+                       timestamp_us=int(now_wall * 1_000_000), value=struct.pack("<i", 55), error_code=0),
+        ],
+    )
+    bridge._record_live_values(session, resp)
+
+    # Initially fresh
+    status, _, data = request(app, "/api/v1/agents/agent-a/live-values")
+    assert data["items"][0]["stale"] is False
+    assert data["items"][0]["status"] == "ok"
+
+    # Simulate 20 seconds later (exceeding TTL of 15s)
+    monkeypatch.setattr(time, "monotonic", lambda: now_mono + 25.0)
+    status, _, data = request(app, "/api/v1/agents/agent-a/live-values")
+    assert data["items"][0]["stale"] is True
+    assert data["items"][0]["status"] == "stale"
+    assert data["items"][0]["age_ms"] >= 15000
+
+    # Disconnect cleanup
+    bridge.clear_live_values("agent-a")
+    del bridge._sessions["connected"]
+    status, _, data = request(app, "/api/v1/agents/agent-a/live-values")
+    assert data["connected"] is False
+    assert data["status"] == "agent_disconnected"
+    assert data["items"] == []
+    assert "agent-a" not in bridge._live_values
+
+
+def test_live_values_no_database_persistence_and_no_value_logging(runtime, caplog):
+    app, bridge, database, _, _ = runtime
+    session = bridge._sessions["connected"]
+    session.config_version = 1
+    session.config_items = [ItemRef(item_id=1, opc_item_path="Secret.Sensor.Tag")]
+
+    secret_val = 987654321
+    resp = ReadResponsePayload(
+        request_id=104,
+        duration_us=800,
+        results=[
+            ItemResult(item_id=1, status=ItemStatus.OK, value_type=ValueType.I32, quality=192,
+                       timestamp_us=int(time.time() * 1_000_000), value=struct.pack("<i", secret_val), error_code=0),
+        ],
+    )
+
+    caplog.clear()
+    with caplog.at_level("DEBUG"):
+        bridge._record_live_values(session, resp)
+        status, _, data = request(app, "/api/v1/agents/agent-a/live-values")
+
+    assert status.startswith("200")
+    assert data["items"][0]["value"] == secret_val
+
+    # Check database: NO process values must exist anywhere in SQLite
+    with database.session() as repo:
+        audit_rows = repo._execute("SELECT detail_json FROM audit_events").fetchall()
+        for row in audit_rows:
+            assert str(secret_val) not in str(row[0])
+            assert "Secret.Sensor.Tag" not in str(row[0])
+        snapshot_rows = repo._execute("SELECT payload_json FROM config_snapshots").fetchall()
+        for row in snapshot_rows:
+            assert str(secret_val) not in str(row[0])
+            assert "Secret.Sensor.Tag" not in str(row[0])
+        op_rows = repo._execute("SELECT status FROM config_operations").fetchall()
+        for row in op_rows:
+            assert str(secret_val) not in str(row[0])
+
+    # Check logs: NO process values or tag names logged
+    for record in caplog.records:
+        assert str(secret_val) not in record.getMessage()
+        assert "Secret.Sensor.Tag" not in record.getMessage()
+
+
+def test_live_values_polling_does_not_trigger_opc_reads_or_config_push(runtime):
+    app, bridge, _, _, _ = runtime
+    session = bridge._sessions["connected"]
+    session.config_version = 1
+    session.config_items = [ItemRef(item_id=1, opc_item_path="Test.Tag")]
+    writer = session.writer
+    initial_frames_count = len(writer.frames)
+
+    for _ in range(5):
+        status, _, _ = request(app, "/api/v1/agents/agent-a/live-values")
+        assert status.startswith("200")
+
+    # Zero frames sent!
+    assert len(writer.frames) == initial_frames_count
+
+
+def test_opc_write_remains_strictly_unavailable(runtime):
+    app, _, _, _, _ = runtime
+    # POST to live-values must return 405 Method Not Allowed
+    status, _, data = request(app, "/api/v1/agents/agent-a/live-values", method="POST", payload={"write": 123})
+    assert status.startswith("405")
+    assert data["error"] == "method_not_allowed"
+
+
+def test_ui_assets_live_controls_and_security_hygiene(runtime):
+    app, _, _, _, _ = runtime
+    status, _, html = asset(app, "/ui", ADMIN_TOKEN)
+    assert status.startswith("200")
+    assert 'id="toggle-live"' in html
+    assert ('Iniciar acompanhamento ao vivo' in html or 'Iniciar valores ao vivo' in html)
+    assert 'id="live-values"' in html
+    assert 'id="live-panel"' in html
+    assert "Escrita OPC indisponível" in html
+
+    status, _, js = asset(app, "/ui/app.js", ADMIN_TOKEN)
+    assert status.startswith("200")
+    assert "livePolling" in js
+    assert "fetchLiveValues" in js
+    assert "renderLiveTable" in js
+    assert "stopLive" in js
+    assert "visibilitychange" in js
+    assert "pagehide" in js
+    assert "beforeunload" in js
+
+    # Hygiene: No secrets in JS or HTML
+    assert "localStorage" not in js
+    assert "sessionStorage" not in js
+    assert "ADMIN_API_TOKEN" not in js
+    assert "ADMIN_API_TOKEN" not in html

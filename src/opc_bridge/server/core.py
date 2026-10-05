@@ -12,6 +12,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 from opc_bridge.protocol import (
     HEADER_SIZE,
@@ -22,9 +23,11 @@ from opc_bridge.protocol import (
     HelloAckPayload,
     HelloPayload,
     ItemRef,
+    ItemStatus,
     MsgType,
     ReadRequestPayload,
     ReadResponsePayload,
+    decode_value,
     frame_message,
     unframe_message,
 )
@@ -33,6 +36,67 @@ from opc_bridge.server.credentials import verify_agent_credential_hash
 from opc_bridge.server.persistence import Database
 
 logger = logging.getLogger(__name__)
+
+
+def sanitize_error(error_code: int, status: int = 0) -> str | None:
+    """Sanitize OPC error codes into safe standard strings without leaking internal data."""
+    if error_code == 0 and status == ItemStatus.OK:
+        return None
+    code_u32 = error_code & 0xFFFFFFFF
+    if code_u32 == 0:
+        if status == ItemStatus.BAD_QUALITY:
+            return "Bad Quality"
+        if status == ItemStatus.NOT_FOUND:
+            return "Item Not Found"
+        if status == ItemStatus.TIMEOUT:
+            return "Timeout"
+        return "Read Error"
+    known = {
+        0xC0040001: "OPC_E_INVALIDHANDLE (0xC0040001)",
+        0xC0040004: "OPC_E_BADTYPE (0xC0040004)",
+        0xC0040007: "OPC_E_UNKNOWNITEMID (0xC0040007)",
+        0xC0040008: "OPC_E_INVALIDITEMID (0xC0040008)",
+        0xC0040009: "OPC_E_FILTERDUPLICATE (0xC0040009)",
+        0xC004000C: "OPC_E_RANGE (0xC004000C)",
+        0x80004005: "E_FAIL (0x80004005)",
+        0x80040001: "OPC_E_UNKNOWNITEMID (0x80040001)",
+        0x80040002: "OPC_E_READFAILED (0x80040002)",
+    }
+    if code_u32 in known:
+        return known[code_u32]
+    return f"0x{code_u32:08X}"
+
+
+def format_quality_text(quality: int) -> str:
+    """Format OPC DA 16-bit quality word into high-level status."""
+    major = quality & 0xC0
+    if major == 0xC0:
+        return "Good"
+    if major == 0x40:
+        return "Uncertain"
+    return "Bad"
+
+
+def format_opc_timestamp(timestamp_us: int) -> str | None:
+    if timestamp_us <= 0:
+        return None
+    try:
+        dt = datetime.fromtimestamp(timestamp_us / 1_000_000, tz=timezone.utc)
+        ms = (timestamp_us % 1_000_000) // 1000
+        return dt.strftime("%d/%m/%Y %H:%M:%S") + f".{ms:03d}"
+    except Exception:
+        return None
+
+
+
+def format_received_at(timestamp_s: float) -> str | None:
+    if timestamp_s <= 0:
+        return None
+    try:
+        dt = datetime.fromtimestamp(timestamp_s, tz=timezone.utc)
+        return dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    except Exception:
+        return None
 
 
 @dataclass
@@ -112,6 +176,10 @@ class BridgeServer:
         self._config_timeout_tasks: dict[tuple[str, int], asyncio.Task[None]] = {}
         self._pending_config_payloads: dict[tuple[str, int], ConfigPushPayload] = {}
         self._pending_inspections: dict[tuple[str, str], asyncio.Future] = {}
+        # Ephemeral in-memory live values cache: agent_id -> {item_id -> dict}
+        # Strictly volatile in memory; never written to persistence or logs.
+        self._live_values: dict[str, dict[int, dict[str, Any]]] = {}
+        self._live_lock = threading.Lock()
         if self.config.persistence is not None:
             self._recover_persisted_state()
 
@@ -353,6 +421,8 @@ class BridgeServer:
                 timeout_task.cancel()
         self._pending_config_operations.clear()
         self._pending_config_payloads.clear()
+        with self._live_lock:
+            self._live_values.clear()
         self._sessions.clear()
         if self._server:
             self._server.close()
@@ -474,6 +544,119 @@ class BridgeServer:
             future.cancel()
             return None
 
+    def _record_live_values(self, session: AgentSession, resp: ReadResponsePayload) -> None:
+        """Store the latest read results in volatile memory only. Never logged or persisted."""
+        now_wall = time.time()
+        now_mono = time.monotonic()
+        items_by_id = {item.item_id: item.opc_item_path for item in session.config_items}
+        with self._live_lock:
+            agent_cache = self._live_values.setdefault(session.agent_id, {})
+            for res in resp.results:
+                opc_path = items_by_id.get(res.item_id, "")
+                val, val_type_name = decode_value(res.value_type, res.value)
+                err_str = sanitize_error(res.error_code, res.status)
+                agent_cache[res.item_id] = {
+                    "agent_id": session.agent_id,
+                    "item_id": res.item_id,
+                    "opc_item_path": opc_path,
+                    "value": val,
+                    "value_type": val_type_name,
+                    "quality": res.quality,
+                    "quality_text": format_quality_text(res.quality),
+                    "opc_timestamp": format_opc_timestamp(res.timestamp_us),
+                    "received_at": format_received_at(now_wall),
+                    "received_at_mono": now_mono,
+                    "error": err_str,
+                }
+
+    def clear_live_values(self, agent_id: str) -> None:
+        """Purge volatile live values for an agent upon session disconnect or config wipe."""
+        with self._live_lock:
+            self._live_values.pop(agent_id, None)
+
+    def get_live_values(self, agent_id: str) -> dict[str, Any]:
+        """Threadsafe lookup of ephemeral live values for an agent's active configuration."""
+        session = next((s for s in self._sessions.values() if s.agent_id == agent_id), None)
+        if session is None:
+            return {
+                "agent_id": agent_id,
+                "connected": False,
+                "config_version": None,
+                "update_rate_ms": None,
+                "status": "agent_disconnected",
+                "items": [],
+            }
+        if not session.config_items or session.config_version == 0:
+            return {
+                "agent_id": agent_id,
+                "connected": True,
+                "config_version": session.config_version,
+                "update_rate_ms": session.update_rate_ms,
+                "status": "no_active_configuration",
+                "items": [],
+            }
+
+        now_mono = time.monotonic()
+        # TTL rule: 3 * update_rate_ms, minimum 15000 ms (15s)
+        ttl_ms = max(3 * session.update_rate_ms, 15000)
+        items_result = []
+
+        with self._live_lock:
+            agent_cache = self._live_values.get(agent_id, {})
+            for item in session.config_items:
+                cached = agent_cache.get(item.item_id)
+                if cached is None:
+                    items_result.append({
+                        "item_id": item.item_id,
+                        "opc_item_path": item.opc_item_path,
+                        "available": False,
+                        "status": "waiting_first_read",
+                        "value": None,
+                        "value_type": None,
+                        "quality": None,
+                        "quality_text": None,
+                        "opc_timestamp": None,
+                        "received_at": None,
+                        "age_ms": None,
+                        "stale": False,
+                        "error": None,
+                    })
+                else:
+                    age_ms = int((now_mono - cached["received_at_mono"]) * 1000)
+                    is_stale = age_ms > ttl_ms
+                    has_error = bool(cached["error"])
+                    if is_stale:
+                        status = "stale"
+                    elif has_error:
+                        status = "error"
+                    else:
+                        status = "ok"
+                    items_result.append({
+                        "item_id": item.item_id,
+                        "opc_item_path": item.opc_item_path,
+                        "available": True,
+                        "status": status,
+                        "value": cached["value"],
+                        "value_type": cached["value_type"],
+                        "quality": cached["quality"],
+                        "quality_text": cached["quality_text"],
+                        "opc_timestamp": cached["opc_timestamp"],
+                        "received_at": cached["received_at"],
+                        "age_ms": age_ms,
+                        "stale": is_stale,
+                        "error": cached["error"],
+                    })
+
+        return {
+            "agent_id": agent_id,
+            "connected": True,
+            "config_version": session.config_version,
+            "update_rate_ms": session.update_rate_ms,
+            "status": "ok",
+            "items": items_result,
+        }
+
+
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
@@ -516,6 +699,8 @@ class BridgeServer:
                         self._pending_reads.pop(key, None)
                         if not future.done():
                             future.cancel()
+            if session:
+                self.clear_live_values(session.agent_id)
             if session and session.session_id in self._sessions:
                 del self._sessions[session.session_id]
                 logger.info("Session removed: %s", session.session_id)
@@ -671,6 +856,7 @@ class BridgeServer:
                 pending = self._pending_reads.get((session.session_id, resp.request_id))
                 if pending is not None and not pending.done():
                     pending.set_result(resp)
+                self._record_live_values(session, resp)
                 logger.info(
                     "Read response from %s: request=%d duration=%dus results=%d",
                     session.session_id,
@@ -704,6 +890,13 @@ class BridgeServer:
                         session.config_items = list(config_payload.items)
                         session.update_rate_ms = config_payload.update_rate_ms
                         session.opc_prog_id = config_payload.opc_prog_id
+                        new_item_ids = {item.item_id for item in config_payload.items}
+                        with self._live_lock:
+                            if session.agent_id in self._live_values:
+                                self._live_values[session.agent_id] = {
+                                    iid: val for iid, val in self._live_values[session.agent_id].items()
+                                    if iid in new_item_ids
+                                }
                     if operation_id is not None:
                         self._complete_config_operation(operation_id, session.agent_id, "applied")
                         with self.config.persistence.session() as repo:

@@ -5,8 +5,9 @@
 # Arquitetura e Fluxo de Autenticação:
 # 1. Navegador acessa: https://10.247.168.43:8081/ui
 # 2. Nginx valida TLS com o certificado de servidor em /etc/opc-bridge/tls/server/
-# 3. Nginx exige HTTP Basic Authentication através do arquivo /etc/opc-bridge/nginx-admin.htpasswd
-# 4. Nginx restringe a origem de rede via ACL permitindo apenas a estação 10.247.87.39
+# 3. Nginx exige HTTP Basic Authentication obrigatório através de /etc/opc-bridge/nginx-admin.htpasswd
+# 4. Qualquer usuário na rede roteável pode alcançar a porta 8081, sendo o acesso
+#    estritamente restrito a usuários previamente cadastrados no arquivo htpasswd (sem ACL fixa por IP).
 # 5. Nginx sobrescreve o cabeçalho Authorization do cliente injetando o Bearer token
 #    técnico administrativo obtido a partir de arquivo protegido fora do controle de versão
 # 6. Backend WSGI interno em 127.0.0.1:8081 recebe a requisição autenticada
@@ -20,10 +21,14 @@
 #     EOF'
 #     sudo chown root:root /etc/opc-bridge/nginx-api-token.conf
 #     sudo chmod 600 /etc/opc-bridge/nginx-api-token.conf
-# - O arquivo /etc/opc-bridge/nginx-admin.htpasswd deve ser criado manualmente no AUTOU3:
-#     sudo htpasswd -c -B /etc/opc-bridge/nginx-admin.htpasswd admin
-#     sudo chown root:root /etc/opc-bridge/nginx-admin.htpasswd
-#     sudo chmod 600 /etc/opc-bridge/nginx-admin.htpasswd
+# - Gerenciamento de usuários no arquivo /etc/opc-bridge/nginx-admin.htpasswd:
+#     * Criação inicial do arquivo htpasswd:
+#         sudo htpasswd -c -B /etc/opc-bridge/nginx-admin.htpasswd admin
+#     * Adicionar novo usuário individualmente sem sobrescrever os existentes:
+#         sudo htpasswd -B /etc/opc-bridge/nginx-admin.htpasswd NOME_DO_USUARIO
+#     * Permissões restritas do arquivo:
+#         sudo chown root:root /etc/opc-bridge/nginx-admin.htpasswd
+#         sudo chmod 600 /etc/opc-bridge/nginx-admin.htpasswd
 # - Validar a configuração após instalação:
 #     sudo nginx -t
 #     sudo systemctl reload nginx
@@ -46,11 +51,9 @@ server {
     # Desativa listagem de arquivos
     autoindex off;
 
-    # ACL de rede: permitir exclusivamente a estação de engenharia autorizada
-    allow 10.247.87.39;
-    deny all;
-
-    # HTTP Basic Authentication gerenciada no proxy reverso
+    # Acesso pela rede: qualquer estação na rede corporativa roteável pode alcançar a porta,
+    # porém o acesso a todos os caminhos exige obrigatoriamente HTTP Basic Authentication.
+    # Sem ACL fixa por IP.
     auth_basic "OPC-Bridge Control Plane - Acesso Administrativo";
     auth_basic_user_file /etc/opc-bridge/nginx-admin.htpasswd;
 
@@ -66,7 +69,7 @@ server {
 
     # Encaminhamento para a API interna e assets estáticos no loopback
     location / {
-        limit_except GET POST HEAD {
+        limit_except GET POST PUT DELETE HEAD {
             deny all;
         }
 

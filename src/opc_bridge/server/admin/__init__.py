@@ -135,9 +135,16 @@ class AdminApplication(TagAdministration):
     def _read_request(
         self, method: str, path: str, query: str, environ: dict[str, Any], start_response: Callable[..., Any]
     ) -> list[bytes]:
+        equip_resp = self.equipment_route(method, path, query, environ, start_response)
+        if equip_resp is not None:
+            return equip_resp
+        config_resp = self.named_config_route(method, path, query, environ, start_response)
+        if config_resp is not None:
+            return config_resp
         tag_response = self.tag_route(method, path, query, environ, start_response)
         if tag_response is not None:
             return tag_response
+
         if (method == "POST" and self._bridge_server is not None and
                 path.startswith("/api/v1/agents/") and path.endswith("/config-operations")):
             agent_id = path[len("/api/v1/agents/") : -len("/config-operations")].rstrip("/")

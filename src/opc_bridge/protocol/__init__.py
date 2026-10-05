@@ -20,7 +20,9 @@ from .messages import (
     MsgType,
     ReadRequestPayload,
     ReadResponsePayload,
+    VALUE_TYPE_NAMES,
     ValueType,
+    decode_value,
     frame_message,
     unframe_message,
 )
@@ -45,7 +47,9 @@ __all__ = [
     "MsgType",
     "ReadRequestPayload",
     "ReadResponsePayload",
+    "VALUE_TYPE_NAMES",
     "ValueType",
+    "decode_value",
     "frame_message",
     "unframe_message",
 ]

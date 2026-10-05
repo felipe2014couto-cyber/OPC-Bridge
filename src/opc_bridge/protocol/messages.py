@@ -50,6 +50,47 @@ class ValueType(IntEnum):
     BLOB = 6
 
 
+VALUE_TYPE_NAMES: dict[int, str] = {
+    ValueType.I16: "I16",
+    ValueType.I32: "I32",
+    ValueType.F32: "F32",
+    ValueType.F64: "F64",
+    ValueType.BOOL: "BOOL",
+    ValueType.STRING: "STRING",
+    ValueType.BLOB: "BLOB",
+}
+
+
+def decode_value(value_type: int, raw_bytes: bytes) -> tuple[object, str]:
+    """Safely decode an ItemResult value bytes according to its ValueType."""
+    type_name = VALUE_TYPE_NAMES.get(value_type, f"TYPE_{value_type}")
+    if not raw_bytes:
+        return None, type_name
+    try:
+        if value_type == ValueType.I16:
+            if len(raw_bytes) >= 2:
+                return struct.unpack("<h", raw_bytes[:2])[0], type_name
+        elif value_type == ValueType.I32:
+            if len(raw_bytes) >= 4:
+                return struct.unpack("<i", raw_bytes[:4])[0], type_name
+        elif value_type == ValueType.F32:
+            if len(raw_bytes) >= 4:
+                return round(struct.unpack("<f", raw_bytes[:4])[0], 6), type_name
+        elif value_type == ValueType.F64:
+            if len(raw_bytes) >= 8:
+                return struct.unpack("<d", raw_bytes[:8])[0], type_name
+        elif value_type == ValueType.BOOL:
+            if len(raw_bytes) >= 1:
+                return bool(struct.unpack("<?", raw_bytes[:1])[0]), type_name
+        elif value_type == ValueType.STRING:
+            return raw_bytes.decode("utf-8", errors="replace"), type_name
+        elif value_type == ValueType.BLOB:
+            return raw_bytes.hex(), type_name
+    except Exception:
+        pass
+    return None, type_name
+
+
 @dataclass
 class Header:
     magic: int = MAGIC

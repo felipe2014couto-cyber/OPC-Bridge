@@ -3,9 +3,11 @@ from __future__ import annotations
 
 from typing import Any, List
 
-REVISION = "0003_retention_policy"
+REVISION = "0004_equipment_and_opc_configs"
+_RETENTION_REVISION = "0003_retention_policy"
 _BRIDGE_STATE_REVISION = "0002_bridge_server_state"
 _INITIAL_REVISION = "0001_initial"
+
 
 _SCHEMA: List[str] = [
     """CREATE TABLE agents (
@@ -146,6 +148,37 @@ def _apply_retention_policy(cursor: Any, database: Any, marker: str) -> None:
         )
     cursor.execute(
         "INSERT INTO schema_migrations(revision) VALUES (" + marker + ")",
+        (_RETENTION_REVISION,),
+    )
+
+
+def _apply_equipment_and_opc_configs(cursor: Any, database: Any, marker: str, timestamp_type: str) -> None:
+    statements = [
+        """CREATE TABLE equipments (
+            equipment_id VARCHAR(128) PRIMARY KEY,
+            name VARCHAR(255) NOT NULL,
+            ip_address VARCHAR(128) NOT NULL,
+            agent_id VARCHAR(128) REFERENCES agents(agent_id) ON DELETE SET NULL,
+            created_at __TIMESTAMP__ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at __TIMESTAMP__ NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )""",
+        """CREATE TABLE named_opc_configs (
+            config_id VARCHAR(128) PRIMARY KEY,
+            name VARCHAR(255) NOT NULL,
+            equipment_id VARCHAR(128) NOT NULL REFERENCES equipments(equipment_id) ON DELETE CASCADE,
+            agent_id VARCHAR(128) REFERENCES agents(agent_id) ON DELETE SET NULL,
+            opc_prog_id VARCHAR(256) NOT NULL,
+            interval_ms INTEGER NOT NULL CHECK (interval_ms >= 1000 AND interval_ms <= 60000),
+            tags_json TEXT NOT NULL,
+            created_at __TIMESTAMP__ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at __TIMESTAMP__ NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )""",
+    ]
+    for statement in statements:
+        statement = statement.replace("__TIMESTAMP__", timestamp_type)
+        cursor.execute(statement)
+    cursor.execute(
+        "INSERT INTO schema_migrations(revision) VALUES (" + marker + ")",
         (REVISION,),
     )
 
@@ -171,8 +204,10 @@ def upgrade_database(database: Any) -> None:
             _apply_initial(cursor, database, marker, timestamp_type)
         if _BRIDGE_STATE_REVISION not in applied:
             _apply_bridge_state(cursor, database, marker, timestamp_type)
-        if REVISION not in applied:
+        if _RETENTION_REVISION not in applied:
             _apply_retention_policy(cursor, database, marker)
+        if REVISION not in applied:
+            _apply_equipment_and_opc_configs(cursor, database, marker, timestamp_type)
         connection.commit()
     except Exception:
         connection.rollback()

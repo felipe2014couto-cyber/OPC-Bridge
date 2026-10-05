@@ -12,7 +12,10 @@ from .models import (
     CollectionPlan,
     ConfigOperation,
     ConfigSnapshot,
+    Equipment,
+    NamedOpcConfig,
 )
+
 
 T = TypeVar("T")
 
@@ -498,3 +501,169 @@ class PersistenceRepository:
             ),
             ConfigOperation,
         )
+
+    def list_equipments(self) -> List[dict[str, Any]]:
+        cursor = self._execute(
+            "SELECT e.equipment_id, e.name, e.ip_address, e.agent_id, e.created_at, e.updated_at, "
+            "a.display_name AS agent_display_name, "
+            "s.session_id, s.state AS agent_session_state, "
+            "(SELECT COUNT(*) FROM named_opc_configs c WHERE c.equipment_id = e.equipment_id) AS config_count "
+            "FROM equipments e "
+            "LEFT JOIN agents a ON a.agent_id = e.agent_id "
+            "LEFT JOIN agent_sessions s ON s.session_id = ("
+            "SELECT latest.session_id FROM agent_sessions latest "
+            "WHERE latest.agent_id = e.agent_id "
+            "ORDER BY latest.started_at DESC, latest.session_id DESC LIMIT 1) "
+            "ORDER BY e.name, e.equipment_id"
+        )
+        rows = self._dicts(cursor)
+        for r in rows:
+            if not r.get("agent_id"):
+                r["agent_status"] = "unassociated"
+            elif r.get("agent_session_state") == "connected" and r.get("session_id") is not None:
+                r["agent_status"] = "connected"
+            else:
+                r["agent_status"] = "disconnected"
+        return rows
+
+    def get_equipment(self, equipment_id: str) -> Optional[dict[str, Any]]:
+        cursor = self._execute(
+            "SELECT e.equipment_id, e.name, e.ip_address, e.agent_id, e.created_at, e.updated_at, "
+            "a.display_name AS agent_display_name, "
+            "s.session_id, s.state AS agent_session_state, "
+            "(SELECT COUNT(*) FROM named_opc_configs c WHERE c.equipment_id = e.equipment_id) AS config_count "
+            "FROM equipments e "
+            "LEFT JOIN agents a ON a.agent_id = e.agent_id "
+            "LEFT JOIN agent_sessions s ON s.session_id = ("
+            "SELECT latest.session_id FROM agent_sessions latest "
+            "WHERE latest.agent_id = e.agent_id "
+            "ORDER BY latest.started_at DESC, latest.session_id DESC LIMIT 1) "
+            "WHERE e.equipment_id = ?",
+            (equipment_id,),
+        )
+        rows = self._dicts(cursor)
+        if not rows:
+            return None
+        r = rows[0]
+        if not r.get("agent_id"):
+            r["agent_status"] = "unassociated"
+        elif r.get("agent_session_state") == "connected" and r.get("session_id") is not None:
+            r["agent_status"] = "connected"
+        else:
+            r["agent_status"] = "disconnected"
+        return r
+
+    def add_equipment(
+        self, equipment_id: str, name: str, ip_address: str, agent_id: Optional[str] = None
+    ) -> Equipment:
+        self._execute(
+            "INSERT INTO equipments(equipment_id, name, ip_address, agent_id) VALUES (?, ?, ?, ?)",
+            (equipment_id, name, ip_address, agent_id),
+        )
+        return Equipment(equipment_id=equipment_id, name=name, ip_address=ip_address, agent_id=agent_id)
+
+    def update_equipment(
+        self, equipment_id: str, name: str, ip_address: str, agent_id: Optional[str] = None
+    ) -> Optional[Equipment]:
+        cursor = self._execute(
+            "UPDATE equipments SET name = ?, ip_address = ?, agent_id = ?, updated_at = CURRENT_TIMESTAMP "
+            "WHERE equipment_id = ?",
+            (name, ip_address, agent_id, equipment_id),
+        )
+        if cursor.rowcount == 0:
+            return None
+        return Equipment(equipment_id=equipment_id, name=name, ip_address=ip_address, agent_id=agent_id)
+
+    def delete_equipment(self, equipment_id: str) -> bool:
+        cursor = self._execute("DELETE FROM equipments WHERE equipment_id = ?", (equipment_id,))
+        return cursor.rowcount > 0
+
+    def list_named_configs(self, equipment_id: Optional[str] = None) -> List[dict[str, Any]]:
+        query = (
+            "SELECT c.config_id, c.name, c.equipment_id, c.agent_id, c.opc_prog_id, c.interval_ms, "
+            "c.tags_json, c.created_at, c.updated_at, e.name AS equipment_name "
+            "FROM named_opc_configs c "
+            "JOIN equipments e ON e.equipment_id = c.equipment_id"
+        )
+        params: tuple = ()
+        if equipment_id is not None:
+            query += " WHERE c.equipment_id = ?"
+            params = (equipment_id,)
+        query += " ORDER BY c.name, c.config_id"
+        return self._dicts(self._execute(query, params))
+
+    def get_named_config(self, config_id: str) -> Optional[dict[str, Any]]:
+        cursor = self._execute(
+            "SELECT c.config_id, c.name, c.equipment_id, c.agent_id, c.opc_prog_id, c.interval_ms, "
+            "c.tags_json, c.created_at, c.updated_at, e.name AS equipment_name "
+            "FROM named_opc_configs c "
+            "JOIN equipments e ON e.equipment_id = c.equipment_id "
+            "WHERE c.config_id = ?",
+            (config_id,),
+        )
+        rows = self._dicts(cursor)
+        return rows[0] if rows else None
+
+    def add_named_config(
+        self,
+        config_id: str,
+        name: str,
+        equipment_id: str,
+        opc_prog_id: str,
+        interval_ms: int,
+        tags_json: str,
+        agent_id: Optional[str] = None,
+    ) -> NamedOpcConfig:
+        self._execute(
+            "INSERT INTO named_opc_configs(config_id, name, equipment_id, agent_id, opc_prog_id, interval_ms, tags_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (config_id, name, equipment_id, agent_id, opc_prog_id, interval_ms, tags_json),
+        )
+        return NamedOpcConfig(
+            config_id=config_id,
+            name=name,
+            equipment_id=equipment_id,
+            agent_id=agent_id,
+            opc_prog_id=opc_prog_id,
+            interval_ms=interval_ms,
+            tags_json=tags_json,
+        )
+
+    def update_named_config(
+        self,
+        config_id: str,
+        name: str,
+        equipment_id: str,
+        opc_prog_id: str,
+        interval_ms: int,
+        tags_json: str,
+        agent_id: Optional[str] = None,
+    ) -> Optional[NamedOpcConfig]:
+        cursor = self._execute(
+            "UPDATE named_opc_configs "
+            "SET name = ?, equipment_id = ?, agent_id = ?, opc_prog_id = ?, interval_ms = ?, tags_json = ?, "
+            "updated_at = CURRENT_TIMESTAMP WHERE config_id = ?",
+            (name, equipment_id, agent_id, opc_prog_id, interval_ms, tags_json, config_id),
+        )
+        if cursor.rowcount == 0:
+            return None
+        return NamedOpcConfig(
+            config_id=config_id,
+            name=name,
+            equipment_id=equipment_id,
+            agent_id=agent_id,
+            opc_prog_id=opc_prog_id,
+            interval_ms=interval_ms,
+            tags_json=tags_json,
+        )
+
+    def delete_named_config(self, config_id: str) -> bool:
+        cursor = self._execute("DELETE FROM named_opc_configs WHERE config_id = ?", (config_id,))
+        return cursor.rowcount > 0
+
+    def list_named_configs_for_equipment(self, equipment_id: str) -> List[dict[str, Any]]:
+        cursor = self._execute(
+            "SELECT config_id, name FROM named_opc_configs WHERE equipment_id = ? ORDER BY name",
+            (equipment_id,),
+        )
+        return self._dicts(cursor)

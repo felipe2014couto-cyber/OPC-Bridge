@@ -73,3 +73,26 @@ class AuditEvent:
     event_type: str
     detail_json: str = "{}"
     occurred_at: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class Equipment:
+    equipment_id: str
+    name: str
+    ip_address: str
+    agent_id: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class NamedOpcConfig:
+    config_id: str
+    name: str
+    equipment_id: str
+    opc_prog_id: str
+    interval_ms: int
+    tags_json: str
+    agent_id: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
