@@ -25,6 +25,15 @@ except ImportError:
     import contextlib
 
     class PytestFallback:
+        class _Mark:
+            @staticmethod
+            def parametrize(*args, **kwargs):
+                def decorator(func):
+                    return func
+                return decorator
+
+        mark = _Mark()
+
         @staticmethod
         def approx(val, rel=None, tolerance=1e-4):
             class ApproxVal:
@@ -36,13 +45,22 @@ except ImportError:
             return ApproxVal(val)
 
         @staticmethod
-        def raises(expected_exception):
+        def raises(expected_exception, match=None):
+            class ExceptionInfo:
+                def __init__(self):
+                    self.value = None
+
             @contextlib.contextmanager
             def cm():
+                info = ExceptionInfo()
                 try:
-                    yield
-                except expected_exception:
-                    pass
+                    yield info
+                except expected_exception as exc:
+                    info.value = exc
+                    if match is not None:
+                        import re
+                        if not re.search(match, str(exc)):
+                            raise AssertionError(f"Pattern {match!r} does not match {str(exc)!r}") from exc
                 else:
                     raise AssertionError(f"Expected exception {expected_exception} was not raised")
             return cm()
@@ -164,16 +182,22 @@ class MockComGroup:
 class MockComGroups:
     """Mock OPCGroups collection."""
 
-    def __init__(self) -> None:
-        self._groups: dict[str, MockComGroup] = {}
+    def __init__(self, server: Optional[Any] = None) -> None:
+        self._groups: dict[str, Any] = {}
+        self._server = server
 
-    def Add(self, name: str) -> MockComGroup:
-        group = MockComGroup(name)
+    def Add(self, name: str) -> Any:
+        if self._server is not None and hasattr(self._server, "_create_group"):
+            group = self._server._create_group(name)
+        else:
+            group = MockComGroup(name)
         self._groups[name] = group
         return group
 
-    def Remove(self, group: MockComGroup) -> None:
-        self._groups.pop(group.Name, None)
+    def Remove(self, group: Any) -> None:
+        name = getattr(group, "Name", None)
+        if name:
+            self._groups.pop(name, None)
 
 
 class MockComServer:
@@ -185,9 +209,12 @@ class MockComServer:
         self.MinorVersion = 1
         self.BuildNumber = 104
         self.ServerState = 1  # OPCRunning
-        self.OPCGroups = MockComGroups()
+        self.OPCGroups = MockComGroups(self)
         self.connected_prog_id = None
         self.connected = False
+
+    def _create_group(self, name: str) -> MockComGroup:
+        return MockComGroup(name)
 
     def Connect(self, prog_id: str) -> None:
         self.connected_prog_id = prog_id
@@ -493,6 +520,171 @@ class TestOpcDaAdapter:
 
         adapter.disconnect()
 
+    def test_read_device_passes_one_based_handles(self):
+        """Confirm that SyncRead receives 1-based server handles [0, h1, h2, ...]."""
+        recorded_calls = []
+
+        class RecordingGroup(MockComGroup):
+            def SyncRead(self, source, count, server_handles):
+                recorded_calls.append({
+                    "source": source,
+                    "count": count,
+                    "handles": list(server_handles),
+                })
+                return super().SyncRead(source, count, server_handles)
+
+        class RecordingServer(MockComServer):
+            def _create_group(self, name):
+                return RecordingGroup(name)
+
+        adapter = OpcDaAdapter(com_factory=lambda: RecordingServer())
+        adapter.connect("Simulated.OPC")
+        group = adapter.create_group("OneBasedTestGroup", 1000)
+        mapping = adapter.add_items(group, ["Tag.A", "Tag.B"])
+        item_ids = [mapping["Tag.A"], mapping["Tag.B"]]
+
+        results = adapter.read_device(group, item_ids)
+        assert len(results) == 2
+        assert len(recorded_calls) == 1
+        call = recorded_calls[0]
+        assert call["source"] == OPC_DS_DEVICE
+        assert call["count"] == 2
+        # Index 0 must be reserved as 0, followed by the actual handles
+        assert call["handles"][0] == 0
+        assert len(call["handles"]) == 3
+        expected_handles = [adapter._groups[group.name]["items_by_id"][iid]["server_handle"] for iid in item_ids]
+        assert call["handles"][1:] == expected_handles
+
+        adapter.disconnect()
+
+    def test_read_device_maps_two_tags_from_one_based_arrays(self):
+        """Confirm correct tag mapping when SyncRead returns 1-based arrays."""
+        now = time.time()
+
+        class OneBasedGroup(MockComGroup):
+            def SyncRead(self, source, count, server_handles):
+                assert count == 2
+                assert server_handles[0] == 0
+                # Return strictly 1-based arrays where index 0 is dummy/error
+                values = [None, 42.5, 99.0]
+                errors = [0xC0040001, 0, 0]
+                qualities = [OPC_QUALITY_BAD, OPC_QUALITY_GOOD, OPC_QUALITY_GOOD]
+                timestamps = [now, now + 1, now + 2]
+                return values, errors, qualities, timestamps
+
+        class OneBasedServer(MockComServer):
+            def _create_group(self, name):
+                return OneBasedGroup(name)
+
+        adapter = OpcDaAdapter(com_factory=lambda: OneBasedServer())
+        adapter.connect("Simulated.OPC")
+        group = adapter.create_group("MappingGroup", 1000)
+        mapping = adapter.add_items(group, ["LineA.Diameter", "LineA.Weight"])
+
+        results = adapter.read_device(group, [mapping["LineA.Diameter"], mapping["LineA.Weight"]])
+        assert len(results) == 2
+
+        # Item 1: LineA.Diameter -> values[1] (42.5)
+        res1 = results[0]
+        assert res1.item_id == mapping["LineA.Diameter"]
+        assert res1.status == ItemStatus.OK
+        assert res1.error_code == 0
+        assert res1.quality == OPC_QUALITY_GOOD
+        assert struct.unpack("<d", res1.value)[0] == pytest.approx(42.5)
+
+        # Item 2: LineA.Weight -> values[2] (99.0)
+        res2 = results[1]
+        assert res2.item_id == mapping["LineA.Weight"]
+        assert res2.status == ItemStatus.OK
+        assert res2.error_code == 0
+        assert res2.quality == OPC_QUALITY_GOOD
+        assert struct.unpack("<d", res2.value)[0] == pytest.approx(99.0)
+
+        adapter.disconnect()
+
+    def test_read_device_preserves_real_hresult_on_syncread_failure(self):
+        """SyncRead exceptions must preserve the real COM HRESULT and not mask it as OPC_E_INVALIDHANDLE."""
+        class FailingGroup(MockComGroup):
+            def __init__(self, name, exc_to_raise):
+                super().__init__(name)
+                self.exc_to_raise = exc_to_raise
+
+            def SyncRead(self, source, count, server_handles):
+                raise self.exc_to_raise
+
+        class CustomComError(Exception):
+            def __init__(self, hr, msg):
+                super().__init__(msg)
+                self.hresult = hr
+
+        # Case 1: Exception with real COM HRESULT (e.g., E_ACCESSDENIED 0x80070005)
+        class HResultServer(MockComServer):
+            def _create_group(self, name):
+                return FailingGroup(name, CustomComError(0x80070005, "Access Denied"))
+
+        adapter = OpcDaAdapter(com_factory=lambda: HResultServer())
+        adapter.connect("Simulated.OPC")
+        group = adapter.create_group("FailGroup1", 1000)
+        mapping = adapter.add_items(group, ["Tag.X", "Tag.Y"])
+
+        results = adapter.read_device(group, list(mapping.values()))
+        assert len(results) == 2
+        for r in results:
+            assert r.status == ItemStatus.ERROR
+            assert r.error_code == 0x80070005
+            assert r.error_code != 0xC0040001  # Not masked as OPC_E_INVALIDHANDLE
+        adapter.disconnect()
+
+        # Case 2: Generic exception without HRESULT (falls back safely to E_FAIL 0x80004005)
+        class GenericErrorServer(MockComServer):
+            def _create_group(self, name):
+                return FailingGroup(name, RuntimeError("Driver communication interrupted"))
+
+        adapter2 = OpcDaAdapter(com_factory=lambda: GenericErrorServer())
+        adapter2.connect("Simulated.OPC")
+        group2 = adapter2.create_group("FailGroup2", 1000)
+        mapping2 = adapter2.add_items(group2, ["Tag.Z"])
+
+        results2 = adapter2.read_device(group2, list(mapping2.values()))
+        assert len(results2) == 1
+        assert results2[0].status == ItemStatus.ERROR
+        assert results2[0].error_code == 0x80004005
+        assert results2[0].error_code != 0xC0040001
+        adapter2.disconnect()
+
+    def test_add_items_rejects_invalid_server_handle(self):
+        """add_items must reject missing or invalid ServerHandle from COM wrapper."""
+        class InvalidHandleItem:
+            def __init__(self, handle):
+                self.ServerHandle = handle
+
+        class InvalidHandleItems:
+            def __init__(self, bad_handle):
+                self.bad_handle = bad_handle
+
+            def AddItem(self, path, client_handle):
+                return InvalidHandleItem(self.bad_handle)
+
+        class InvalidHandleGroup:
+            def __init__(self, bad_handle):
+                self.OPCItems = InvalidHandleItems(bad_handle)
+
+        for bad in (None, 0, -5, "not_an_int", False, True):
+            class BadServer(MockComServer):
+                def _create_group(self, name):
+                    return InvalidHandleGroup(bad)
+
+            adapter = OpcDaAdapter(com_factory=lambda: BadServer())
+            adapter.connect("Simulated.OPC")
+            group = adapter.create_group(f"BadGroup_{bad}", 1000)
+
+            with pytest.raises(RuntimeError) as exc_info:
+                adapter.add_items(group, ["Tag.BadHandle"])
+            assert "invalid ServerHandle" in str(exc_info.value)
+            # Ensure no corrupted record was stored
+            assert "Tag.BadHandle" not in adapter._groups[group.name]["id_by_path"]
+            adapter.disconnect()
+
 
 class TestSupervisedOpcAdapter:
     """Tests for out-of-process COM supervision and crash recovery."""
@@ -657,10 +849,25 @@ class TestServiceAndPackaging:
         assert cfg["opc_prog_id"] == "Custom.ProgId.1"
         assert cfg["auth_token"] == "my-token"
 
-    def test_service_logging_redacts_secrets(self, tmp_path):
+    def test_service_logging_redacts_secrets(self, tmp_path, monkeypatch=None):
         import asyncio
 
         from opc_bridge.agent.service import run_agent_main
+        import opc_bridge.adapters.supervised
+
+        orig_calcsize = struct.calcsize
+        orig_select = getattr(opc_bridge.adapters.supervised, "select_worker_runtime", None)
+        if monkeypatch is not None:
+            monkeypatch.setattr(
+                "opc_bridge.adapters.supervised.select_worker_runtime",
+                lambda *a, **k: ("x64", sys.executable),
+            )
+            if orig_calcsize("P") != 8:
+                monkeypatch.setattr(struct, "calcsize", lambda fmt: 8 if fmt == "P" else orig_calcsize(fmt))
+        else:
+            opc_bridge.adapters.supervised.select_worker_runtime = lambda *a, **k: ("x64", sys.executable)
+            if orig_calcsize("P") != 8:
+                struct.calcsize = lambda fmt: 8 if fmt == "P" else orig_calcsize(fmt)
 
         log_file = tmp_path / "agent.log"
         cfg = {
@@ -675,15 +882,19 @@ class TestServiceAndPackaging:
 
         stop_event = asyncio.Event()
         stop_event.set()
-        run_agent_main(cfg, stop_event=stop_event)
-
-        log_content = log_file.read_text(encoding="utf-8")
-        assert "super-secret-cleartext-token" not in log_content
-        assert "[REDACTED]" in log_content
-
-        for handler in logging.root.handlers[:]:
-            handler.close()
-            logging.root.removeHandler(handler)
+        try:
+            run_agent_main(cfg, stop_event=stop_event)
+            log_content = log_file.read_text(encoding="utf-8")
+            assert "super-secret-cleartext-token" not in log_content
+            assert "[REDACTED]" in log_content
+        finally:
+            for handler in logging.root.handlers[:]:
+                handler.close()
+                logging.root.removeHandler(handler)
+            if monkeypatch is None and orig_select is not None:
+                opc_bridge.adapters.supervised.select_worker_runtime = orig_select
+            if monkeypatch is None and struct.calcsize is not orig_calcsize:
+                struct.calcsize = orig_calcsize
 
     def test_setup_config_fails_closed_without_token(self, tmp_path):
         import subprocess
@@ -742,7 +953,11 @@ if __name__ == "__main__":
     tda.test_read_device_preserves_error_code(mock_adapter)
     mock_adapter = OpcDaAdapter(com_factory=lambda: MockComServer())
     tda.test_browse_items(mock_adapter)
-    print("[PASS] TestOpcDaAdapter (9 unit tests)")
+    tda.test_read_device_passes_one_based_handles()
+    tda.test_read_device_maps_two_tags_from_one_based_arrays()
+    tda.test_read_device_preserves_real_hresult_on_syncread_failure()
+    tda.test_add_items_rejects_invalid_server_handle()
+    print("[PASS] TestOpcDaAdapter (13 unit tests)")
 
     # 3. SupervisedOpcAdapter tests (lifecycle, crash recovery, blocked call timeout + reaping)
     tsup = TestSupervisedOpcAdapter()
@@ -767,5 +982,5 @@ if __name__ == "__main__":
     print("[PASS] TestServiceAndPackaging")
 
     print("=" * 60)
-    print("ALL 19 OPC DA & SUPERVISION TESTS PASSED SUCCESSFULLY!")
+    print("ALL 23 OPC DA & SUPERVISION TESTS PASSED SUCCESSFULLY!")
     print("=" * 60)

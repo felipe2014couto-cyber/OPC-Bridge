@@ -29,6 +29,7 @@ from opc_bridge.adapters.base import (
     BrowseEntry,
     GroupHandle,
     ServerStatus,
+    opc_hresult,
 )
 from opc_bridge.protocol import ItemResult, ItemStatus, ValueType
 
@@ -528,7 +529,17 @@ class OpcDaAdapter:
             if opc_items is not None:
                 try:
                     native_item = opc_items.AddItem(path, item_id)
-                    server_handle = getattr(native_item, "ServerHandle", item_id)
+                    raw_handle = getattr(native_item, "ServerHandle", None)
+                    if (
+                        raw_handle is None
+                        or not isinstance(raw_handle, int)
+                        or isinstance(raw_handle, bool)
+                        or raw_handle <= 0
+                    ):
+                        raise RuntimeError(
+                            f"OPC server returned invalid ServerHandle {raw_handle!r} for item {path!r}"
+                        )
+                    server_handle = int(raw_handle)
                 except Exception as exc:
                     raise RuntimeError(f"Failed to add OPC item {path!r}: {exc}") from exc
 
@@ -632,23 +643,29 @@ class OpcDaAdapter:
         if native_group is not None and hasattr(native_group, "SyncRead"):
             server_handles = [rec["server_handle"] for _, rec in valid_items]
             count = len(server_handles)
+            handles_1based = [0] + server_handles
             try:
-                raw_out = native_group.SyncRead(OPC_DS_DEVICE, count, server_handles)
+                raw_out = native_group.SyncRead(OPC_DS_DEVICE, count, handles_1based)
                 if isinstance(raw_out, tuple) and len(raw_out) >= 4:
                     raw_vals, raw_errs, raw_quals, raw_times = raw_out[0], raw_out[1], raw_out[2], raw_out[3]
                 else:
                     raw_vals, raw_errs, raw_quals, raw_times = (
-                        getattr(raw_out, "Values", [None] * count),
-                        getattr(raw_out, "Errors", [0] * count),
-                        getattr(raw_out, "Qualities", [OPC_QUALITY_GOOD] * count),
-                        getattr(raw_out, "TimeStamps", [now_us] * count),
+                        getattr(raw_out, "Values", [None] * (count + 1)),
+                        getattr(raw_out, "Errors", [0] * (count + 1)),
+                        getattr(raw_out, "Qualities", [OPC_QUALITY_GOOD] * (count + 1)),
+                        getattr(raw_out, "TimeStamps", [now_us] * (count + 1)),
                     )
 
                 for idx, (iid, _) in enumerate(valid_items):
-                    val = raw_vals[idx] if idx < len(raw_vals) else None
-                    err = int(raw_errs[idx]) if idx < len(raw_errs) else 0
-                    qual = int(raw_quals[idx]) if idx < len(raw_quals) else OPC_QUALITY_GOOD
-                    raw_ts = raw_times[idx] if idx < len(raw_times) else now_us
+                    val_idx = idx + 1 if len(raw_vals) > count else idx
+                    err_idx = idx + 1 if len(raw_errs) > count else idx
+                    qual_idx = idx + 1 if len(raw_quals) > count else idx
+                    time_idx = idx + 1 if len(raw_times) > count else idx
+
+                    val = raw_vals[val_idx] if val_idx < len(raw_vals) else None
+                    err = int(raw_errs[err_idx]) if err_idx < len(raw_errs) else 0
+                    qual = int(raw_quals[qual_idx]) if qual_idx < len(raw_quals) else OPC_QUALITY_GOOD
+                    raw_ts = raw_times[time_idx] if time_idx < len(raw_times) else now_us
                     ts_us = datetime_to_timestamp_us(raw_ts)
 
                     val_type, val_bytes = pack_variant_value(val)
@@ -673,17 +690,25 @@ class OpcDaAdapter:
                     )
                 return results
             except Exception as exc:  # noqa: BLE001 - provider-specific exception boundary.
-                logger.error("COM SyncRead failed on group %s: %s", group_name, exc)
+                hresult = opc_hresult(exc)
+                effective_error = hresult if hresult is not None else 0x80004005
+                status = ItemStatus.NOT_FOUND if effective_error == OPC_E_UNKNOWNITEMID else ItemStatus.ERROR
+                logger.error(
+                    "COM SyncRead failed on group %s (hresult=0x%08X): %s",
+                    group_name,
+                    effective_error,
+                    exc,
+                )
                 for iid, _ in valid_items:
                     results.append(
                         ItemResult(
                             item_id=iid,
-                            status=ItemStatus.ERROR,
+                            status=status,
                             value_type=ValueType.BLOB,
                             quality=OPC_QUALITY_BAD,
                             timestamp_us=now_us,
                             value=b"",
-                            error_code=OPC_E_INVALIDHANDLE,
+                            error_code=effective_error,
                         )
                     )
                 return results
