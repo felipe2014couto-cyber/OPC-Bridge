@@ -350,7 +350,7 @@
       el("meta-session-id").textContent = "—";
       el("meta-last-heartbeat").textContent = "—";
       el("active-config").textContent = "Equipamento não associado a um agente.";
-      el("operations").replaceChildren();
+      if (el("operations")) el("operations").replaceChildren();
     }
 
     // Load saved configs for this equipment
@@ -374,17 +374,19 @@
         el("btn-load-active").disabled = true;
       }
 
-      // History
+      // History (if visual table exists)
       const tbody = el("operations");
-      tbody.replaceChildren();
-      for (const op of (histData.operations || [])) {
-        const tr = document.createElement("tr");
-        for (const val of [op.version, op.status, op.requested_at, op.completed_at || "—", op.operation_id + (op.error ? ` · ${op.error}` : "")]) {
-          const td = document.createElement("td");
-          td.textContent = val;
-          tr.append(td);
+      if (tbody) {
+        tbody.replaceChildren();
+        for (const op of (histData.operations || [])) {
+          const tr = document.createElement("tr");
+          for (const val of [op.version, op.status, op.requested_at, op.completed_at || "—", op.operation_id + (op.error ? ` · ${op.error}` : "")]) {
+            const td = document.createElement("td");
+            td.textContent = val;
+            tr.append(td);
+          }
+          tbody.append(tr);
         }
-        tbody.append(tr);
       }
     } catch (err) {
       el("active-config").textContent = "Erro ao carregar dados do agente.";
@@ -579,9 +581,21 @@
     return inputs.map(i => i.value.trim()).filter(v => !!v);
   }
 
+  function clearValidationHighlights() {
+    const banner = el("validation-errors-banner");
+    if (banner) {
+      banner.textContent = "";
+      banner.hidden = true;
+    }
+    for (const row of el("tags").children) {
+      row.classList.remove("row-error");
+    }
+  }
+
   function invalidateApproval() {
     approval = null;
     generation++;
+    clearValidationHighlights();
     for (const row of el("tags").children) {
       const tdQual = row.querySelector(".col-qual");
       if (tdQual) {
@@ -634,7 +648,7 @@
     }
   }
 
-  // Validate Tags List
+  // Validate and Snapshot Read Now ("Validar e ler agora")
   async function validateTagList(customPaths = null) {
     if (!selectedEquipment?.agent_id || busy) return;
     try {
@@ -648,31 +662,92 @@
 
       busy = true;
       updateButtons();
-      message("Validando lista de tags em worker isolado no agente…", "info");
+      clearValidationHighlights();
+      message("Validando lista e executando leitura pontual no agente…", "info");
       const revision = generation;
 
       const payload = {opc_prog_id: prog, update_rate_ms: rate, tags};
       const data = await api(`/api/v1/agents/${encodeURIComponent(selectedEquipment.agent_id)}/tag-validations`, payload);
       if (revision !== generation) return;
 
+      const notFoundList = [];
+
       // Match results to table rows
-      for (const row of el("tags").children) {
+      const rows = [...el("tags").children];
+      rows.forEach((row, idx) => {
         const tagInput = row.querySelector("input");
-        if (!tagInput) continue;
-        const res = (data.results || []).find(r => r.opc_item_path === tagInput.value.trim());
+        if (!tagInput) return;
+        const path = tagInput.value.trim();
+        const res = (data.results || []).find(r => r.opc_item_path === path);
+
+        const tdVal = row.querySelector(".col-val");
+        const tdType = row.querySelector(".col-type");
         const tdQual = row.querySelector(".col-qual");
-        if (res && tdQual) {
-          tdQual.textContent = res.status === "valid" ? "Válida" : (res.status === "invalid" ? "Inválida" : `Erro (0x${res.hresult ? res.hresult.toString(16) : ""})`);
-          tdQual.className = "col-qual " + (res.status === "valid" ? "valid" : "error");
+        const tdTs = row.querySelector(".col-ts");
+        const tdAge = row.querySelector(".col-age");
+
+        if (res) {
+          if (res.status === "valid") {
+            row.classList.remove("row-error");
+            if (tdVal) tdVal.textContent = res.value !== null && res.value !== undefined ? String(res.value) : "—";
+            if (tdType) tdType.textContent = res.value_type || "—";
+            if (tdQual) {
+              tdQual.textContent = res.quality_text || (res.quality !== null && res.quality !== undefined ? String(res.quality) : "Válida");
+              tdQual.className = "col-qual valid";
+            }
+            if (tdTs) tdTs.textContent = formatOpcTimestamp(res.opc_timestamp) || "—";
+            if (tdAge) tdAge.textContent = "—";
+          } else if (res.status === "invalid" || res.error === "Endereço OPC não encontrado.") {
+            row.classList.add("row-error");
+            if (tdVal) tdVal.textContent = "—";
+            if (tdType) tdType.textContent = "—";
+            if (tdQual) {
+              tdQual.textContent = "Endereço OPC não encontrado.";
+              tdQual.className = "col-qual error";
+            }
+            if (tdTs) tdTs.textContent = "—";
+            if (tdAge) tdAge.textContent = "—";
+            notFoundList.push({line: idx + 1, path});
+          } else {
+            // Other COM or OPC errors
+            row.classList.remove("row-error");
+            if (tdVal) tdVal.textContent = "—";
+            if (tdType) tdType.textContent = "—";
+            if (tdQual) {
+              tdQual.textContent = res.error || (res.hresult ? `Erro (0x${res.hresult.toString(16).toUpperCase()})` : "Erro de leitura");
+              tdQual.className = "col-qual error";
+            }
+            if (tdTs) tdTs.textContent = "—";
+            if (tdAge) tdAge.textContent = "—";
+          }
+        }
+      });
+
+      // Consolidated alert banner
+      const banner = el("validation-errors-banner");
+      if (banner) {
+        if (notFoundList.length > 0) {
+          const count = notFoundList.length;
+          const itemsText = notFoundList.map(item => `linha ${item.line} — ${item.path}`).join("; ");
+          const label = count === 1 ? "1 endereço OPC não foi encontrado" : `${count} endereços OPC não foram encontrados`;
+          banner.textContent = `${label}: ${itemsText}.`;
+          banner.hidden = false;
+        } else {
+          banner.textContent = "";
+          banner.hidden = true;
         }
       }
 
       if (data.valid) {
         approval = {id: data.validation_id, expires: Date.now() + (data.expires_in_seconds * 1000)};
-        message("Validação concluída com 100% de tags válidas. Pronto para aplicar no agente.", "success");
+        message("Validação e leitura de snapshot concluídas com sucesso. Todas as tags são válidas.", "success");
       } else {
         approval = null;
-        message("Há tags inválidas ou com erro no plano. A configuração ativa do agente foi mantida intacta.", "error");
+        if (notFoundList.length > 0) {
+          message("A validação identificou endereços OPC não encontrados. A configuração ativa do agente foi mantida intacta.", "error");
+        } else {
+          message("Há tags inválidas ou com erro no plano. A configuração ativa do agente foi mantida intacta.", "error");
+        }
       }
     } catch (err) {
       message(err.message, "error");

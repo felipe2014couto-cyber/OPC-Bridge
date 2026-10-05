@@ -345,10 +345,31 @@ td input {
   color: #733c00;
 }
 
+.banner.danger {
+  background: var(--status-red-bg);
+  border: 1px solid var(--status-red);
+  color: var(--status-red);
+  font-weight: 500;
+}
+
 .banner.info {
   background: #e8f0fe;
   border: 1px solid #8ab4f8;
   color: #174ea6;
+}
+
+tr.row-error td {
+  background-color: var(--status-red-bg) !important;
+}
+
+.col-qual.error {
+  color: var(--status-red);
+  font-weight: 600;
+}
+
+.col-qual.valid {
+  color: var(--status-green);
+  font-weight: 600;
 }
 
 .meta-grid {

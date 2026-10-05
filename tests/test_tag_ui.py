@@ -7,6 +7,7 @@ import io
 import json
 from pathlib import Path
 import pickle
+import re
 import struct
 import time
 import uuid
@@ -317,12 +318,33 @@ def test_validation_non_destructive_with_nonpicklable_com(runtime):
     assert status.startswith("200") and result["valid"] is False
     assert result["validation_id"] is None
     assert result["results"] == [
-        {"opc_item_path": "Good.Tag", "status": "valid", "hresult": None},
-        {"opc_item_path": "Missing.Tag", "status": "invalid", "hresult": 0xC0040007}]
+        {
+            "opc_item_path": "Good.Tag",
+            "status": "valid",
+            "hresult": None,
+            "value": 100.5,
+            "value_type": "F64",
+            "quality": 192,
+            "quality_text": "Good",
+            "opc_timestamp": result["results"][0]["opc_timestamp"],
+            "error": None,
+        },
+        {
+            "opc_item_path": "Missing.Tag",
+            "status": "invalid",
+            "hresult": 0xC0040007,
+            "value": None,
+            "value_type": None,
+            "quality": None,
+            "quality_text": None,
+            "opc_timestamp": None,
+            "error": "Endereço OPC não encontrado.",
+        },
+    ]
     assert "DO-NOT-EXPOSE" not in json.dumps(result)
     assert bridge._sessions["connected"].writer.frames == []
     assert active._groups == previous and active._connected
-    assert all("read_device" not in candidate.commands for candidate in created)
+    assert any("read_device" in candidate.commands for candidate in created)
     assert created[0].commands[-2:] == ["disconnect", "exit"]
     assert created[0].startup_timeout == 10
     with database.session() as repo:
@@ -462,7 +484,17 @@ def test_prog_id_failure_has_only_safe_per_tag_hresult(runtime, monkeypatch):
                         inspect_opc(req, FailedConnection, SimulatedOpcAdapter()))
     status, _, response = validate(app)
     assert status.startswith("200") and response["valid"] is False
-    assert response["results"] == [{"opc_item_path": "Good.Tag", "status": "error", "hresult": 0x80040154}]
+    assert response["results"] == [{
+        "opc_item_path": "Good.Tag",
+        "status": "error",
+        "hresult": 0x80040154,
+        "value": None,
+        "value_type": None,
+        "quality": None,
+        "quality_text": None,
+        "opc_timestamp": None,
+        "error": "0x80040154",
+    }]
     assert "PRIVATE" not in json.dumps(response)
 
 
@@ -1046,3 +1078,119 @@ def test_ui_assets_live_controls_and_security_hygiene(runtime):
     assert "sessionStorage" not in js
     assert "ADMIN_API_TOKEN" not in js
     assert "ADMIN_API_TOKEN" not in html
+
+
+def test_snapshot_valid_returns_value_type_quality_and_timestamp(runtime):
+    app, bridge, database, created, active = runtime
+    status, _, result = validate(app, plan(["Good.Tag"]))
+    assert status.startswith("200")
+    assert result["valid"] is True
+    assert result["validation_id"] is not None
+    assert len(result["results"]) == 1
+    tag_res = result["results"][0]
+    assert tag_res["opc_item_path"] == "Good.Tag"
+    assert tag_res["status"] == "valid"
+    assert tag_res["hresult"] is None
+    assert tag_res["value"] == 100.5
+    assert tag_res["value_type"] == "F64"
+    assert tag_res["quality"] == 192
+    assert tag_res["quality_text"] == "Good"
+    assert tag_res["opc_timestamp"] is not None
+    assert re.match(r"^\d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2}\.\d{3}$", tag_res["opc_timestamp"])
+    assert tag_res["error"] is None
+
+
+def test_snapshot_mixed_valid_and_nonexistent_tags_without_interruption(runtime):
+    app, bridge, database, created, active = runtime
+    status, _, result = validate(app, plan(["Good.Tag.1", "Missing.Tag", "Good.Tag.2"]))
+    assert status.startswith("200")
+    assert result["valid"] is False
+    assert result["validation_id"] is None
+    assert len(result["results"]) == 3
+
+    res_by_path = {r["opc_item_path"]: r for r in result["results"]}
+    r1 = res_by_path["Good.Tag.1"]
+    r2 = res_by_path["Missing.Tag"]
+    r3 = res_by_path["Good.Tag.2"]
+
+    assert r1["status"] == "valid"
+    assert r1["value"] is not None
+    assert r1["quality_text"] == "Good"
+    assert r1["error"] is None
+
+    assert r2["status"] == "invalid"
+    assert r2["hresult"] == 0xC0040007
+    assert r2["error"] == "Endereço OPC não encontrado."
+    assert r2["value"] is None
+
+    assert r3["status"] == "valid"
+    assert r3["value"] is not None
+    assert r3["quality_text"] == "Good"
+    assert r3["error"] is None
+
+
+def test_validation_error_highlight_and_consolidated_warning(runtime):
+    app, _, _, _, _ = runtime
+    status, _, html = asset(app, "/ui", ADMIN_TOKEN)
+    assert status.startswith("200")
+    assert 'id="validation-errors-banner"' in html
+    assert 'Validar e ler agora' in html
+    assert 'Validar lista' not in html
+
+    status, _, css = asset(app, "/ui/style.css", ADMIN_TOKEN)
+    assert status.startswith("200")
+    assert '.banner.danger' in css
+    assert 'tr.row-error td' in css
+    assert '.col-qual.error' in css
+    assert '.col-qual.valid' in css
+
+    status, _, js = asset(app, "/ui/app.js", ADMIN_TOKEN)
+    assert status.startswith("200")
+    assert 'validation-errors-banner' in js
+    assert 'Endereço OPC não encontrado.' in js
+    assert 'row-error' in js
+    assert 'clearValidationHighlights' in js
+    assert 'endereços OPC não foram encontrados' in js
+    assert 'endereço OPC não foi encontrado' in js
+
+
+def test_absence_of_visual_history_block(runtime):
+    app, _, _, _, _ = runtime
+    status, _, html = asset(app, "/ui", ADMIN_TOKEN)
+    assert status.startswith("200")
+    assert "Histórico de aplicações de configuração" not in html
+    assert "Configuração ativa no agente" in html
+    assert "Carregar no formulário" in html
+
+
+def test_snapshot_validation_does_not_send_config_push_nor_persist_nor_start_live_values(runtime):
+    app, bridge, database, created, active = runtime
+    session = bridge._sessions["connected"]
+    initial_version = session.config_version
+    initial_frames_count = len(session.writer.frames)
+
+    with database.session() as repo:
+        ops_before = repo.list_admin_config_operations("agent-a")
+        snaps_before = len(repo._execute("SELECT snapshot_id FROM config_snapshots").fetchall())
+
+    # Execute snapshot validation
+    status, _, result = validate(app, plan(["Good.Tag", "Missing.Tag"]))
+    assert status.startswith("200")
+
+    # 1. No frames (especially no CONFIG_PUSH) sent to active agent session
+    assert len(session.writer.frames) == initial_frames_count
+    assert all(frame[4] != MsgType.CONFIG_PUSH for frame in session.writer.frames)
+
+    # 2. Config version unchanged
+    assert session.config_version == initial_version
+
+    # 3. No operations or snapshots created in database
+    with database.session() as repo:
+        ops_after = repo.list_admin_config_operations("agent-a")
+        snaps_after = len(repo._execute("SELECT snapshot_id FROM config_snapshots").fetchall())
+    assert len(ops_after) == len(ops_before)
+    assert snaps_after == snaps_before
+
+    # 4. Live values cache is NOT populated or started
+    live_data = bridge.get_live_values("agent-a")
+    assert live_data["items"] == []

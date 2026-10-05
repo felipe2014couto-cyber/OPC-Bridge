@@ -23,7 +23,10 @@ from .messages import (
     VALUE_TYPE_NAMES,
     ValueType,
     decode_value,
+    format_opc_timestamp,
+    format_quality_text,
     frame_message,
+    sanitize_error,
     unframe_message,
 )
 
@@ -50,6 +53,9 @@ __all__ = [
     "VALUE_TYPE_NAMES",
     "ValueType",
     "decode_value",
+    "format_opc_timestamp",
+    "format_quality_text",
     "frame_message",
+    "sanitize_error",
     "unframe_message",
 ]

@@ -173,6 +173,8 @@
           <button id="add-tag" type="button">Adicionar endereço OPC</button>
         </div>
 
+        <div id="validation-errors-banner" class="banner danger" hidden></div>
+
         <div class="table-wrap">
           <table>
             <thead>
@@ -193,7 +195,7 @@
         <div class="actions" style="margin-top: 14px;">
           <button id="btn-save-config" class="primary" type="button">Salvar configuração</button>
           <button id="toggle-live" type="button" disabled>Iniciar acompanhamento ao vivo</button>
-          <button id="validate-all" type="button" disabled>Validar lista</button>
+          <button id="validate-all" type="button" disabled>Validar e ler agora</button>
           <button id="apply" class="primary" type="button" disabled>Aplicar no agente</button>
         </div>
         <p class="muted">Limite máximo de 50 tags por plano. Intervalo entre 1000 e 60000 ms. Aplicar no agente exige confirmação explícita.</p>
@@ -205,29 +207,13 @@
         </div>
       </section>
 
-      <!-- Seção: Configuração Ativa no Agente e Histórico -->
+      <!-- Seção: Configuração Ativa no Agente -->
       <section class="card">
         <div class="section-title">
           <h3>Configuração ativa no agente</h3>
           <button id="btn-load-active" type="button" disabled>Carregar no formulário</button>
         </div>
         <div id="active-config" class="code-box">Nenhuma configuração ativa registrada.</div>
-
-        <h3>Histórico de aplicações de configuração</h3>
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Versão</th>
-                <th>Estado</th>
-                <th>Solicitada</th>
-                <th>Concluída</th>
-                <th>Operação / erro seguro</th>
-              </tr>
-            </thead>
-            <tbody id="operations"></tbody>
-          </table>
-        </div>
       </section>
     </div>
   </div>

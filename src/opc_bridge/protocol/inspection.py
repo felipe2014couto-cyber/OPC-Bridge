@@ -76,6 +76,20 @@ class InspectionRequest:
         return cls(**data)
 
 
+REQUIRED_RESULT_KEYS = {"opc_item_path", "status", "hresult"}
+ALLOWED_RESULT_KEYS = {
+    "opc_item_path",
+    "status",
+    "hresult",
+    "value",
+    "value_type",
+    "quality",
+    "quality_text",
+    "opc_timestamp",
+    "error",
+}
+
+
 @dataclass
 class InspectionResponse:
     request_id: str
@@ -101,13 +115,42 @@ class InspectionResponse:
             if not isinstance(results, list) or len(results) > MAX_TAGS:
                 raise ValueError("Invalid inspection results")
             for result in results:
-                if (not isinstance(result, dict) or set(result) != {"opc_item_path", "status", "hresult"}
-                        or not valid_text(result["opc_item_path"])
-                        or result["status"] not in ("valid", "invalid", "error")
-                        or (result["hresult"] is not None and
-                            (type(result["hresult"]) is not int or
-                             not 0 <= result["hresult"] <= 0xFFFFFFFF))):
+                if not isinstance(result, dict):
                     raise ValueError("Invalid inspection result")
+                keys = set(result)
+                if not REQUIRED_RESULT_KEYS.issubset(keys) or not keys.issubset(ALLOWED_RESULT_KEYS):
+                    raise ValueError("Invalid inspection result")
+                if not valid_text(result["opc_item_path"]):
+                    raise ValueError("Invalid inspection result")
+                if result["status"] not in ("valid", "invalid", "error"):
+                    raise ValueError("Invalid inspection result")
+                hres = result["hresult"]
+                if hres is not None and (type(hres) is not int or not 0 <= hres <= 0xFFFFFFFF):
+                    raise ValueError("Invalid inspection result")
+                if "value" in result:
+                    val = result["value"]
+                    if not isinstance(val, (int, float, str, bool, type(None))):
+                        raise ValueError("Invalid inspection result")
+                if "value_type" in result:
+                    vt = result["value_type"]
+                    if not isinstance(vt, (str, type(None))):
+                        raise ValueError("Invalid inspection result")
+                if "quality" in result:
+                    q = result["quality"]
+                    if q is not None and (type(q) is not int or not 0 <= q <= 0xFFFF):
+                        raise ValueError("Invalid inspection result")
+                if "quality_text" in result:
+                    qt = result["quality_text"]
+                    if not isinstance(qt, (str, type(None))):
+                        raise ValueError("Invalid inspection result")
+                if "opc_timestamp" in result:
+                    ts = result["opc_timestamp"]
+                    if not isinstance(ts, (str, type(None))):
+                        raise ValueError("Invalid inspection result")
+                if "error" in result:
+                    err = result["error"]
+                    if not isinstance(err, (str, type(None))):
+                        raise ValueError("Invalid inspection result")
         if data["servers"] is not None:
             servers = data["servers"]
             if (not isinstance(servers, list) or len(servers) > 100

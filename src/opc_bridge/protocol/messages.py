@@ -4,6 +4,7 @@ Binary little-endian framing over TLS. See docs/contracts/protocol.md.
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import struct
 import zlib
 from dataclasses import dataclass
@@ -89,6 +90,57 @@ def decode_value(value_type: int, raw_bytes: bytes) -> tuple[object, str]:
     except Exception:
         pass
     return None, type_name
+
+
+def format_quality_text(quality: int) -> str:
+    """Format OPC DA 16-bit quality word into high-level status."""
+    major = quality & 0xC0
+    if major == 0xC0:
+        return "Good"
+    if major == 0x40:
+        return "Uncertain"
+    return "Bad"
+
+
+def format_opc_timestamp(timestamp_us: int) -> str | None:
+    """Format microsecond timestamp into OPC standard dd/MM/yyyy HH:mm:ss.SSS format."""
+    if timestamp_us <= 0:
+        return None
+    try:
+        dt = datetime.fromtimestamp(timestamp_us / 1_000_000, tz=timezone.utc)
+        ms = (timestamp_us % 1_000_000) // 1000
+        return dt.strftime("%d/%m/%Y %H:%M:%S") + f".{ms:03d}"
+    except Exception:
+        return None
+
+
+def sanitize_error(error_code: int, status: int = 0) -> str | None:
+    """Sanitize OPC error codes into safe standard strings without leaking internal data."""
+    if error_code == 0 and status == ItemStatus.OK:
+        return None
+    code_u32 = error_code & 0xFFFFFFFF
+    if code_u32 == 0:
+        if status == ItemStatus.BAD_QUALITY:
+            return "Bad Quality"
+        if status == ItemStatus.NOT_FOUND:
+            return "Item Not Found"
+        if status == ItemStatus.TIMEOUT:
+            return "Timeout"
+        return "Read Error"
+    known = {
+        0xC0040001: "OPC_E_INVALIDHANDLE (0xC0040001)",
+        0xC0040004: "OPC_E_BADTYPE (0xC0040004)",
+        0xC0040007: "OPC_E_UNKNOWNITEMID (0xC0040007)",
+        0xC0040008: "OPC_E_INVALIDITEMID (0xC0040008)",
+        0xC0040009: "OPC_E_FILTERDUPLICATE (0xC0040009)",
+        0xC004000C: "OPC_E_RANGE (0xC004000C)",
+        0x80004005: "E_FAIL (0x80004005)",
+        0x80040001: "OPC_E_UNKNOWNITEMID (0x80040001)",
+        0x80040002: "OPC_E_READFAILED (0x80040002)",
+    }
+    if code_u32 in known:
+        return known[code_u32]
+    return f"0x{code_u32:08X}"
 
 
 @dataclass
