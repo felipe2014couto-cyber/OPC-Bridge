@@ -45,10 +45,13 @@ def inspect_opc(request: InspectionRequest, adapter_factory, active_adapter) -> 
             )
         candidate.connect(request.opc_prog_id)
         group = candidate.create_group("inspection_" + uuid.uuid4().hex, 1000)
-        results = []
-        for path in request.tags or []:
+        tags = request.tags or []
+        results: list[dict | None] = [None] * len(tags)
+        valid_items_to_read: list[tuple[int, str, int]] = []  # (index, path, item_id)
+
+        for idx, path in enumerate(tags):
             if time.monotonic() >= deadline:
-                results.append({
+                results[idx] = {
                     "opc_item_path": path,
                     "status": "error",
                     "hresult": None,
@@ -58,13 +61,13 @@ def inspect_opc(request: InspectionRequest, adapter_factory, active_adapter) -> 
                     "quality_text": None,
                     "opc_timestamp": None,
                     "error": "A inspeção excedeu o prazo.",
-                })
+                }
                 continue
             try:
                 mapping = candidate.add_items(group, [path])
                 item_id = mapping.get(path) if isinstance(mapping, dict) else None
                 if not (type(item_id) is int and item_id > 0):
-                    results.append({
+                    results[idx] = {
                         "opc_item_path": path,
                         "status": "invalid",
                         "hresult": 0xC0040007,
@@ -74,63 +77,9 @@ def inspect_opc(request: InspectionRequest, adapter_factory, active_adapter) -> 
                         "quality_text": None,
                         "opc_timestamp": None,
                         "error": "Endereço OPC não encontrado.",
-                    })
+                    }
                     continue
-
-                read_results = candidate.read_device(group, [item_id])
-                if not read_results:
-                    results.append({
-                        "opc_item_path": path,
-                        "status": "error",
-                        "hresult": None,
-                        "value": None,
-                        "value_type": None,
-                        "quality": None,
-                        "quality_text": None,
-                        "opc_timestamp": None,
-                        "error": "Falha na leitura do dispositivo.",
-                    })
-                    continue
-
-                res = read_results[0]
-                if res.status == ItemStatus.NOT_FOUND or res.error_code in (0xC0040007, 0xC0040008, 0x80040001):
-                    results.append({
-                        "opc_item_path": path,
-                        "status": "invalid",
-                        "hresult": (res.error_code & 0xFFFFFFFF) if res.error_code else 0xC0040007,
-                        "value": None,
-                        "value_type": None,
-                        "quality": None,
-                        "quality_text": None,
-                        "opc_timestamp": None,
-                        "error": "Endereço OPC não encontrado.",
-                    })
-                elif res.error_code != 0 or res.status in (ItemStatus.ERROR, ItemStatus.TIMEOUT):
-                    err_str = sanitize_error(res.error_code, res.status)
-                    results.append({
-                        "opc_item_path": path,
-                        "status": "error",
-                        "hresult": (res.error_code & 0xFFFFFFFF) if res.error_code != 0 else None,
-                        "value": None,
-                        "value_type": None,
-                        "quality": res.quality if res.quality is not None else None,
-                        "quality_text": format_quality_text(res.quality) if res.quality is not None else None,
-                        "opc_timestamp": format_opc_timestamp(res.timestamp_us),
-                        "error": err_str or "Erro de leitura OPC.",
-                    })
-                else:
-                    val, val_type_name = decode_value(res.value_type, res.value)
-                    results.append({
-                        "opc_item_path": path,
-                        "status": "valid",
-                        "hresult": None,
-                        "value": val,
-                        "value_type": val_type_name,
-                        "quality": res.quality,
-                        "quality_text": format_quality_text(res.quality),
-                        "opc_timestamp": format_opc_timestamp(res.timestamp_us),
-                        "error": None,
-                    })
+                valid_items_to_read.append((idx, path, item_id))
             except Exception as exc:  # noqa: BLE001 - COM provider boundary.
                 if isinstance(exc, TimeoutError):
                     deadline = 0
@@ -153,7 +102,7 @@ def inspect_opc(request: InspectionRequest, adapter_factory, active_adapter) -> 
                 else:
                     status = "error"
                     err_str = sanitize_error(hresult or 0, ItemStatus.ERROR) if hresult else "Erro na operação OPC."
-                results.append({
+                results[idx] = {
                     "opc_item_path": path,
                     "status": status,
                     "hresult": hresult,
@@ -163,8 +112,108 @@ def inspect_opc(request: InspectionRequest, adapter_factory, active_adapter) -> 
                     "quality_text": None,
                     "opc_timestamp": None,
                     "error": err_str,
-                })
-        return InspectionResponse(request.request_id, results=results)
+                }
+
+        if valid_items_to_read:
+            if time.monotonic() >= deadline:
+                for idx, path, _ in valid_items_to_read:
+                    results[idx] = {
+                        "opc_item_path": path,
+                        "status": "error",
+                        "hresult": None,
+                        "value": None,
+                        "value_type": None,
+                        "quality": None,
+                        "quality_text": None,
+                        "opc_timestamp": None,
+                        "error": "A inspeção excedeu o prazo.",
+                    }
+            else:
+                item_ids = [item_id for _, _, item_id in valid_items_to_read]
+                try:
+                    read_results = candidate.read_device(group, item_ids)
+                    results_by_id = {}
+                    if read_results:
+                        for res in read_results:
+                            results_by_id[res.item_id] = res
+
+                    for idx, path, item_id in valid_items_to_read:
+                        res = results_by_id.get(item_id)
+                        if res is None:
+                            results[idx] = {
+                                "opc_item_path": path,
+                                "status": "error",
+                                "hresult": None,
+                                "value": None,
+                                "value_type": None,
+                                "quality": None,
+                                "quality_text": None,
+                                "opc_timestamp": None,
+                                "error": "Falha na leitura do dispositivo.",
+                            }
+                            continue
+
+                        if res.status == ItemStatus.NOT_FOUND or res.error_code in (0xC0040007, 0xC0040008, 0x80040001):
+                            results[idx] = {
+                                "opc_item_path": path,
+                                "status": "invalid",
+                                "hresult": (res.error_code & 0xFFFFFFFF) if res.error_code else 0xC0040007,
+                                "value": None,
+                                "value_type": None,
+                                "quality": None,
+                                "quality_text": None,
+                                "opc_timestamp": None,
+                                "error": "Endereço OPC não encontrado.",
+                            }
+                        elif res.error_code != 0 or res.status in (ItemStatus.ERROR, ItemStatus.TIMEOUT):
+                            err_str = sanitize_error(res.error_code, res.status)
+                            results[idx] = {
+                                "opc_item_path": path,
+                                "status": "error",
+                                "hresult": (res.error_code & 0xFFFFFFFF) if res.error_code != 0 else None,
+                                "value": None,
+                                "value_type": None,
+                                "quality": res.quality if res.quality is not None else None,
+                                "quality_text": format_quality_text(res.quality) if res.quality is not None else None,
+                                "opc_timestamp": format_opc_timestamp(res.timestamp_us),
+                                "error": err_str or "Erro de leitura OPC.",
+                            }
+                        else:
+                            val, val_type_name = decode_value(res.value_type, res.value)
+                            results[idx] = {
+                                "opc_item_path": path,
+                                "status": "valid",
+                                "hresult": None,
+                                "value": val,
+                                "value_type": val_type_name,
+                                "quality": res.quality,
+                                "quality_text": format_quality_text(res.quality),
+                                "opc_timestamp": format_opc_timestamp(res.timestamp_us),
+                                "error": None,
+                            }
+                except Exception as exc:  # noqa: BLE001 - COM provider boundary.
+                    hresult = opc_hresult(exc)
+                    if hresult in (0xC0040007, 0xC0040008, 0x80040001):
+                        batch_status = "invalid"
+                        batch_err = "Endereço OPC não encontrado."
+                    else:
+                        batch_status = "error"
+                        batch_err = sanitize_error(hresult or 0, ItemStatus.ERROR) if hresult else "Falha na leitura do dispositivo."
+                    for idx, path, _ in valid_items_to_read:
+                        results[idx] = {
+                            "opc_item_path": path,
+                            "status": batch_status,
+                            "hresult": hresult,
+                            "value": None,
+                            "value_type": None,
+                            "quality": None,
+                            "quality_text": None,
+                            "opc_timestamp": None,
+                            "error": batch_err,
+                        }
+
+        final_results = [r for r in results if r is not None]
+        return InspectionResponse(request.request_id, results=final_results)
     except Exception as exc:  # noqa: BLE001 - never send provider messages or COM objects.
         hres = opc_hresult(exc)
         err_msg = sanitize_error(hres or 0) if hres else "Falha na inspeção OPC."

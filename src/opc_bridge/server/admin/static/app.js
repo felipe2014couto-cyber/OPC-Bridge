@@ -662,6 +662,8 @@
 
       busy = true;
       updateButtons();
+      const btnValidate = el("validate-all");
+      if (btnValidate) btnValidate.textContent = "Lendo…";
       clearValidationHighlights();
       message("Lendo valores atuais no servidor OPC…", "info");
       const revision = generation;
@@ -753,6 +755,8 @@
       message(err.message, "error");
     } finally {
       busy = false;
+      const btnValidate = el("validate-all");
+      if (btnValidate) btnValidate.textContent = "Ler agora";
       updateButtons();
     }
   }

@@ -1224,6 +1224,7 @@ def test_ler_agora_single_click_flow_and_restrictions(runtime):
     assert result["valid"] is False
     assert result["validation_id"] is None
     assert len(result["results"]) == 3
+    assert created[-1].commands.count("read_device") == 1
 
     res_by_path = {r["opc_item_path"]: r for r in result["results"]}
     r_good1 = res_by_path["Good.Tag.1"]
@@ -1437,3 +1438,56 @@ def test_snapshot_mixed_valid_and_excepinfo_unknown_tag_without_interruption(run
     assert r3["status"] == "valid"
     assert r3["value"] is not None
     assert r3["quality_text"] == "Good"
+
+
+def test_batch_sync_read_device_called_once_for_multiple_tags(runtime):
+    """Verify that inspecting multiple valid tags issues exactly one batch read_device call."""
+    app, bridge, database, created, active = runtime
+    tags = ["Good.Tag.1", "Good.Tag.2", "Good.Tag.3"]
+    status, _, result = validate(app, plan(tags))
+    assert status.startswith("200")
+    assert result["valid"] is True
+    assert len(result["results"]) == 3
+
+    adapter = created[-1]
+    # Crucial performance guarantee: read_device must be invoked exactly once in batch
+    assert adapter.commands.count("read_device") == 1
+
+    # Verify all tags have values, types, qualities and timestamps
+    for r in result["results"]:
+        assert r["status"] == "valid"
+        assert r["value"] is not None
+        assert r["quality_text"] == "Good"
+        assert r["opc_timestamp"] is not None
+        assert r["error"] is None
+
+
+def test_batch_sync_read_zero_calls_when_all_tags_invalid(runtime, monkeypatch):
+    """Verify that when all tags fail addition, read_device is never called."""
+    app, bridge, database, created, active = runtime
+    monkeypatch.setattr(InspectionItems, "fail_all", True)
+    tags = ["Tag.1", "Tag.2"]
+    status, _, result = validate(app, plan(tags))
+    assert status.startswith("200")
+    assert result["valid"] is False
+    assert len(result["results"]) == 2
+
+    adapter = created[-1]
+    assert adapter.commands.count("read_device") == 0
+
+    for r in result["results"]:
+        assert r["status"] == "invalid"
+        assert r["error"] == "Endereço OPC não encontrado."
+        assert r["value"] is None
+
+
+def test_ler_agora_ui_in_flight_loading_and_double_click_prevention(runtime):
+    """Verify UI app.js implements disabled state, busy guard, and loading indicator."""
+    app, bridge, database, created, active = runtime
+    status, _, js = asset(app, "/ui/app.js", ADMIN_TOKEN)
+    assert status.startswith("200")
+    # Verify button loading state and double click prevention
+    assert 'Lendo…' in js or 'Lendo...' in js
+    assert 'Ler agora' in js
+    assert 'if (!selectedEquipment?.agent_id || busy) return;' in js
+    assert 'el("validate-all").disabled = !canInspect;' in js
