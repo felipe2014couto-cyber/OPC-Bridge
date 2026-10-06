@@ -35,6 +35,7 @@ from opc_bridge.protocol import (
     unframe_message,
 )
 from opc_bridge.protocol.inspection import CAPABILITY, InspectionRequest, InspectionResponse
+from opc_bridge.protocol.write import WriteRequest, WriteResponse
 from opc_bridge.server.credentials import verify_agent_credential_hash
 from opc_bridge.server.persistence import Database
 
@@ -129,6 +130,7 @@ class BridgeServer:
         self._config_timeout_tasks: dict[tuple[str, int], asyncio.Task[None]] = {}
         self._pending_config_payloads: dict[tuple[str, int], ConfigPushPayload] = {}
         self._pending_inspections: dict[tuple[str, str], asyncio.Future] = {}
+        self._pending_writes: dict[tuple[str, str], asyncio.Future] = {}
         # Ephemeral in-memory live values cache: agent_id -> {item_id -> dict}
         # Strictly volatile in memory; never written to persistence or logs.
         self._live_values: dict[str, dict[int, dict[str, Any]]] = {}
@@ -480,6 +482,34 @@ class BridgeServer:
             future.cancel()
             raise ValueError("inspection_timeout") from None
 
+    async def write_agent(self, agent_id: str, request: WriteRequest) -> WriteResponse:
+        """Send a write request to the specified agent session."""
+        session = next((s for s in self._sessions.values() if s.agent_id == agent_id), None)
+        if session is None:
+            raise ValueError("agent_disconnected")
+        if any(sid == session.session_id for sid, _ in self._pending_writes):
+            raise ValueError("write_busy")
+        key = (session.session_id, request.request_id)
+        future = asyncio.get_running_loop().create_future()
+        self._pending_writes[key] = future
+        try:
+            await session.send(MsgType.OPC_WRITE_REQUEST, request.pack())
+            response = await asyncio.wait_for(future, timeout=30)
+            return response
+        finally:
+            self._pending_writes.pop(key, None)
+
+    def write_agent_threadsafe(self, agent_id: str, request: WriteRequest) -> WriteResponse:
+        loop = self._event_loop
+        if loop is None or not loop.is_running():
+            raise ValueError("runtime_unavailable")
+        future = asyncio.run_coroutine_threadsafe(self.write_agent(agent_id, request), loop)
+        try:
+            return future.result(timeout=32)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            raise ValueError("write_timeout") from None
+
     def dispatch_admin_config_operation_threadsafe(
         self, agent_id: str, operation_id: str, payload: ConfigPushPayload,
         expected_context: tuple[str, int] | None = None,
@@ -645,6 +675,9 @@ class BridgeServer:
                 await asyncio.gather(scheduler_task, return_exceptions=True)
             if session:
                 for key, future in list(self._pending_inspections.items()):
+                    if key[0] == session.session_id and not future.done():
+                        future.set_exception(ConnectionError("Agent disconnected"))
+                for key, future in list(self._pending_writes.items()):
                     if key[0] == session.session_id and not future.done():
                         future.set_exception(ConnectionError("Agent disconnected"))
                 for key, future in list(self._pending_reads.items()):
@@ -826,6 +859,15 @@ class BridgeServer:
                 future = self._pending_inspections.get((session.session_id, response.request_id))
                 if future is not None and not future.done():
                     future.set_result(response)
+            elif header.msg_type == MsgType.OPC_WRITE_RESPONSE:
+                try:
+                    write_response = WriteResponse.unpack(payload)
+                except (ValueError, TypeError, UnicodeError):
+                    logger.warning("Invalid write response from session %s", session.session_id)
+                    continue
+                future = self._pending_writes.get((session.session_id, write_response.request_id))
+                if future is not None and not future.done():
+                    future.set_result(write_response)
             elif header.msg_type == MsgType.CONFIG_ACK:
                 from opc_bridge.protocol.messages import ConfigAckPayload
 

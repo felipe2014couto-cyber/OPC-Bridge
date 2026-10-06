@@ -16,6 +16,8 @@
   let livePolling = null;
   let autoRefreshTimer = null;
   let generation = 0;
+  let currentWriteTags = [];
+  let writeGlobalEnabled = false;
 
   const errors = {
     unauthorized: "Acesso não autorizado ou sessão expirada no proxy.",
@@ -102,24 +104,32 @@
   function switchTab(tab) {
     currentTab = tab;
     stopLive();
+    const tabs = ["equipments", "opc", "write-opc"];
+    tabs.forEach(t => {
+      const btn = el(`tab-${t}`);
+      const panel = el(`panel-${t}`);
+      if (btn && panel) {
+        const isActive = t === tab;
+        btn.classList.toggle("active", isActive);
+        btn.setAttribute("aria-selected", isActive ? "true" : "false");
+        panel.hidden = !isActive;
+      }
+    });
+
     if (tab === "equipments") {
-      el("tab-equipments").classList.add("active");
-      el("tab-equipments").setAttribute("aria-selected", "true");
-      el("tab-opc").classList.remove("active");
-      el("tab-opc").setAttribute("aria-selected", "false");
-      el("panel-equipments").hidden = false;
-      el("panel-opc").hidden = true;
       loadEquipments().catch(e => message(e.message, "error"));
-    } else {
-      el("tab-opc").classList.add("active");
-      el("tab-opc").setAttribute("aria-selected", "true");
-      el("tab-equipments").classList.remove("active");
-      el("tab-equipments").setAttribute("aria-selected", "false");
-      el("panel-opc").hidden = false;
-      el("panel-equipments").hidden = true;
+    } else if (tab === "opc") {
       populateEquipmentDropdown();
       if (el("opc-equipment-select").value) {
         onEquipmentSelected().catch(e => message(e.message, "error"));
+      }
+    } else if (tab === "write-opc") {
+      populateWriteEquipmentDropdown();
+      if (selectedEquipment && selectedEquipment.equipment_id) {
+        el("write-equipment-select").value = selectedEquipment.equipment_id;
+      }
+      if (el("write-equipment-select").value) {
+        loadWriteEquipment().catch(e => message(e.message, "error"));
       }
     }
   }
@@ -134,6 +144,7 @@
       equipments = data.equipments || [];
       renderEquipmentsTable();
       populateEquipmentDropdown();
+      populateWriteEquipmentDropdown();
     } catch (err) {
       message(err.message, "error");
     }
@@ -985,6 +996,599 @@
   }
 
   // ==========================================
+  // MODULE 3: OPERAÇÃO OPC (ESCRITA CONTROLADA)
+  // ==========================================
+
+  function populateWriteEquipmentDropdown() {
+    const sel = el("write-equipment-select");
+    if (!sel) return;
+    const currentVal = sel.value;
+    sel.replaceChildren(new Option("Selecione um equipamento...", ""));
+    equipments.forEach(eq => {
+      sel.append(new Option(`${eq.name} (${eq.ip_address})`, eq.equipment_id));
+    });
+    if (currentVal && equipments.some(e => e.equipment_id === currentVal)) {
+      sel.value = currentVal;
+    } else if (selectedEquipment && equipments.some(e => e.equipment_id === selectedEquipment.equipment_id)) {
+      sel.value = selectedEquipment.equipment_id;
+    }
+  }
+
+  async function loadWriteEquipment() {
+    const eqId = el("write-equipment-select").value;
+    const tbody = el("write-spreadsheet-body");
+    const banner = el("write-kill-switch-banner");
+    const reviewBtn = el("btn-review-write");
+
+    if (!eqId) {
+      el("write-agent-info").hidden = true;
+      banner.className = "banner warning";
+      banner.textContent = "Selecione um equipamento para verificar as variáveis e permissões de escrita.";
+      tbody.replaceChildren();
+      const tr = document.createElement("tr");
+      const td = document.createElement("td");
+      td.colSpan = 8;
+      td.className = "muted";
+      td.textContent = "Selecione um equipamento para carregar as tags operacionais.";
+      tr.append(td);
+      tbody.append(tr);
+      if (reviewBtn) reviewBtn.disabled = true;
+      renderWriteAuditTable([]);
+      return;
+    }
+
+    try {
+      const data = await api(`/api/v1/write-operation/tags?equipment_id=${encodeURIComponent(eqId)}`);
+      writeGlobalEnabled = !!data.writes_enabled_globally;
+      currentWriteTags = data.tags || [];
+
+      // Update Kill Switch Banner
+      if (writeGlobalEnabled) {
+        banner.className = "banner info";
+        banner.textContent = "Chave de escrita ATIVA no servidor (OPC_BRIDGE_ENABLE_WRITES=true). Gravação permitida apenas para tags com write_enabled=true.";
+      } else {
+        banner.className = "banner warning";
+        banner.textContent = "Chave geral de escrita DESLIGADA (OPC_BRIDGE_ENABLE_WRITES=false). Nenhuma operação de escrita será aceita pelo servidor.";
+      }
+
+      // Metadata Grid
+      el("write-agent-info").hidden = false;
+      const eq = data.equipment || {};
+      el("write-meta-agent-id").textContent = eq.agent_id || "Não associado";
+      el("write-meta-agent-status").textContent = eq.agent_status === "connected" ? "Conectado" : (eq.agent_status === "disconnected" ? "Desconectado" : "Não associado");
+      el("write-meta-prog-id").textContent = data.opc_prog_id || "—";
+      const writableCount = currentWriteTags.filter(t => t.write_enabled).length;
+      el("write-meta-permission").textContent = `${writableCount} de ${currentWriteTags.length} tag(s) autorizada(s) para escrita`;
+
+      renderWriteSpreadsheet();
+      await loadWriteAuditEvents(eqId);
+    } catch (err) {
+      message(err.message, "error");
+    }
+  }
+
+  function renderWriteSpreadsheet() {
+    const tbody = el("write-spreadsheet-body");
+    tbody.replaceChildren();
+
+    if (!currentWriteTags.length) {
+      const tr = document.createElement("tr");
+      const td = document.createElement("td");
+      td.colSpan = 8;
+      td.className = "muted";
+      td.textContent = "Nenhuma tag cadastrada nas configurações deste equipamento.";
+      tr.append(td);
+      tbody.append(tr);
+      updateWriteReviewButton();
+      return;
+    }
+
+    currentWriteTags.forEach((tag, idx) => {
+      const tr = document.createElement("tr");
+      tr.dataset.tag = tag.opc_item_path;
+
+      // 1. Tag
+      const tdTag = document.createElement("td");
+      tdTag.textContent = tag.opc_item_path;
+      tdTag.style.fontWeight = "600";
+      tdTag.style.wordBreak = "break-all";
+
+      // 2. Descrição
+      const tdDesc = document.createElement("td");
+      tdDesc.textContent = tag.description || "—";
+
+      // 3. Tipo
+      const tdType = document.createElement("td");
+      const typeBadge = document.createElement("span");
+      typeBadge.className = "badge";
+      typeBadge.textContent = tag.data_type || "float";
+      tdType.append(typeBadge);
+
+      // 4. Limites
+      const tdLimits = document.createElement("td");
+      if (tag.allowed_values && Array.isArray(tag.allowed_values) && tag.allowed_values.length > 0) {
+        tdLimits.textContent = `[${tag.allowed_values.join(", ")}]`;
+      } else if (tag.min_value !== null || tag.max_value !== null) {
+        tdLimits.textContent = `[${tag.min_value ?? "-∞"} .. ${tag.max_value ?? "+∞"}]`;
+      } else {
+        tdLimits.textContent = "—";
+      }
+
+      // 5. Valor atual
+      const tdCurrent = document.createElement("td");
+      tdCurrent.className = "col-val";
+      tdCurrent.textContent = tag.current_value !== null && tag.current_value !== undefined ? String(tag.current_value) : "—";
+      if (tag.quality !== null && tag.quality !== undefined) {
+        const qBadge = document.createElement("span");
+        qBadge.style.marginLeft = "6px";
+        qBadge.className = "badge " + (tag.quality >= 192 ? "good" : "error");
+        qBadge.textContent = tag.quality >= 192 ? "Good" : `Bad (${tag.quality})`;
+        tdCurrent.append(qBadge);
+      }
+
+      // 6. Novo valor (Input Spreadsheet)
+      const tdNew = document.createElement("td");
+      const input = document.createElement("input");
+      input.className = "write-cell-input";
+      input.dataset.tag = tag.opc_item_path;
+      input.dataset.index = String(idx);
+
+      if (!tag.write_enabled) {
+        input.disabled = true;
+        input.placeholder = "Somente leitura";
+        input.title = "write_enabled: false na configuração";
+      } else if (!writeGlobalEnabled) {
+        input.disabled = true;
+        input.placeholder = "Chave geral OFF";
+        input.title = "OPC_BRIDGE_ENABLE_WRITES=false";
+      } else {
+        input.placeholder = "Novo valor...";
+        input.setAttribute("aria-label", `Novo valor para ${tag.opc_item_path}`);
+
+        // Event: live validation
+        input.addEventListener("input", () => {
+          validateWriteCell(input);
+          updateWriteReviewButton();
+        });
+
+        // Event: spreadsheet keyboard navigation (Enter, Shift+Enter, ArrowUp, ArrowDown)
+        input.addEventListener("keydown", e => {
+          const allInputs = [...tbody.querySelectorAll(".write-cell-input:not([disabled])")];
+          const curPos = allInputs.indexOf(input);
+          if (curPos === -1) return;
+
+          if ((e.key === "Enter" && !e.shiftKey) || e.key === "ArrowDown") {
+            e.preventDefault();
+            if (curPos < allInputs.length - 1) allInputs[curPos + 1].focus();
+          } else if ((e.key === "Enter" && e.shiftKey) || e.key === "ArrowUp") {
+            e.preventDefault();
+            if (curPos > 0) allInputs[curPos - 1].focus();
+          }
+        });
+
+        // Event: spreadsheet multi-line paste (Excel copy-paste support)
+        input.addEventListener("paste", e => {
+          const pastedText = (e.clipboardData || window.clipboardData)?.getData("text") || "";
+          if (pastedText.includes("\n") || pastedText.includes("\r")) {
+            e.preventDefault();
+            const lines = pastedText.split(/\r?\n/).map(s => s.trim()).filter(s => s.length > 0);
+            const allInputs = [...tbody.querySelectorAll(".write-cell-input:not([disabled])")];
+            const startPos = allInputs.indexOf(input);
+            if (startPos !== -1) {
+              lines.forEach((lineVal, offset) => {
+                const targetInput = allInputs[startPos + offset];
+                if (targetInput) {
+                  targetInput.value = lineVal;
+                  validateWriteCell(targetInput);
+                }
+              });
+              updateWriteReviewButton();
+            }
+          }
+        });
+      }
+      tdNew.append(input);
+
+      // 7. Situação / Validação
+      const tdStatus = document.createElement("td");
+      const statusBadge = document.createElement("span");
+      statusBadge.className = "badge status-badge";
+      if (!tag.write_enabled) {
+        statusBadge.classList.add("readonly");
+        statusBadge.textContent = "Somente leitura";
+      } else if (!writeGlobalEnabled) {
+        statusBadge.classList.add("readonly");
+        statusBadge.textContent = "Bloqueado (chave geral)";
+      } else {
+        statusBadge.classList.add("pending");
+        statusBadge.textContent = "Em espera";
+      }
+      tdStatus.append(statusBadge);
+
+      // 8. Timestamp
+      const tdTs = document.createElement("td");
+      tdTs.className = "col-ts";
+      tdTs.textContent = formatOpcTimestamp(tag.timestamp);
+
+      tr.append(tdTag, tdDesc, tdType, tdLimits, tdCurrent, tdNew, tdStatus, tdTs);
+      tbody.append(tr);
+    });
+
+    updateWriteReviewButton();
+  }
+
+  function validateWriteCell(input) {
+    const rawVal = input.value.trim();
+    const tagPath = input.dataset.tag;
+    const tagSpec = currentWriteTags.find(t => t.opc_item_path === tagPath);
+    const row = input.closest("tr");
+    const statusBadge = row?.querySelector(".status-badge");
+
+    if (!rawVal) {
+      input.classList.remove("valid", "invalid");
+      if (statusBadge) {
+        statusBadge.className = "badge status-badge pending";
+        statusBadge.textContent = "Em espera";
+      }
+      return true;
+    }
+
+    if (!tagSpec) return false;
+
+    let isValid = true;
+    let errMsg = "";
+    const dataType = (tagSpec.data_type || "float").toLowerCase();
+
+    // Type validation
+    if (dataType === "boolean") {
+      const boolLow = rawVal.toLowerCase();
+      if (!["true", "false", "1", "0", "sim", "nao", "não"].includes(boolLow)) {
+        isValid = false;
+        errMsg = "Inválido (esperado booleano)";
+      }
+    } else if (dataType === "integer") {
+      if (!/^-?\d+$/.test(rawVal)) {
+        isValid = false;
+        errMsg = "Inválido (esperado inteiro)";
+      }
+    } else if (dataType === "float") {
+      if (!/^-?\d+(\.\d+)?([eE][+-]?\d+)?$/.test(rawVal) && isNaN(Number(rawVal))) {
+        isValid = false;
+        errMsg = "Inválido (esperado número)";
+      }
+    }
+
+    // Bounds validation
+    if (isValid && (dataType === "integer" || dataType === "float")) {
+      const num = Number(rawVal);
+      if (tagSpec.min_value !== null && tagSpec.min_value !== undefined && num < Number(tagSpec.min_value)) {
+        isValid = false;
+        errMsg = `Abaixo do mín (${tagSpec.min_value})`;
+      } else if (tagSpec.max_value !== null && tagSpec.max_value !== undefined && num > Number(tagSpec.max_value)) {
+        isValid = false;
+        errMsg = `Acima do máx (${tagSpec.max_value})`;
+      }
+    }
+
+    // Allowed values validation
+    if (isValid && Array.isArray(tagSpec.allowed_values) && tagSpec.allowed_values.length > 0) {
+      const allowedStr = tagSpec.allowed_values.map(String);
+      if (!allowedStr.includes(rawVal)) {
+        isValid = false;
+        errMsg = "Valor não permitido";
+      }
+    }
+
+    if (isValid) {
+      input.classList.remove("invalid");
+      input.classList.add("valid");
+      if (statusBadge) {
+        statusBadge.className = "badge status-badge applied";
+        statusBadge.textContent = "Válido";
+      }
+      return true;
+    } else {
+      input.classList.remove("valid");
+      input.classList.add("invalid");
+      if (statusBadge) {
+        statusBadge.className = "badge status-badge rejected";
+        statusBadge.textContent = errMsg;
+      }
+      return false;
+    }
+  }
+
+  function updateWriteReviewButton() {
+    const btn = el("btn-review-write");
+    if (!btn) return;
+    if (!writeGlobalEnabled) {
+      btn.disabled = true;
+      return;
+    }
+    const inputs = [...el("write-spreadsheet-body").querySelectorAll(".write-cell-input:not([disabled])")];
+    const filled = inputs.filter(i => i.value.trim().length > 0);
+    const hasInvalid = filled.some(i => i.classList.contains("invalid"));
+    btn.disabled = filled.length === 0 || hasInvalid;
+  }
+
+  function clearWriteValues() {
+    const inputs = [...el("write-spreadsheet-body").querySelectorAll(".write-cell-input:not([disabled])")];
+    inputs.forEach(input => {
+      input.value = "";
+      input.classList.remove("valid", "invalid");
+      const row = input.closest("tr");
+      const statusBadge = row?.querySelector(".status-badge");
+      if (statusBadge) {
+        statusBadge.className = "badge status-badge pending";
+        statusBadge.textContent = "Em espera";
+      }
+    });
+    updateWriteReviewButton();
+    message("Valores da planilha limpos.", "info");
+  }
+
+  async function reviewWriteOperation() {
+    const eqId = el("write-equipment-select").value;
+    if (!eqId) return;
+
+    const inputs = [...el("write-spreadsheet-body").querySelectorAll(".write-cell-input:not([disabled])")];
+    const filled = inputs.filter(i => i.value.trim().length > 0);
+    if (!filled.length) {
+      message("Nenhum novo valor foi preenchido para escrita.", "error");
+      return;
+    }
+
+    // Verify all cells
+    let allValid = true;
+    filled.forEach(input => {
+      if (!validateWriteCell(input)) allValid = false;
+    });
+    if (!allValid) {
+      message("Corrija os valores destacados em vermelho antes de prosseguir.", "error");
+      updateWriteReviewButton();
+      return;
+    }
+
+    const itemsToValidate = filled.map(i => ({
+      tag: i.dataset.tag,
+      value: i.value.trim()
+    }));
+
+    try {
+      const valRes = await api("/api/v1/write-operation/validate", {
+        equipment_id: eqId,
+        items: itemsToValidate
+      });
+
+      if (!valRes.valid) {
+        valRes.items.forEach(resItem => {
+          if (!resItem.valid) {
+            const input = inputs.find(i => i.dataset.tag === resItem.tag);
+            if (input) {
+              input.classList.remove("valid");
+              input.classList.add("invalid");
+              const row = input.closest("tr");
+              const sb = row?.querySelector(".status-badge");
+              if (sb) {
+                sb.className = "badge status-badge rejected";
+                sb.textContent = resItem.error || "Rejeitado na validação";
+              }
+            }
+          }
+        });
+        message("Validação rejeitada pelo servidor. Verifique os valores informados.", "error");
+        updateWriteReviewButton();
+        return;
+      }
+
+      // Populate Confirmation Modal
+      const modal = el("modal-write-confirm");
+      const selOpt = el("write-equipment-select").selectedOptions[0];
+      el("modal-eq-name").textContent = selOpt ? selOpt.textContent : eqId;
+      el("modal-agent-id").textContent = el("write-meta-agent-id").textContent || "—";
+      const operatorUser = el("write-operator-user").value.trim() || "operador";
+      el("modal-user-id").textContent = operatorUser;
+
+      const summaryBody = el("modal-write-summary-body");
+      summaryBody.replaceChildren();
+
+      filled.forEach(input => {
+        const tagSpec = currentWriteTags.find(t => t.opc_item_path === input.dataset.tag);
+        const tr = document.createElement("tr");
+
+        const tdTag = document.createElement("td");
+        tdTag.textContent = input.dataset.tag;
+        tdTag.style.fontWeight = "600";
+
+        const tdType = document.createElement("td");
+        tdType.textContent = tagSpec?.data_type || "—";
+
+        const tdOld = document.createElement("td");
+        tdOld.textContent = tagSpec?.current_value !== null && tagSpec?.current_value !== undefined ? String(tagSpec.current_value) : "—";
+
+        const tdNew = document.createElement("td");
+        tdNew.textContent = input.value.trim();
+        tdNew.style.fontWeight = "bold";
+        tdNew.style.color = "var(--brand-blue)";
+
+        tr.append(tdTag, tdType, tdOld, tdNew);
+        summaryBody.append(tr);
+      });
+
+      modal.hidden = false;
+    } catch (err) {
+      message(err.message, "error");
+    }
+  }
+
+  async function confirmAndExecuteWrite() {
+    const eqId = el("write-equipment-select").value;
+    const modal = el("modal-write-confirm");
+    const confirmBtn = el("btn-confirm-execute-write");
+    const inputs = [...el("write-spreadsheet-body").querySelectorAll(".write-cell-input:not([disabled])")];
+    const filled = inputs.filter(i => i.value.trim().length > 0);
+
+    const items = filled.map(i => ({
+      tag: i.dataset.tag,
+      value: i.value.trim()
+    }));
+    const username = el("write-operator-user").value.trim() || "operador";
+
+    confirmBtn.disabled = true;
+    confirmBtn.textContent = "Gravando...";
+
+    try {
+      const res = await api("/api/v1/write-operation/execute", {
+        equipment_id: eqId,
+        items,
+        confirmed: true,
+        username
+      });
+
+      modal.hidden = true;
+      confirmBtn.disabled = false;
+      confirmBtn.textContent = "Confirmar e Gravar";
+
+      // Process per-tag results
+      const resultsMap = new Map((res.results || []).map(r => [r.tag, r]));
+      filled.forEach(input => {
+        const itemResult = resultsMap.get(input.dataset.tag);
+        const row = input.closest("tr");
+        const statusBadge = row?.querySelector(".status-badge");
+        if (itemResult) {
+          if (itemResult.status === "applied") {
+            input.value = "";
+            input.classList.remove("valid", "invalid");
+            if (statusBadge) {
+              statusBadge.className = "badge status-badge applied";
+              statusBadge.textContent = "Gravado com sucesso";
+            }
+          } else {
+            input.classList.remove("valid");
+            input.classList.add("invalid");
+            if (statusBadge) {
+              statusBadge.className = "badge status-badge rejected";
+              statusBadge.textContent = itemResult.error || `Rejeitado: ${itemResult.status}`;
+            }
+          }
+        }
+      });
+
+      updateWriteReviewButton();
+      message(`Operação de escrita concluída: ${(res.results || []).length} tag(s) processada(s).`, "success");
+      await loadWriteAuditEvents(eqId);
+      await refreshWriteReadingsOnly(eqId);
+    } catch (err) {
+      confirmBtn.disabled = false;
+      confirmBtn.textContent = "Confirmar e Gravar";
+      message(`Falha na gravação: ${err.message}`, "error");
+    }
+  }
+
+  async function loadWriteAuditEvents(eqId) {
+    const tbody = el("write-audit-body");
+    if (!tbody) return;
+    try {
+      const data = await api(`/api/v1/write-operation/audit?equipment_id=${encodeURIComponent(eqId)}&limit=25`);
+      renderWriteAuditTable(data.audit_events || []);
+    } catch (err) {
+      console.warn("Could not load write audit events:", err);
+    }
+  }
+
+  function renderWriteAuditTable(events) {
+    const tbody = el("write-audit-body");
+    if (!tbody) return;
+    tbody.replaceChildren();
+
+    if (!events.length) {
+      const tr = document.createElement("tr");
+      const td = document.createElement("td");
+      td.colSpan = 7;
+      td.className = "muted";
+      td.textContent = "Nenhum evento de auditoria registrado para este equipamento.";
+      tr.append(td);
+      tbody.append(tr);
+      return;
+    }
+
+    events.forEach(ev => {
+      const det = ev.detail || {};
+      const tr = document.createElement("tr");
+
+      const tdTs = document.createElement("td");
+      tdTs.textContent = formatOpcTimestamp(det.timestamp || ev.occurred_at);
+
+      const tdTag = document.createElement("td");
+      tdTag.textContent = det.tag || "—";
+      tdTag.style.fontWeight = "600";
+
+      const tdPrev = document.createElement("td");
+      tdPrev.textContent = det.previous_value !== null && det.previous_value !== undefined ? String(det.previous_value) : "—";
+
+      const tdReq = document.createElement("td");
+      tdReq.textContent = det.requested_value !== null && det.requested_value !== undefined ? String(det.requested_value) : "—";
+      tdReq.style.fontWeight = "600";
+
+      const tdUser = document.createElement("td");
+      tdUser.textContent = det.user || "—";
+
+      const tdStatus = document.createElement("td");
+      const badge = document.createElement("span");
+      badge.className = "badge " + (det.status === "applied" ? "good" : "error");
+      badge.textContent = det.status === "applied" ? "Gravado" : (det.status || "Erro");
+      tdStatus.append(badge);
+
+      const tdDetail = document.createElement("td");
+      tdDetail.textContent = det.error ? det.error : "Sucesso";
+      if (det.error) tdDetail.style.color = "var(--status-red)";
+
+      tr.append(tdTs, tdTag, tdPrev, tdReq, tdUser, tdStatus, tdDetail);
+      tbody.append(tr);
+    });
+  }
+
+  async function refreshWriteReadingsOnly(eqId) {
+    try {
+      const data = await api(`/api/v1/write-operation/tags?equipment_id=${encodeURIComponent(eqId)}`);
+      const newTags = data.tags || [];
+      const tbody = el("write-spreadsheet-body");
+      if (!tbody) return;
+
+      newTags.forEach(ntag => {
+        const existing = currentWriteTags.find(t => t.opc_item_path === ntag.opc_item_path);
+        if (existing) {
+          existing.current_value = ntag.current_value;
+          existing.quality = ntag.quality;
+          existing.timestamp = ntag.timestamp;
+        }
+
+        const row = tbody.querySelector(`tr[data-tag="${CSS.escape(ntag.opc_item_path)}"]`);
+        if (row) {
+          const tdCur = row.querySelector(".col-val");
+          if (tdCur) {
+            tdCur.replaceChildren();
+            tdCur.textContent = ntag.current_value !== null && ntag.current_value !== undefined ? String(ntag.current_value) : "—";
+            if (ntag.quality !== null && ntag.quality !== undefined) {
+              const qBadge = document.createElement("span");
+              qBadge.style.marginLeft = "6px";
+              qBadge.className = "badge " + (ntag.quality >= 192 ? "good" : "error");
+              qBadge.textContent = ntag.quality >= 192 ? "Good" : `Bad (${ntag.quality})`;
+              tdCur.append(qBadge);
+            }
+          }
+          const tdTs = row.querySelector(".col-ts");
+          if (tdTs) {
+            tdTs.textContent = formatOpcTimestamp(ntag.timestamp);
+          }
+        }
+      });
+    } catch (e) {
+      // silent background refresh error
+    }
+  }
+
+  // ==========================================
   // INITIALIZATION & EVENT LISTENERS
   // ==========================================
 
@@ -1001,6 +1605,25 @@
       // Event listeners - Navigation Tabs
       el("tab-equipments").addEventListener("click", () => switchTab("equipments"));
       el("tab-opc").addEventListener("click", () => switchTab("opc"));
+      el("tab-write-opc").addEventListener("click", () => switchTab("write-opc"));
+
+      // Operação OPC Module events
+      el("btn-refresh-write-opc").addEventListener("click", () => loadWriteEquipment());
+      el("write-equipment-select").addEventListener("change", () => loadWriteEquipment());
+      el("btn-refresh-write-reads").addEventListener("click", () => {
+        const eqId = el("write-equipment-select").value;
+        if (eqId) refreshWriteReadingsOnly(eqId);
+      });
+      el("btn-clear-write-values").addEventListener("click", clearWriteValues);
+      el("btn-review-write").addEventListener("click", reviewWriteOperation);
+      el("btn-refresh-audit").addEventListener("click", () => {
+        const eqId = el("write-equipment-select").value;
+        if (eqId) loadWriteAuditEvents(eqId);
+      });
+      el("btn-cancel-write-modal").addEventListener("click", () => {
+        el("modal-write-confirm").hidden = true;
+      });
+      el("btn-confirm-execute-write").addEventListener("click", confirmAndExecuteWrite);
 
       // Equipments Module events
       el("btn-refresh-equipments").addEventListener("click", () => loadEquipments());
@@ -1066,6 +1689,11 @@
         } else if (currentTab === "opc" && selectedEquipment) {
           if (selectedEquipment.agent_id) {
             loadAgentActiveConfigAndHistory(selectedEquipment.agent_id).catch(() => {});
+          }
+        } else if (currentTab === "write-opc") {
+          const eqId = el("write-equipment-select").value;
+          if (eqId) {
+            refreshWriteReadingsOnly(eqId).catch(() => {});
           }
         }
       }, 5000);

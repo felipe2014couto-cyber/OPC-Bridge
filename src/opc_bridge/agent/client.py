@@ -37,6 +37,8 @@ from opc_bridge.protocol import (
     unframe_message,
 )
 from opc_bridge.protocol.inspection import CAPABILITY, InspectionRequest, InspectionResponse
+from opc_bridge.protocol.write import CAPABILITY_WRITE, WriteRequest, WriteResponse
+from opc_bridge.agent.write import execute_agent_write
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +82,12 @@ class AgentClient:
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._heartbeat_expired = False
         self._inspection_task: asyncio.Task | None = None
+        self._write_task: asyncio.Task | None = None
+        self._write_allowlist: set[str] = set()
+
+    def set_write_allowlist(self, allowlist: set[str] | list[str]) -> None:
+        """Configure local per-tag write allowlist."""
+        self._write_allowlist = set(allowlist)
 
     @property
     def session_id(self) -> str | None:
@@ -121,7 +129,7 @@ class AgentClient:
             agent_id=self._agent_id,
             hostname="agent-host",
             os_version="Python",
-            capabilities=[CAPABILITY] if self._adapter_factory is not None else [],
+            capabilities=[CAPABILITY, CAPABILITY_WRITE] if (self._adapter_factory is not None or self._adapter is not None) else [],
         )
         await self._send(MsgType.HELLO, hello.pack())
 
@@ -169,6 +177,8 @@ class AgentClient:
                 await self._handle_config_push(payload)
             elif header.msg_type == MsgType.OPC_INSPECT_REQUEST:
                 await self._handle_inspection_request(payload)
+            elif header.msg_type == MsgType.OPC_WRITE_REQUEST:
+                await self._handle_write_request(payload)
             elif header.msg_type == MsgType.READ_REQUEST:
                 await self._handle_read_request(payload)
             elif header.msg_type == MsgType.HEARTBEAT:
@@ -181,6 +191,9 @@ class AgentClient:
             else:
                 logger.warning("Unexpected message type: %s", header.msg_type)
         self._running = False
+        if self._write_task is not None:
+            self._write_task.cancel()
+            await asyncio.gather(self._write_task, return_exceptions=True)
         if self._inspection_task is not None:
             self._inspection_task.cancel()
             await asyncio.gather(self._inspection_task, return_exceptions=True)
@@ -223,6 +236,31 @@ class AgentClient:
                 logger.warning("Inspection response could not be delivered")
 
         self._inspection_task = asyncio.create_task(execute())
+
+    async def _handle_write_request(self, payload: bytes) -> None:
+        try:
+            request = WriteRequest.unpack(payload)
+        except Exception:
+            logger.warning("Invalid write request payload")
+            return
+
+        if self._write_task is not None and not self._write_task.done():
+            await self._send(
+                MsgType.OPC_WRITE_RESPONSE,
+                WriteResponse(request.request_id, error="busy").pack(),
+            )
+            return
+
+        async def execute() -> None:
+            try:
+                response = await asyncio.get_running_loop().run_in_executor(
+                    None, execute_agent_write, request, self._adapter, self._write_allowlist
+                )
+                await self._send(MsgType.OPC_WRITE_RESPONSE, response.pack())
+            except Exception:
+                logger.warning("Write response could not be delivered")
+
+        self._write_task = asyncio.create_task(execute())
 
     async def _handle_config_push(self, payload: bytes) -> None:
         """Process CONFIG_PUSH and send CONFIG_ACK."""

@@ -15,6 +15,7 @@ import struct
 import threading
 import time
 from dataclasses import dataclass, field
+from typing import Any
 
 from opc_bridge.protocol import ItemResult, ItemStatus, ValueType
 
@@ -268,3 +269,30 @@ class SimulatedOpcAdapter:
             return f"{value:.2f}".encode()
         else:
             return struct.pack("<d", value)
+
+    def write_items(self, items: list[tuple[str, Any]]) -> list[tuple[str, bool, str | None]]:
+        """Simulate writing values to items when enabled by the global kill switch."""
+        from opc_bridge.protocol.write import WRITES_DISABLED_MESSAGE, is_writes_enabled
+
+        if not is_writes_enabled():
+            return [(tag, False, WRITES_DISABLED_MESSAGE) for tag, _ in items]
+
+        with self._lock:
+            outcomes: list[tuple[str, bool, str | None]] = []
+            for tag, val in items:
+                updated = False
+                for group in self._groups.values():
+                    for item in group.items.values():
+                        if item.path == tag:
+                            if item.value_type == ValueType.BOOL:
+                                item.base_value = 1.0 if val else 0.0
+                            elif isinstance(val, (int, float)):
+                                item.base_value = float(val)
+                            updated = True
+                            outcomes.append((tag, True, None))
+                            break
+                    if updated:
+                        break
+                if not updated:
+                    outcomes.append((tag, True, None))
+            return outcomes

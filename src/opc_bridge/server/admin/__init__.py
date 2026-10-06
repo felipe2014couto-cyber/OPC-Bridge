@@ -13,6 +13,7 @@ from wsgiref.simple_server import make_server
 
 from opc_bridge.protocol import ConfigPushPayload, ItemRef
 from opc_bridge.server.admin.tags import TagAdministration
+from opc_bridge.server.admin.write_ops import WriteOperationAdministration
 from opc_bridge.server.core import BridgeServer
 from opc_bridge.server.persistence import Database, database_from_env
 
@@ -97,7 +98,7 @@ def _same_database(left: Database, right: Database) -> bool:
     return left.database_url == right.database_url
 
 
-class AdminApplication(TagAdministration):
+class AdminApplication(TagAdministration, WriteOperationAdministration):
     """WSGI application with explicit bearer authentication and safe projections."""
 
     def __init__(self, database: Database, bridge_server: BridgeServer | None = None) -> None:
@@ -135,6 +136,9 @@ class AdminApplication(TagAdministration):
     def _read_request(
         self, method: str, path: str, query: str, environ: dict[str, Any], start_response: Callable[..., Any]
     ) -> list[bytes]:
+        write_resp = self.write_operation_route(method, path, query, environ, start_response)
+        if write_resp is not None:
+            return write_resp
         equip_resp = self.equipment_route(method, path, query, environ, start_response)
         if equip_resp is not None:
             return equip_resp

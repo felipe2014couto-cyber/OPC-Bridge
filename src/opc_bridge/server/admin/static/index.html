@@ -18,6 +18,7 @@
   <nav class="nav-tabs" role="tablist" aria-label="Módulos Administrativos">
     <button id="tab-equipments" class="tab-btn active" role="tab" aria-selected="true" aria-controls="panel-equipments">Equipamentos</button>
     <button id="tab-opc" class="tab-btn" role="tab" aria-selected="false" aria-controls="panel-opc">OPC</button>
+    <button id="tab-write-opc" class="tab-btn" role="tab" aria-selected="false" aria-controls="panel-write-opc">Operação OPC</button>
   </nav>
 </header>
 
@@ -215,6 +216,145 @@
         </div>
         <div id="active-config" class="code-box">Nenhuma configuração ativa registrada.</div>
       </section>
+    </div>
+
+    <!-- MÓDULO 3: OPERAÇÃO OPC (ESCRITA CONTROLADA) -->
+    <div id="panel-write-opc" class="tab-panel" role="tabpanel" aria-labelledby="tab-write-opc" hidden>
+      <!-- Seção: Seleção de Equipamento e Status da Chave Geral -->
+      <section class="card">
+        <div class="section-title">
+          <h2>Operação OPC (Escrita Controlada)</h2>
+          <div class="actions">
+            <button id="btn-refresh-write-opc" type="button">Atualizar</button>
+          </div>
+        </div>
+
+        <div id="write-kill-switch-banner" class="banner warning">
+          Verificando status da chave geral de escrita...
+        </div>
+
+        <div class="form-grid" style="margin-top: 14px;">
+          <div>
+            <label for="write-equipment-select">Selecione o equipamento cadastrado *</label>
+            <select id="write-equipment-select">
+              <option value="">Selecione um equipamento...</option>
+            </select>
+          </div>
+          <div>
+            <label for="write-operator-user">Identificação do operador *</label>
+            <input id="write-operator-user" value="operador" placeholder="Ex: operador ou matrícula">
+          </div>
+        </div>
+
+        <div id="write-agent-info" class="meta-grid" hidden>
+          <div class="meta-item"><dt>Agente associado</dt><dd id="write-meta-agent-id">—</dd></div>
+          <div class="meta-item"><dt>Situação</dt><dd id="write-meta-agent-status">—</dd></div>
+          <div class="meta-item"><dt>ProgID OPC</dt><dd id="write-meta-prog-id">—</dd></div>
+          <div class="meta-item"><dt>Permissão de escrita</dt><dd id="write-meta-permission">—</dd></div>
+        </div>
+      </section>
+
+      <!-- Seção: Planilha Operacional de Escrita -->
+      <section class="card">
+        <div class="section-title">
+          <h2>Planilha de Operação de Tags</h2>
+          <div class="actions">
+            <button id="btn-refresh-write-reads" type="button">Atualizar leituras</button>
+            <button id="btn-clear-write-values" type="button">Limpar novos valores</button>
+            <button id="btn-review-write" class="primary" type="button" disabled>Revisar e escrever</button>
+          </div>
+        </div>
+        <p class="muted">
+          Edição tipo planilha: use <strong>Enter / Shift+Enter</strong> ou <strong>Setas</strong> para navegar verticalmente entre as células de novo valor. Cole valores em lote (<strong>Ctrl+V</strong>) copiados de colunas do Excel. Somente tags autorizadas (<code>write_enabled: true</code>) aceitam novos valores.
+        </p>
+
+        <div class="table-wrap">
+          <table class="spreadsheet-table">
+            <thead>
+              <tr>
+                <th style="min-width: 220px;">Endereço OPC (Tag)</th>
+                <th style="min-width: 140px;">Descrição</th>
+                <th style="width: 80px;">Tipo</th>
+                <th style="min-width: 110px;">Limites</th>
+                <th style="width: 110px;">Valor atual</th>
+                <th style="min-width: 150px;">Novo valor</th>
+                <th style="min-width: 160px;">Situação / Validação</th>
+                <th style="width: 170px;">Último timestamp</th>
+              </tr>
+            </thead>
+            <tbody id="write-spreadsheet-body">
+              <tr>
+                <td colspan="8" class="muted">Selecione um equipamento para carregar as tags operacionais.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Seção: Histórico de Auditoria -->
+      <section class="card">
+        <div class="section-title">
+          <h2>Histórico de Auditoria de Escritas</h2>
+          <div class="actions">
+            <button id="btn-refresh-audit" type="button">Atualizar auditoria</button>
+          </div>
+        </div>
+        <p class="muted">Registro persistente e imutável de todas as tentativas e execuções de escrita OPC.</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Data / Hora (UTC)</th>
+                <th>Tag</th>
+                <th>Valor anterior</th>
+                <th>Novo valor</th>
+                <th>Operador</th>
+                <th>Situação</th>
+                <th>Detalhes / Erro</th>
+              </tr>
+            </thead>
+            <tbody id="write-audit-body">
+              <tr>
+                <td colspan="7" class="muted">Nenhum evento de auditoria carregado.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <!-- Modal de Confirmação de Escrita -->
+  <div id="modal-write-confirm" class="modal-overlay" hidden>
+    <div class="modal-dialog card" role="dialog" aria-modal="true" aria-labelledby="modal-write-title">
+      <div class="section-title">
+        <h2 id="modal-write-title">Confirmar Operação de Escrita OPC</h2>
+      </div>
+      <div class="banner warning">
+        Atenção: A gravação de valores altera o estado do equipamento no servidor OPC do agente. Verifique os valores com cautela antes de confirmar.
+      </div>
+      <div style="margin: 12px 0;">
+        <p><strong>Equipamento:</strong> <span id="modal-eq-name">—</span></p>
+        <p><strong>Agente:</strong> <span id="modal-agent-id">—</span></p>
+        <p><strong>Operador:</strong> <span id="modal-user-id">—</span></p>
+      </div>
+      <div class="table-wrap" style="max-height: 250px; overflow-y: auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>Tag</th>
+              <th>Tipo</th>
+              <th>Valor Atual</th>
+              <th>Novo Valor</th>
+            </tr>
+          </thead>
+          <tbody id="modal-write-summary-body"></tbody>
+        </table>
+      </div>
+      <div class="actions" style="margin-top: 18px; justify-content: flex-end;">
+        <button id="btn-cancel-write-modal" type="button">Cancelar</button>
+        <button id="btn-confirm-execute-write" class="danger primary" type="button">Confirmar e Gravar</button>
+      </div>
     </div>
   </div>
 </main>

@@ -99,9 +99,28 @@ def named_config_payload(data: dict) -> dict:
     if type(interval_ms) is not int or not 1000 <= interval_ms <= 60000:
         raise ValueError("invalid_interval")
     tags = data.get("tags")
-    if (not isinstance(tags, list) or not 1 <= len(tags) <= MAX_TAGS
-            or any(not valid_text(path, 1024) for path in tags) or len(set(tags)) != len(tags)):
+    if not isinstance(tags, list) or not 1 <= len(tags) <= MAX_TAGS:
         raise ValueError("invalid_tags")
+    parsed_tags = []
+    seen_paths = set()
+    for entry in tags:
+        if isinstance(entry, str):
+            if not valid_text(entry, 1024) or entry in seen_paths:
+                raise ValueError("invalid_tags")
+            seen_paths.add(entry)
+            parsed_tags.append(entry)
+        elif isinstance(entry, dict):
+            path = entry.get("opc_item_path") or entry.get("path")
+            if not valid_text(path, 1024) or path in seen_paths:
+                raise ValueError("invalid_tags")
+            seen_paths.add(path)
+            parsed_tags.append(entry)
+        else:
+            raise ValueError("invalid_tags")
+
+    def _tag_key(item: Any) -> str:
+        return item if isinstance(item, str) else str(item.get("opc_item_path") or item.get("path") or "")
+
     agent_id = data.get("agent_id")
     if agent_id is not None and (not isinstance(agent_id, str) or not agent_id.strip()):
         agent_id = None
@@ -110,7 +129,7 @@ def named_config_payload(data: dict) -> dict:
         "equipment_id": eq_id.strip(),
         "opc_prog_id": prog_id.strip(),
         "interval_ms": interval_ms,
-        "tags": sorted(tags),
+        "tags": sorted(parsed_tags, key=_tag_key),
         "agent_id": agent_id.strip() if agent_id else None,
     }
 
