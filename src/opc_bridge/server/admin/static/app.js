@@ -648,7 +648,7 @@
     }
   }
 
-  // Validate and Snapshot Read Now ("Validar e ler agora")
+  // Read Now ("Ler agora")
   async function validateTagList(customPaths = null) {
     if (!selectedEquipment?.agent_id || busy) return;
     try {
@@ -663,7 +663,7 @@
       busy = true;
       updateButtons();
       clearValidationHighlights();
-      message("Validando lista e executando leitura pontual no agente…", "info");
+      message("Lendo valores atuais no servidor OPC…", "info");
       const revision = generation;
 
       const payload = {opc_prog_id: prog, update_rate_ms: rate, tags};
@@ -740,11 +740,11 @@
 
       if (data.valid) {
         approval = {id: data.validation_id, expires: Date.now() + (data.expires_in_seconds * 1000)};
-        message("Validação e leitura de snapshot concluídas com sucesso. Todas as tags são válidas.", "success");
+        message("Leitura pontual concluída com sucesso. Todas as tags são válidas.", "success");
       } else {
         approval = null;
         if (notFoundList.length > 0) {
-          message("A validação identificou endereços OPC não encontrados. A configuração ativa do agente foi mantida intacta.", "error");
+          message("A leitura identificou endereços OPC não encontrados. A configuração ativa do agente foi mantida intacta.", "error");
         } else {
           message("Há tags inválidas ou com erro no plano. A configuração ativa do agente foi mantida intacta.", "error");
         }

@@ -1135,7 +1135,8 @@ def test_validation_error_highlight_and_consolidated_warning(runtime):
     status, _, html = asset(app, "/ui", ADMIN_TOKEN)
     assert status.startswith("200")
     assert 'id="validation-errors-banner"' in html
-    assert 'Validar e ler agora' in html
+    assert 'Ler agora' in html
+    assert 'Validar e ler agora' not in html
     assert 'Validar lista' not in html
 
     status, _, css = asset(app, "/ui/style.css", ADMIN_TOKEN)
@@ -1193,6 +1194,70 @@ def test_snapshot_validation_does_not_send_config_push_nor_persist_nor_start_liv
     assert snaps_after == snaps_before
 
     # 4. Live values cache is NOT populated or started
+    live_data = bridge.get_live_values("agent-a")
+    assert live_data["items"] == []
+
+
+def test_ler_agora_single_click_flow_and_restrictions(runtime):
+    """Verify single-click 'Ler agora': snapshot values, mixed list, red alert, and zero config push/persistence/polling."""
+    app, bridge, database, created, active = runtime
+    session = bridge._sessions["connected"]
+    initial_version = session.config_version
+    initial_frames_count = len(session.writer.frames)
+
+    # 1. UI markup checks: button is "Ler agora"
+    status, _, html = asset(app, "/ui", ADMIN_TOKEN)
+    assert status.startswith("200")
+    assert 'Ler agora' in html
+    assert 'Validar e ler agora' not in html
+    assert 'Validar lista' not in html
+    assert 'id="validation-errors-banner"' in html
+
+    # 2. Database state before
+    with database.session() as repo:
+        ops_before = repo.list_admin_config_operations("agent-a")
+        snaps_before = len(repo._execute("SELECT snapshot_id FROM config_snapshots").fetchall())
+
+    # 3. Single-click read of mixed list (valid and nonexistent)
+    status, _, result = validate(app, plan(["Good.Tag.1", "Missing.Tag", "Good.Tag.2"]))
+    assert status.startswith("200")
+    assert result["valid"] is False
+    assert result["validation_id"] is None
+    assert len(result["results"]) == 3
+
+    res_by_path = {r["opc_item_path"]: r for r in result["results"]}
+    r_good1 = res_by_path["Good.Tag.1"]
+    r_missing = res_by_path["Missing.Tag"]
+    r_good2 = res_by_path["Good.Tag.2"]
+
+    # Valid tags have values, types, quality and timestamps
+    assert r_good1["status"] == "valid"
+    assert r_good1["value"] is not None
+    assert r_good1["quality_text"] == "Good"
+    assert r_good1["opc_timestamp"] is not None
+    assert r_good1["error"] is None
+
+    assert r_good2["status"] == "valid"
+    assert r_good2["value"] is not None
+    assert r_good2["quality_text"] == "Good"
+    assert r_good2["opc_timestamp"] is not None
+    assert r_good2["error"] is None
+
+    # Invalid tag has invalid status and exact Brazilian Portuguese message
+    assert r_missing["status"] == "invalid"
+    assert r_missing["error"] == "Endereço OPC não encontrado."
+    assert r_missing["value"] is None
+
+    # 4. Strict guarantees: no CONFIG_PUSH, no config mutation, no persistence, no live polling
+    assert len(session.writer.frames) == initial_frames_count
+    assert all(frame[4] != MsgType.CONFIG_PUSH for frame in session.writer.frames)
+    assert session.config_version == initial_version
+    with database.session() as repo:
+        ops_after = repo.list_admin_config_operations("agent-a")
+        snaps_after = len(repo._execute("SELECT snapshot_id FROM config_snapshots").fetchall())
+    assert len(ops_after) == len(ops_before)
+    assert snaps_after == snaps_before
+
     live_data = bridge.get_live_values("agent-a")
     assert live_data["items"] == []
 
