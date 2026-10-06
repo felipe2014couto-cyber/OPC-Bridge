@@ -21,33 +21,80 @@ logger = logging.getLogger(__name__)
 
 
 def inspect_opc(request: InspectionRequest, adapter_factory, active_adapter) -> InspectionResponse:
-    if adapter_factory is None:
-        return InspectionResponse(request.request_id, error="unavailable")
     if not _slot.acquire(blocking=False):
         return InspectionResponse(request.request_id, error="busy")
     candidate = None
+    group = None
+    is_reused = False
+    t_total_start = time.perf_counter()
+    t_wait_ms = 0.0
+    t_worker_ms = 0.0
+    t_group_ms = 0.0
+    t_add_ms = 0.0
+    t_read_ms = 0.0
+    t_cleanup_ms = 0.0
     try:
-        candidate = adapter_factory()
-        if candidate is active_adapter:
-            candidate = None
-            return InspectionResponse(request.request_id, error="unavailable")
-        # Limit only the temporary worker; never change the active worker's deadlines.
-        if hasattr(candidate, "command_timeout"):
-            candidate.command_timeout = min(candidate.command_timeout, 5)
-            candidate.connect_timeout = min(candidate.connect_timeout, 10)
-            candidate.startup_timeout = 10
+        req_prog = (request.opc_prog_id or "").strip()
+        active_prog = (getattr(active_adapter, "prog_id", None) or getattr(active_adapter, "_prog_id", None) or "")
+        if isinstance(active_prog, str):
+            active_prog = active_prog.strip()
+        else:
+            active_prog = str(active_prog).strip() if active_prog else ""
+
+        active_connected = getattr(active_adapter, "is_connected", None)
+        if callable(active_connected):
+            active_connected = active_connected()
+        elif active_connected is None:
+            active_connected = getattr(active_adapter, "_connected", False)
+            if hasattr(active_adapter, "is_alive") and not active_adapter.is_alive:
+                active_connected = False
+
+        can_reuse = bool(
+            request.action == "tags"
+            and active_adapter is not None
+            and active_connected
+            and req_prog
+            and active_prog
+            and req_prog.lower() == active_prog.lower()
+        )
+
+        t_worker_start = time.perf_counter()
+        if can_reuse:
+            candidate = active_adapter
+            is_reused = True
+            t_worker_ms = (time.perf_counter() - t_worker_start) * 1000
+        else:
+            if adapter_factory is None:
+                return InspectionResponse(request.request_id, error="unavailable")
+            candidate = adapter_factory()
+            if candidate is active_adapter:
+                candidate = None
+                return InspectionResponse(request.request_id, error="unavailable")
+            is_reused = False
+            # Limit only the temporary worker; never change the active worker's deadlines.
+            if hasattr(candidate, "command_timeout"):
+                candidate.command_timeout = min(candidate.command_timeout, 5)
+                candidate.connect_timeout = min(candidate.connect_timeout, 10)
+                candidate.startup_timeout = 10
+            if request.action == "servers":
+                servers = candidate.discover_servers()
+                t_worker_ms = (time.perf_counter() - t_worker_start) * 1000
+                return InspectionResponse(
+                    request.request_id,
+                    servers=sorted({p for p in servers if valid_text(p, 256)})[:100],
+                )
+            candidate.connect(request.opc_prog_id)
+            t_worker_ms = (time.perf_counter() - t_worker_start) * 1000
+
         deadline = time.monotonic() + 30
-        if request.action == "servers":
-            servers = candidate.discover_servers()
-            return InspectionResponse(
-                request.request_id,
-                servers=sorted({p for p in servers if valid_text(p, 256)})[:100],
-            )
-        candidate.connect(request.opc_prog_id)
+        t_group_start = time.perf_counter()
         group = candidate.create_group("inspection_" + uuid.uuid4().hex, 1000)
+        t_group_ms = (time.perf_counter() - t_group_start) * 1000
         tags = request.tags or []
         results: list[dict | None] = [None] * len(tags)
         valid_items_to_read: list[tuple[int, str, int]] = []  # (index, path, item_id)
+
+        t_add_start = time.perf_counter()
 
         for idx, path in enumerate(tags):
             if time.monotonic() >= deadline:
@@ -113,7 +160,9 @@ def inspect_opc(request: InspectionRequest, adapter_factory, active_adapter) -> 
                     "opc_timestamp": None,
                     "error": err_str,
                 }
+        t_add_ms = (time.perf_counter() - t_add_start) * 1000
 
+        t_read_start = time.perf_counter()
         if valid_items_to_read:
             if time.monotonic() >= deadline:
                 for idx, path, _ in valid_items_to_read:
@@ -211,6 +260,7 @@ def inspect_opc(request: InspectionRequest, adapter_factory, active_adapter) -> 
                             "opc_timestamp": None,
                             "error": batch_err,
                         }
+        t_read_ms = (time.perf_counter() - t_read_start) * 1000
 
         final_results = [r for r in results if r is not None]
         return InspectionResponse(request.request_id, results=final_results)
@@ -233,11 +283,28 @@ def inspect_opc(request: InspectionRequest, adapter_factory, active_adapter) -> 
         ]
         return InspectionResponse(request.request_id, results=results, error="inspection_failed")
     finally:
-        try:
-            if candidate is not None:
-                try:
-                    candidate.disconnect()
-                except Exception:  # noqa: BLE001 - best-effort temporary worker cleanup.
-                    logger.warning("Temporary OPC inspection cleanup failed")
-        finally:
-            _slot.release()
+        t_cleanup_start = time.perf_counter()
+        if group is not None and candidate is not None:
+            try:
+                candidate.remove_group(group)
+            except Exception:  # noqa: BLE001 - best-effort temporary group cleanup.
+                logger.warning("Failed to remove temporary inspection group %s", getattr(group, "name", group))
+        if not is_reused and candidate is not None:
+            try:
+                candidate.disconnect()
+            except Exception:  # noqa: BLE001 - best-effort temporary worker cleanup.
+                logger.warning("Temporary OPC inspection cleanup failed")
+        t_cleanup_ms = (time.perf_counter() - t_cleanup_start) * 1000
+        t_total_ms = (time.perf_counter() - t_total_start) * 1000
+        logger.info(
+            "Inspection duration [mode=%s]: wait=%.2fms worker=%.2fms group=%.2fms add=%.2fms read=%.2fms cleanup=%.2fms total=%.2fms",
+            "reused" if is_reused else "fallback",
+            t_wait_ms,
+            t_worker_ms,
+            t_group_ms,
+            t_add_ms,
+            t_read_ms,
+            t_cleanup_ms,
+            t_total_ms,
+        )
+        _slot.release()

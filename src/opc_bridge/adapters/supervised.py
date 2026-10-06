@@ -11,6 +11,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 import time
 from multiprocessing.connection import Listener
 from typing import Any
@@ -93,11 +94,22 @@ class SupervisedOpcAdapter:
         self._conn: Any = None
         self._connected = False
         self._recovering = False
+        self._lock = threading.RLock()
 
     @property
     def is_alive(self) -> bool:
         """Check if child worker process is currently running."""
         return self._process is not None and self._process.poll() is None
+
+    @property
+    def prog_id(self) -> str | None:
+        """Return configured ProgID."""
+        return self._prog_id
+
+    @property
+    def is_connected(self) -> bool:
+        """Return whether adapter is connected and child worker is alive."""
+        return self._connected and self.is_alive
 
     @property
     def worker_pid(self) -> int | None:
@@ -237,60 +249,63 @@ class SupervisedOpcAdapter:
         timeout = timeout or self.command_timeout
         attempts = 2 if allow_retry else 1
 
-        for attempt in range(attempts):
-            try:
-                if not self.is_alive or self._conn is None:
-                    self._recover()
+        with self._lock:
+            for attempt in range(attempts):
+                try:
+                    if not self.is_alive or self._conn is None:
+                        self._recover()
 
-                resp = self._send_raw(msg, timeout=timeout)
-                if not resp.get("ok"):
-                    err_msg = resp.get("error", "Unknown error")
-                    err_type = resp.get("type", "RuntimeError")
-                    if err_type == "ConnectionError":
-                        raise OpcWorkerConnectionError(err_msg, resp.get("hresult"))
-                    elif err_type == "ValueError":
-                        raise ValueError(err_msg)
-                    raise OpcWorkerError(err_msg, resp.get("hresult"))
-                return resp
-            except TimeoutError as exc:
-                # Do not retry on timeout; re-raise immediately to enforce deadline
-                logger.warning(
-                    "OPC worker operation '%s' timed out (attempt %d/%d): %s; child was killed",
-                    msg.get("op"), attempt + 1, attempts, exc,
-                )
-                raise
-            except (EOFError, BrokenPipeError, ConnectionResetError) as exc:
-                logger.warning("OPC worker crash/disconnect during '%s' (attempt %d/%d): %s", msg.get("op"), attempt + 1, attempts, exc)
-                self._cleanup_process()
-                if attempt == attempts - 1:
+                    resp = self._send_raw(msg, timeout=timeout)
+                    if not resp.get("ok"):
+                        err_msg = resp.get("error", "Unknown error")
+                        err_type = resp.get("type", "RuntimeError")
+                        if err_type == "ConnectionError":
+                            raise OpcWorkerConnectionError(err_msg, resp.get("hresult"))
+                        elif err_type == "ValueError":
+                            raise ValueError(err_msg)
+                        raise OpcWorkerError(err_msg, resp.get("hresult"))
+                    return resp
+                except TimeoutError as exc:
+                    # Do not retry on timeout; re-raise immediately to enforce deadline
+                    logger.warning(
+                        "OPC worker operation '%s' timed out (attempt %d/%d): %s; child was killed",
+                        msg.get("op"), attempt + 1, attempts, exc,
+                    )
                     raise
-                self._recover()
+                except (EOFError, BrokenPipeError, ConnectionResetError) as exc:
+                    logger.warning("OPC worker crash/disconnect during '%s' (attempt %d/%d): %s", msg.get("op"), attempt + 1, attempts, exc)
+                    self._cleanup_process()
+                    if attempt == attempts - 1:
+                        raise
+                    self._recover()
 
     def connect(self, prog_id: str) -> None:
         """Connect to an OPC DA server by ProgID."""
-        self._prog_id = prog_id
-        if not self.is_alive:
-            self._start_worker()
+        with self._lock:
+            self._prog_id = prog_id
+            if not self.is_alive:
+                self._start_worker()
 
-        self._execute({"op": "connect", "prog_id": prog_id}, timeout=self.connect_timeout)
-        self._connected = True
+            self._execute({"op": "connect", "prog_id": prog_id}, timeout=self.connect_timeout)
+            self._connected = True
 
     def disconnect(self) -> None:
         """Disconnect and terminate worker cleanly."""
-        if self.is_alive and self._conn is not None:
-            try:
-                self._send_raw({"op": "disconnect"}, timeout=3.0)
-                self._send_raw({"op": "exit"}, timeout=2.0)
-            except Exception:
-                logger.debug("Worker disconnect failed", exc_info=True)
+        with self._lock:
+            if self.is_alive and self._conn is not None:
+                try:
+                    self._send_raw({"op": "disconnect"}, timeout=3.0)
+                    self._send_raw({"op": "exit"}, timeout=2.0)
+                except Exception:
+                    logger.debug("Worker disconnect failed", exc_info=True)
 
-        self._cleanup_process()
-        self._connected = False
-        self._groups.clear()
-        self._group_items.clear()
-        self._group_handles.clear()
-        self._item_mappings.clear()
-        logger.info("Supervised OPC adapter disconnected")
+            self._cleanup_process()
+            self._connected = False
+            self._groups.clear()
+            self._group_items.clear()
+            self._group_handles.clear()
+            self._item_mappings.clear()
+            logger.info("Supervised OPC adapter disconnected")
 
     def create_group(self, name: str, update_rate_ms: int) -> GroupHandle:
         """Create a new OPC group."""
@@ -411,17 +426,19 @@ class SupervisedOpcAdapter:
 
     def simulate_crash(self) -> None:
         """Trigger immediate child process crash (for fault-injection testing)."""
-        if self._conn is not None and self.is_alive:
-            try:
-                self._conn.send({"op": "crash"})
-            except Exception:
-                logger.debug("Crash injection IPC send failed", exc_info=True)
-            time.sleep(0.05)
+        with self._lock:
+            if self._conn is not None and self.is_alive:
+                try:
+                    self._conn.send({"op": "crash"})
+                except Exception:
+                    logger.debug("Crash injection IPC send failed", exc_info=True)
+                time.sleep(0.05)
 
     def simulate_block(self) -> None:
         """Trigger infinite block in child process to test deadline reaping."""
-        if self._conn is not None and self.is_alive:
-            try:
-                self._conn.send({"op": "block"})
-            except Exception:
-                logger.debug("Block injection IPC send failed", exc_info=True)
+        with self._lock:
+            if self._conn is not None and self.is_alive:
+                try:
+                    self._conn.send({"op": "block"})
+                except Exception:
+                    logger.debug("Block injection IPC send failed", exc_info=True)

@@ -12,6 +12,7 @@ import datetime
 import logging
 import struct
 import sys
+import threading
 import time
 from typing import Any, Callable
 
@@ -290,6 +291,12 @@ class OpcDaAdapter:
         self._vendor_info: str = "OPC DA Adapter"
         self._server_version: str = "1.0.0"
         self._start_time: float = 0.0
+        self._lock = threading.RLock()
+
+    @property
+    def is_connected(self) -> bool:
+        """Return whether adapter is connected."""
+        return self._connected
 
     @classmethod
     def discover_servers(cls) -> list[str]:
@@ -377,110 +384,113 @@ class OpcDaAdapter:
 
         Reuses persistent connection if already connected to the same ProgID.
         """
-        if self._connected:
-            if self.prog_id == prog_id:
-                logger.debug("Already connected to %s", prog_id)
-                return
-            self.disconnect()
+        with self._lock:
+            if self._connected:
+                if self.prog_id == prog_id:
+                    logger.debug("Already connected to %s", prog_id)
+                    return
+                self.disconnect()
 
-        self.prog_id = prog_id
-        logger.info("Connecting to OPC DA server prog_id=%s", prog_id)
+            self.prog_id = prog_id
+            logger.info("Connecting to OPC DA server prog_id=%s", prog_id)
 
-        try:
-            if self.com_factory is not None:
-                self._server = self.com_factory()
-            elif sys.platform == "win32":
-                _validate_automation_registration()
-                import pythoncom
-                import win32com.client
+            try:
+                if self.com_factory is not None:
+                    self._server = self.com_factory()
+                elif sys.platform == "win32":
+                    _validate_automation_registration()
+                    import pythoncom
+                    import win32com.client
 
-                pythoncom.CoInitialize()
-                self._server = win32com.client.Dispatch("OPC.Automation")
-            else:
-                raise RuntimeError("Production OPC DA requires Windows COM")
+                    pythoncom.CoInitialize()
+                    self._server = win32com.client.Dispatch("OPC.Automation")
+                else:
+                    raise RuntimeError("Production OPC DA requires Windows COM")
 
-            if not hasattr(self._server, "Connect") or not hasattr(self._server, "OPCGroups"):
-                raise RuntimeError("OPC Automation server interface is unavailable")
-            self._server.Connect(prog_id)
+                if not hasattr(self._server, "Connect") or not hasattr(self._server, "OPCGroups"):
+                    raise RuntimeError("OPC Automation server interface is unavailable")
+                self._server.Connect(prog_id)
 
-            self._connected = True
-            self._start_time = time.time()
-            self._vendor_info = getattr(self._server, "VendorInfo", f"OPC Server ({prog_id})")
-            major = getattr(self._server, "MajorVersion", 1)
-            minor = getattr(self._server, "MinorVersion", 0)
-            build = getattr(self._server, "BuildNumber", 0)
-            self._server_version = f"{major}.{minor}.{build}"
-            logger.info("Connected to %s (Vendor: %s, Version: %s)", prog_id, self._vendor_info, self._server_version)
-        except Exception as exc:
-            self._connected = False
-            self._server = None
-            logger.exception("Failed to connect to OPC DA server %s", prog_id)
-            raise ConnectionError(f"Could not connect to OPC DA server '{prog_id}': {exc}") from exc
+                self._connected = True
+                self._start_time = time.time()
+                self._vendor_info = getattr(self._server, "VendorInfo", f"OPC Server ({prog_id})")
+                major = getattr(self._server, "MajorVersion", 1)
+                minor = getattr(self._server, "MinorVersion", 0)
+                build = getattr(self._server, "BuildNumber", 0)
+                self._server_version = f"{major}.{minor}.{build}"
+                logger.info("Connected to %s (Vendor: %s, Version: %s)", prog_id, self._vendor_info, self._server_version)
+            except Exception as exc:
+                self._connected = False
+                self._server = None
+                logger.exception("Failed to connect to OPC DA server %s", prog_id)
+                raise ConnectionError(f"Could not connect to OPC DA server '{prog_id}': {exc}") from exc
 
     def disconnect(self) -> None:
         """Disconnect and cleanly release all COM groups and server handles."""
-        if not self._connected and self._server is None:
-            return
+        with self._lock:
+            if not self._connected and self._server is None:
+                return
 
-        logger.info("Disconnecting from OPC DA server prog_id=%s", self.prog_id)
-        for group_name in list(self._groups.keys()):
-            try:
-                self._remove_group_internal(group_name)
-            except Exception as exc:  # noqa: BLE001 - provider-specific exception boundary.
-                logger.debug("Error releasing group %s: %s", group_name, exc)
-        self._groups.clear()
+            logger.info("Disconnecting from OPC DA server prog_id=%s", self.prog_id)
+            for group_name in list(self._groups.keys()):
+                try:
+                    self._remove_group_internal(group_name)
+                except Exception as exc:  # noqa: BLE001 - provider-specific exception boundary.
+                    logger.debug("Error releasing group %s: %s", group_name, exc)
+            self._groups.clear()
 
-        if self._server is not None:
-            try:
-                if hasattr(self._server, "Disconnect"):
-                    self._server.Disconnect()
-            except Exception as exc:  # noqa: BLE001 - provider-specific exception boundary.
-                logger.debug("Error disconnecting COM server: %s", exc)
-            self._server = None
+            if self._server is not None:
+                try:
+                    if hasattr(self._server, "Disconnect"):
+                        self._server.Disconnect()
+                except Exception as exc:  # noqa: BLE001 - provider-specific exception boundary.
+                    logger.debug("Error disconnecting COM server: %s", exc)
+                self._server = None
 
-        if sys.platform == "win32":
-            try:
-                import pythoncom
-                pythoncom.CoUninitialize()
-            except Exception:
-                logger.debug("Best-effort COM cleanup failed", exc_info=True)
+            if sys.platform == "win32":
+                try:
+                    import pythoncom
+                    pythoncom.CoUninitialize()
+                except Exception:
+                    logger.debug("Best-effort COM cleanup failed", exc_info=True)
 
-        self._connected = False
-        self.prog_id = None
-        logger.info("Disconnected from OPC DA server")
+            self._connected = False
+            self.prog_id = None
+            logger.info("Disconnected from OPC DA server")
 
     def create_group(self, name: str, update_rate_ms: int) -> GroupHandle:
         """Create a new OPC group with specified update rate."""
-        if not self._connected or self._server is None:
-            raise ConnectionError("Not connected to OPC server")
+        with self._lock:
+            if not self._connected or self._server is None:
+                raise ConnectionError("Not connected to OPC server")
 
-        if name in self._groups:
-            raise ValueError(f"Group '{name}' already exists")
+            if name in self._groups:
+                raise ValueError(f"Group '{name}' already exists")
 
-        self._group_counter += 1
-        native_group = None
-        if not hasattr(self._server, "OPCGroups"):
-            raise RuntimeError("OPC group interface is unavailable")
-        if hasattr(self._server, "OPCGroups"):
-            opc_groups = self._server.OPCGroups
-            try:
-                native_group = opc_groups.Add(name)
-                if hasattr(native_group, "UpdateRate"):
-                    native_group.UpdateRate = update_rate_ms
-                if hasattr(native_group, "IsActive"):
-                    native_group.IsActive = True
-            except Exception as exc:
-                logger.error("Failed to add OPC group '%s': %s", name, exc)
-                raise RuntimeError(f"Failed to create OPC group '{name}': {exc}") from exc
+            self._group_counter += 1
+            native_group = None
+            if not hasattr(self._server, "OPCGroups"):
+                raise RuntimeError("OPC group interface is unavailable")
+            if hasattr(self._server, "OPCGroups"):
+                opc_groups = self._server.OPCGroups
+                try:
+                    native_group = opc_groups.Add(name)
+                    if hasattr(native_group, "UpdateRate"):
+                        native_group.UpdateRate = update_rate_ms
+                    if hasattr(native_group, "IsActive"):
+                        native_group.IsActive = True
+                except Exception as exc:
+                    logger.error("Failed to add OPC group '%s': %s", name, exc)
+                    raise RuntimeError(f"Failed to create OPC group '{name}': {exc}") from exc
 
-        handle = GroupHandle(name=name, update_rate_ms=update_rate_ms, native_handle=native_group)
-        self._groups[name] = {
-            "handle": handle,
-            "native_group": native_group,
-            "items_by_id": {},
-            "id_by_path": {},
-        }
-        return handle
+            handle = GroupHandle(name=name, update_rate_ms=update_rate_ms, native_handle=native_group)
+            self._groups[name] = {
+                "handle": handle,
+                "native_group": native_group,
+                "items_by_id": {},
+                "id_by_path": {},
+            }
+            return handle
 
     def _remove_group_internal(self, name: str) -> None:
         """Internal helper to remove group from COM server."""
@@ -496,98 +506,102 @@ class OpcDaAdapter:
 
     def remove_group(self, handle: GroupHandle) -> None:
         """Remove an OPC group."""
-        group_name = handle.name if hasattr(handle, "name") else str(handle)
-        self._remove_group_internal(group_name)
+        with self._lock:
+            group_name = handle.name if hasattr(handle, "name") else str(handle)
+            self._remove_group_internal(group_name)
 
     def add_items(self, group: GroupHandle, item_paths: list[str]) -> dict[str, int]:
         """Add items to a group. Returns mapping of item_path -> item_id."""
-        if not self._connected or self._server is None:
-            raise ConnectionError("Not connected to OPC server")
+        with self._lock:
+            if not self._connected or self._server is None:
+                raise ConnectionError("Not connected to OPC server")
 
-        group_name = group.name if hasattr(group, "name") else str(group)
-        group_data = self._groups.get(group_name)
-        if group_data is None:
-            raise ValueError(f"Group '{group_name}' not found")
+            group_name = group.name if hasattr(group, "name") else str(group)
+            group_data = self._groups.get(group_name)
+            if group_data is None:
+                raise ValueError(f"Group '{group_name}' not found")
 
-        native_group = group_data.get("native_group")
-        opc_items = getattr(native_group, "OPCItems", None) if native_group else None
+            native_group = group_data.get("native_group")
+            opc_items = getattr(native_group, "OPCItems", None) if native_group else None
 
-        if opc_items is None:
-            raise RuntimeError("OPC item registration interface is unavailable")
+            if opc_items is None:
+                raise RuntimeError("OPC item registration interface is unavailable")
 
-        result_mapping: dict[str, int] = {}
-        for path in item_paths:
-            if path in group_data["id_by_path"]:
-                result_mapping[path] = group_data["id_by_path"][path]
-                continue
+            result_mapping: dict[str, int] = {}
+            for path in item_paths:
+                if path in group_data["id_by_path"]:
+                    result_mapping[path] = group_data["id_by_path"][path]
+                    continue
 
-            self._item_counter += 1
-            item_id = self._item_counter
-            native_item = None
-            server_handle = item_id
+                self._item_counter += 1
+                item_id = self._item_counter
+                native_item = None
+                server_handle = item_id
 
-            if opc_items is not None:
-                try:
-                    native_item = opc_items.AddItem(path, item_id)
-                    raw_handle = getattr(native_item, "ServerHandle", None)
-                    if (
-                        raw_handle is None
-                        or not isinstance(raw_handle, int)
-                        or isinstance(raw_handle, bool)
-                        or raw_handle <= 0
-                    ):
-                        raise RuntimeError(
-                            f"OPC server returned invalid ServerHandle {raw_handle!r} for item {path!r}"
-                        )
-                    server_handle = int(raw_handle)
-                except Exception as exc:
-                    raise RuntimeError(f"Failed to add OPC item {path!r}: {exc}") from exc
+                if opc_items is not None:
+                    try:
+                        native_item = opc_items.AddItem(path, item_id)
+                        raw_handle = getattr(native_item, "ServerHandle", None)
+                        if (
+                            raw_handle is None
+                            or not isinstance(raw_handle, int)
+                            or isinstance(raw_handle, bool)
+                            or raw_handle <= 0
+                        ):
+                            raise RuntimeError(
+                                f"OPC server returned invalid ServerHandle {raw_handle!r} for item {path!r}"
+                            )
+                        server_handle = int(raw_handle)
+                    except Exception as exc:
+                        raise RuntimeError(f"Failed to add OPC item {path!r}: {exc}") from exc
 
-            record = {
-                "item_id": item_id,
-                "path": path,
-                "server_handle": server_handle,
-                "native_item": native_item,
-            }
-            group_data["items_by_id"][item_id] = record
-            group_data["id_by_path"][path] = item_id
-            result_mapping[path] = item_id
+                record = {
+                    "item_id": item_id,
+                    "path": path,
+                    "server_handle": server_handle,
+                    "native_item": native_item,
+                }
+                group_data["items_by_id"][item_id] = record
+                group_data["id_by_path"][path] = item_id
+                result_mapping[path] = item_id
 
-        return result_mapping
+            return result_mapping
 
     def remove_items(self, group: GroupHandle, item_ids: list[int]) -> None:
         """Remove items from a group."""
-        group_name = group.name if hasattr(group, "name") else str(group)
-        group_data = self._groups.get(group_name)
-        if group_data is None:
-            return
+        with self._lock:
+            group_name = group.name if hasattr(group, "name") else str(group)
+            group_data = self._groups.get(group_name)
+            if group_data is None:
+                return
 
-        native_group = group_data.get("native_group")
-        opc_items = getattr(native_group, "OPCItems", None) if native_group else None
+            native_group = group_data.get("native_group")
+            opc_items = getattr(native_group, "OPCItems", None) if native_group else None
 
-        server_handles_to_remove = []
-        for item_id in item_ids:
-            record = group_data["items_by_id"].pop(item_id, None)
-            if record:
-                group_data["id_by_path"].pop(record["path"], None)
-                server_handles_to_remove.append(record["server_handle"])
+            server_handles_to_remove = []
+            for item_id in item_ids:
+                record = group_data["items_by_id"].pop(item_id, None)
+                if record:
+                    group_data["id_by_path"].pop(record["path"], None)
+                    server_handles_to_remove.append(record["server_handle"])
 
-        if opc_items is not None and server_handles_to_remove:
-            try:
-                if hasattr(opc_items, "Remove"):
-                    opc_items.Remove(len(server_handles_to_remove), server_handles_to_remove)
-            except Exception as exc:  # noqa: BLE001 - provider-specific exception boundary.
-                logger.debug("Error removing items from OPCItems: %s", exc)
+            if opc_items is not None and server_handles_to_remove:
+                try:
+                    if hasattr(opc_items, "Remove"):
+                        opc_items.Remove(len(server_handles_to_remove), server_handles_to_remove)
+                except Exception as exc:  # noqa: BLE001 - provider-specific exception boundary.
+                    logger.debug("Error removing items from OPCItems: %s", exc)
 
     def validate_items(self, item_paths: list[str]) -> dict[str, bool]:
         """Validate if item paths exist in the server address space."""
-        if not self._connected or self._server is None:
-            raise ConnectionError("Not connected to OPC server")
+        with self._lock:
+            if not self._connected or self._server is None:
+                raise ConnectionError("Not connected to OPC server")
 
-        validations: dict[str, bool] = {}
-        for path in item_paths:
-            validations[path] = True
-        return validations
+            validations: dict[str, bool] = {}
+            for path in item_paths:
+                validations[path] = True
+            return validations
 
     def read_device(self, group: GroupHandle, item_ids: list[int]) -> list[ItemResult]:
         """Perform a synchronous Device read (OPC_DS_DEVICE = 2) for requested items.
@@ -595,6 +609,10 @@ class OpcDaAdapter:
         Never reads from cache. Preserves native types, original OPC quality,
         UTC timestamps in microseconds, and item HRESULT error codes.
         """
+        with self._lock:
+            return self._read_device_internal(group, item_ids)
+
+    def _read_device_internal(self, group: GroupHandle, item_ids: list[int]) -> list[ItemResult]:
         if not self._connected or self._server is None:
             raise ConnectionError("Not connected to OPC server")
 
@@ -730,6 +748,10 @@ class OpcDaAdapter:
 
     def browse_items(self, parent_path: str = "") -> list[BrowseEntry]:
         """Browse items hierarchically or flatly in the OPC server namespace."""
+        with self._lock:
+            return self._browse_items_internal(parent_path)
+
+    def _browse_items_internal(self, parent_path: str = "") -> list[BrowseEntry]:
         if not self._connected or self._server is None:
             raise ConnectionError("Not connected to OPC server")
 
@@ -779,6 +801,10 @@ class OpcDaAdapter:
 
     def get_server_status(self) -> ServerStatus:
         """Get the current operational status of the OPC DA server."""
+        with self._lock:
+            return self._get_server_status_internal()
+
+    def _get_server_status_internal(self) -> ServerStatus:
         if not self._connected or self._server is None:
             return ServerStatus(state=OPC_STATUS_FAILED, vendor_info="Disconnected", version="", start_time=0.0)
 

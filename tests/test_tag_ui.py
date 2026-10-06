@@ -1488,6 +1488,158 @@ def test_ler_agora_ui_in_flight_loading_and_double_click_prevention(runtime):
     assert status.startswith("200")
     # Verify button loading state and double click prevention
     assert 'Lendo…' in js or 'Lendo...' in js
+    assert 'Conectando…' in js or 'Conectando...' in js
     assert 'Ler agora' in js
     assert 'if (!selectedEquipment?.agent_id || busy) return;' in js
     assert 'el("validate-all").disabled = !canInspect;' in js
+    # Verify user message indication for reused vs fallback mode
+    assert 'Lendo valores atuais no servidor OPC…' in js
+    assert 'Conectando ao servidor OPC…' in js
+
+
+def test_worker_reuse_when_prog_id_matches_active_connection():
+    """Verify active worker is reused directly without calling factory when ProgID matches."""
+    active = SimulatedOpcAdapter()
+    active.connect("ABB.AfwOpcDaSurrogate.1")
+    periodic_group = active.create_group("periodic_group", 1000)
+    active.add_items(periodic_group, ["Periodic.Tag"])
+
+    factory_calls = 0
+
+    def factory():
+        nonlocal factory_calls
+        factory_calls += 1
+        return SimulatedOpcAdapter()
+
+    req = InspectionRequest("req-1", action="tags", opc_prog_id="ABB.AfwOpcDaSurrogate.1", tags=["Simulated.Temperature", "Simulated.Pressure"])
+    resp = inspect_opc(req, factory, active)
+
+    # 1. Factory must NOT be called: active worker was reused
+    assert factory_calls == 0
+    assert resp.error is None
+    assert len(resp.results) == 2
+    assert resp.results[0]["status"] == "valid"
+    assert resp.results[0]["value"] is not None
+    assert resp.results[1]["status"] == "valid"
+    assert resp.results[1]["value"] is not None
+
+    # 2. Active adapter remains connected; temporary group was removed
+    assert active.is_connected is True
+    assert "periodic_group" in active._groups
+    assert len(active._groups) == 1  # Only periodic_group remains, inspection group cleaned up
+
+
+def test_worker_fallback_when_prog_id_differs_from_active_connection():
+    """Verify fallback new worker is spawned and disconnected when ProgID differs."""
+    active = SimulatedOpcAdapter()
+    active.connect("ABB.AfwOpcDaSurrogate.1")
+
+    created = []
+
+    def factory():
+        adapter = SerializedInspectionAdapter()
+        created.append(adapter)
+        return adapter
+
+    req = InspectionRequest("req-2", action="tags", opc_prog_id="Kepware.KEPServerEX.V6", tags=["Good.Tag"])
+    resp = inspect_opc(req, factory, active)
+
+    # 1. Factory was invoked to create isolated worker for different ProgID
+    assert len(created) == 1
+    fallback = created[0]
+    assert fallback.commands[0] == "connect"
+    assert fallback.commands.count("read_device") == 1
+    # Fallback was cleanly disconnected
+    assert fallback.is_alive is False
+
+    # 2. Active adapter remains connected and untouched
+    assert active.is_connected is True
+    assert active.prog_id == "ABB.AfwOpcDaSurrogate.1"
+
+
+def test_temporary_group_cleaned_up_on_tag_errors_without_disconnecting_active():
+    """Verify exclusive inspection group is removed in finally even when tags fail."""
+    active = SerializedInspectionAdapter()
+    active.connect("ABB.AfwOpcDaSurrogate.1")
+    periodic_group = active.create_group("periodic_group", 5000)
+
+    factory_calls = 0
+
+    def factory():
+        nonlocal factory_calls
+        factory_calls += 1
+        return SerializedInspectionAdapter()
+
+    req = InspectionRequest("req-3", action="tags", opc_prog_id="ABB.AfwOpcDaSurrogate.1", tags=["Missing.Tag"])
+    resp = inspect_opc(req, factory, active)
+
+    assert factory_calls == 0
+    assert len(resp.results) == 1
+    assert resp.results[0]["status"] == "invalid"
+    assert resp.results[0]["hresult"] == 0xC0040007
+    assert resp.results[0]["error"] == "Endereço OPC não encontrado."
+
+    # Active supervisor must remain alive and connected
+    assert active.is_alive is True
+    assert active.is_connected is True
+    # Temporary group was removed
+    assert "periodic_group" in active._groups
+    assert len(active._groups) == 1
+    assert active.commands.count("remove_group") >= 1
+
+
+def test_periodic_collection_preserved_during_and_after_inspection():
+    """Verify periodic collection on active adapter runs smoothly before, during, and after inspection."""
+    active = SimulatedOpcAdapter()
+    active.connect("ABB.AfwOpcDaSurrogate.1")
+    periodic_group = active.create_group("periodic_group", 1000)
+    mapping = active.add_items(periodic_group, ["Simulated.Temperature"])
+    item_id = mapping["Simulated.Temperature"]
+
+    # 1. Periodic read before inspection
+    pre_results = active.read_device(periodic_group, [item_id])
+    assert len(pre_results) == 1
+    assert pre_results[0].status == ItemStatus.OK
+    pre_ts = pre_results[0].timestamp_us
+
+    # 2. Execute inspection with matching ProgID (reusing active worker)
+    req = InspectionRequest("req-4", action="tags", opc_prog_id="ABB.AfwOpcDaSurrogate.1", tags=["Simulated.Pressure"])
+    resp = inspect_opc(req, lambda: None, active)
+    assert resp.error is None
+    assert len(resp.results) == 1
+    assert resp.results[0]["status"] == "valid"
+
+    # 3. Periodic read after inspection continues with valid data and advanced timestamp
+    post_results = active.read_device(periodic_group, [item_id])
+    assert len(post_results) == 1
+    assert post_results[0].status == ItemStatus.OK
+    assert post_results[0].timestamp_us >= pre_ts
+    assert active.is_connected is True
+    assert len(active._groups) == 1
+
+
+def test_structured_duration_logging_present_without_secrets(caplog):
+    """Verify structured duration logging outputs wait, worker, group, add, read, cleanup, total without secrets."""
+    import logging
+
+    active = SimulatedOpcAdapter()
+    active.connect("ABB.AfwOpcDaSurrogate.1")
+
+    with caplog.at_level(logging.INFO, logger="opc_bridge.agent.inspection"):
+        req = InspectionRequest("req-log", action="tags", opc_prog_id="ABB.AfwOpcDaSurrogate.1", tags=["Simulated.Temperature"])
+        resp = inspect_opc(req, lambda: None, active)
+
+    assert resp.error is None
+    log_text = caplog.text
+    assert "Inspection duration [mode=reused]:" in log_text
+    assert "wait=" in log_text
+    assert "worker=" in log_text
+    assert "group=" in log_text
+    assert "add=" in log_text
+    assert "read=" in log_text
+    assert "cleanup=" in log_text
+    assert "total=" in log_text
+    # No sensitive info in log
+    assert "token" not in log_text.lower()
+    assert "secret" not in log_text.lower()
+    assert "password" not in log_text.lower()

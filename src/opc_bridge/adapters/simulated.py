@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import random
 import struct
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -70,53 +71,74 @@ class SimulatedOpcAdapter:
 
     def __init__(self, read_latency_us: int = 50) -> None:
         self._connected = False
+        self._prog_id: str | None = None
         self._groups: dict[str, GroupHandle] = {}
         self._read_latency_us = read_latency_us
         self._server_status = ServerStatus()
+        self._lock = threading.RLock()
+
+    @property
+    def prog_id(self) -> str | None:
+        """Return configured ProgID."""
+        return self._prog_id
+
+    @property
+    def is_connected(self) -> bool:
+        """Return whether adapter is connected."""
+        return self._connected
 
     def connect(self, prog_id: str) -> None:
         """Simulate connection to an OPC server."""
-        if self._connected:
-            raise RuntimeError("Already connected")
-        self._connected = True
-        self._server_status.start_time = time.time()
+        with self._lock:
+            if self._connected:
+                raise RuntimeError("Already connected")
+            self._connected = True
+            self._prog_id = prog_id
+            self._server_status.start_time = time.time()
 
     def disconnect(self) -> None:
         """Disconnect and release all resources."""
-        self._groups.clear()
-        self._connected = False
+        with self._lock:
+            self._groups.clear()
+            self._connected = False
+            self._prog_id = None
 
     def create_group(self, name: str, update_rate_ms: int) -> GroupHandle:
         """Create a new OPC group."""
-        if not self._connected:
-            raise RuntimeError("Not connected")
-        if name in self._groups:
-            raise ValueError(f"Group '{name}' already exists")
-        group = GroupHandle(name=name, update_rate_ms=update_rate_ms)
-        self._groups[name] = group
-        return group
+        with self._lock:
+            if not self._connected:
+                raise RuntimeError("Not connected")
+            if name in self._groups:
+                raise ValueError(f"Group '{name}' already exists")
+            group = GroupHandle(name=name, update_rate_ms=update_rate_ms)
+            self._groups[name] = group
+            return group
 
     def remove_group(self, handle: GroupHandle) -> None:
         """Remove an OPC group."""
-        if handle.name in self._groups:
-            del self._groups[handle.name]
+        with self._lock:
+            name = handle.name if hasattr(handle, "name") else str(handle)
+            if name in self._groups:
+                del self._groups[name]
 
     def add_items(
         self, group: GroupHandle, item_paths: list[str]
     ) -> dict[str, int]:
         """Add items to a group. Returns mapping of path -> item_id."""
-        result: dict[str, int] = {}
-        for path in item_paths:
-            item_id = group._next_item_id
-            group._next_item_id += 1
-            group.items[item_id] = SimulatedItem(path=path)
-            result[path] = item_id
-        return result
+        with self._lock:
+            result: dict[str, int] = {}
+            for path in item_paths:
+                item_id = group._next_item_id
+                group._next_item_id += 1
+                group.items[item_id] = SimulatedItem(path=path)
+                result[path] = item_id
+            return result
 
     def remove_items(self, group: GroupHandle, item_ids: list[int]) -> None:
         """Remove items from a group."""
-        for item_id in item_ids:
-            group.items.pop(item_id, None)
+        with self._lock:
+            for item_id in item_ids:
+                group.items.pop(item_id, None)
 
     def read_device(
         self, group: GroupHandle, item_ids: list[int]
@@ -125,8 +147,9 @@ class SimulatedOpcAdapter:
 
         Simulates read latency and optional failures per the item config.
         """
-        if not self._connected:
-            raise RuntimeError("Not connected")
+        with self._lock:
+            if not self._connected:
+                raise RuntimeError("Not connected")
 
         # Simulate read latency
         if self._read_latency_us > 0:
@@ -184,45 +207,47 @@ class SimulatedOpcAdapter:
 
     def browse_items(self, parent_path: str = "") -> list[BrowseEntry]:
         """Browse available items (simulated hierarchy)."""
-        if parent_path == "":
-            return [
-                BrowseEntry(
-                    path="Simulated",
-                    name="Simulated",
-                    data_type="Folder",
-                    access_rights="Read",
-                    is_leaf=False,
-                ),
-            ]
-        if parent_path == "Simulated":
-            return [
-                BrowseEntry(
-                    path="Simulated.Temperature",
-                    name="Temperature",
-                    data_type="Double",
-                    access_rights="Read",
-                    is_leaf=True,
-                ),
-                BrowseEntry(
-                    path="Simulated.Pressure",
-                    name="Pressure",
-                    data_type="Double",
-                    access_rights="Read",
-                    is_leaf=True,
-                ),
-                BrowseEntry(
-                    path="Simulated.Status",
-                    name="Status",
-                    data_type="String",
-                    access_rights="Read",
-                    is_leaf=True,
-                ),
-            ]
-        return []
+        with self._lock:
+            if parent_path == "":
+                return [
+                    BrowseEntry(
+                        path="Simulated",
+                        name="Simulated",
+                        data_type="Folder",
+                        access_rights="Read",
+                        is_leaf=False,
+                    ),
+                ]
+            if parent_path == "Simulated":
+                return [
+                    BrowseEntry(
+                        path="Simulated.Temperature",
+                        name="Temperature",
+                        data_type="Double",
+                        access_rights="Read",
+                        is_leaf=True,
+                    ),
+                    BrowseEntry(
+                        path="Simulated.Pressure",
+                        name="Pressure",
+                        data_type="Double",
+                        access_rights="Read",
+                        is_leaf=True,
+                    ),
+                    BrowseEntry(
+                        path="Simulated.Status",
+                        name="Status",
+                        data_type="String",
+                        access_rights="Read",
+                        is_leaf=True,
+                    ),
+                ]
+            return []
 
     def get_server_status(self) -> ServerStatus:
         """Get simulated server status."""
-        return self._server_status
+        with self._lock:
+            return self._server_status
 
     def _generate_value(self, item: SimulatedItem) -> bytes:
         """Generate a simulated value with optional noise."""

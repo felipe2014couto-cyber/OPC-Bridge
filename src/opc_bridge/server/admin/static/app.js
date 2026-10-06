@@ -660,12 +660,18 @@
         throw new Error(errors.invalid_configuration);
       }
 
+      const isReusing = Boolean(
+        activeAgentConfig &&
+        activeAgentConfig.opc_prog_id &&
+        activeAgentConfig.opc_prog_id.trim().toLowerCase() === prog.toLowerCase()
+      );
+
       busy = true;
       updateButtons();
       const btnValidate = el("validate-all");
-      if (btnValidate) btnValidate.textContent = "Lendo…";
+      if (btnValidate) btnValidate.textContent = isReusing ? "Lendo…" : "Conectando…";
       clearValidationHighlights();
-      message("Lendo valores atuais no servidor OPC…", "info");
+      message(isReusing ? "Lendo valores atuais no servidor OPC…" : "Conectando ao servidor OPC…", "info");
       const revision = generation;
 
       const payload = {opc_prog_id: prog, update_rate_ms: rate, tags};
