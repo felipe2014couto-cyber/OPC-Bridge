@@ -30,14 +30,30 @@ OPC_STATUS_TEST = "TEST"
 
 
 def opc_hresult(exc: BaseException) -> int | None:
-    """Extract only the numeric HRESULT, including provider exception causes."""
+    """Extract only the numeric HRESULT, including provider exception causes and Automation excepinfo."""
     for _ in range(8):
         code = getattr(exc, "hresult", None)
-        if code is None and exc.args and type(exc.args[0]) is int:
+        if code is None and getattr(exc, "args", None) and type(exc.args[0]) is int:
             code = exc.args[0]
         if type(code) is int:
-            return code & 0xFFFFFFFF
-        if exc.__cause__ is None:
+            normalized = code & 0xFFFFFFFF
+            if normalized == 0x80020009:  # DISP_E_EXCEPTION
+                excepinfo = getattr(exc, "excepinfo", None)
+                if excepinfo is None and len(getattr(exc, "args", ())) > 2:
+                    cand = exc.args[2]
+                    if isinstance(cand, (tuple, list)):
+                        excepinfo = cand
+                if isinstance(excepinfo, (tuple, list)):
+                    # EXCEPINFO: (wCode, bstrSource, bstrDescription, bstrHelpFile, dwHelpContext, scode)
+                    inner_scode = None
+                    if len(excepinfo) > 5 and isinstance(excepinfo[5], int) and excepinfo[5] != 0:
+                        inner_scode = excepinfo[5] & 0xFFFFFFFF
+                    elif len(excepinfo) > 0 and isinstance(excepinfo[0], int) and excepinfo[0] != 0:
+                        inner_scode = excepinfo[0] & 0xFFFFFFFF
+                    if inner_scode is not None:
+                        return inner_scode
+            return normalized
+        if getattr(exc, "__cause__", None) is None:
             break
         exc = exc.__cause__
     return None

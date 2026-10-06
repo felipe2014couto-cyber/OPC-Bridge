@@ -14,6 +14,7 @@ import uuid
 
 import pytest
 
+from opc_bridge.adapters.base import GroupHandle
 from opc_bridge.adapters.da import DevelopmentComItems, OpcDaAdapter
 from opc_bridge.adapters.da_worker import process_worker_command, worker_error_response
 from opc_bridge.adapters.simulated import SimulatedOpcAdapter
@@ -1194,3 +1195,180 @@ def test_snapshot_validation_does_not_send_config_push_nor_persist_nor_start_liv
     # 4. Live values cache is NOT populated or started
     live_data = bridge.get_live_values("agent-a")
     assert live_data["items"] == []
+
+
+try:
+    import pywintypes
+    PywinAutomationComError = pywintypes.com_error
+except ImportError:
+    class PywinAutomationComError(Exception):
+        """Exact simulation of pywintypes.com_error structure."""
+        def __init__(self, hresult: int, strerror: str, excepinfo: tuple | None = None, argerror: int | None = None):
+            super().__init__(hresult, strerror, excepinfo, argerror)
+            self.hresult = hresult
+            self.strerror = strerror
+            self.excepinfo = excepinfo
+            self.argerror = argerror
+
+
+def _make_failing_additem_adapter(failing_exception: Exception):
+    """Create a SerializedInspectionAdapter where native AddItem raises the given COM exception."""
+    class CustomItems(DevelopmentComItems):
+        def AddItem(self, path, handle):
+            raise failing_exception
+
+    class CustomGroup(NonPicklableComGroup):
+        def __init__(self, name):
+            super().__init__(name)
+            self.OPCItems = CustomItems()
+
+    class CustomGroups(NonPicklableGroups):
+        def Add(self, name):
+            group = CustomGroup(name)
+            self._groups[name] = group
+            return group
+
+    class CustomServer(NonPicklableComServer):
+        def __init__(self):
+            super().__init__()
+            self.OPCGroups = CustomGroups()
+
+    class CustomAdapter(SerializedInspectionAdapter):
+        def __init__(self):
+            super().__init__()
+            self.worker = OpcDaAdapter(com_factory=CustomServer)
+
+    return CustomAdapter
+
+
+def test_inspect_opc_unwraps_excepinfo_unknownitemid_as_invalid():
+    # DISP_E_EXCEPTION (0x80020009) with excepinfo scode = OPC_E_UNKNOWNITEMID (0xC0040007 / -1073479673)
+    exc = PywinAutomationComError(-2147352567, "Exception occurred.", (0, None, None, None, 0, -1073479673), None)
+    adapter_cls = _make_failing_additem_adapter(exc)
+
+    req = InspectionRequest(str(uuid.uuid4()), "tags", PROG_ID, ["Nonexistent.Tag"])
+    resp = inspect_opc(req, adapter_cls, None)
+    assert len(resp.results) == 1
+    r = resp.results[0]
+    assert r["status"] == "invalid"
+    assert r["hresult"] == 0xC0040007
+    assert r["error"] == "Endereço OPC não encontrado."
+    assert r["value"] is None
+
+
+def test_inspect_opc_unwraps_excepinfo_invaliditemid_as_invalid():
+    # DISP_E_EXCEPTION (0x80020009) with excepinfo scode = OPC_E_INVALIDITEMID (0xC0040008 / -1073479672)
+    exc = PywinAutomationComError(-2147352567, "Exception occurred.", (0, None, None, None, 0, -1073479672), None)
+    adapter_cls = _make_failing_additem_adapter(exc)
+
+    req = InspectionRequest(str(uuid.uuid4()), "tags", PROG_ID, ["Invalid.Tag"])
+    resp = inspect_opc(req, adapter_cls, None)
+    assert len(resp.results) == 1
+    r = resp.results[0]
+    assert r["status"] == "invalid"
+    assert r["hresult"] == 0xC0040008
+    assert r["error"] == "Endereço OPC não encontrado."
+    assert r["value"] is None
+
+
+def test_inspect_opc_disp_exception_without_inner_scode_remains_generic():
+    # DISP_E_EXCEPTION (0x80020009) with excepinfo scode = 0 (no inner code)
+    exc = PywinAutomationComError(-2147352567, "Exception occurred.", (0, None, None, None, 0, 0), None)
+    adapter_cls = _make_failing_additem_adapter(exc)
+
+    req = InspectionRequest(str(uuid.uuid4()), "tags", PROG_ID, ["Generic.Error.Tag"])
+    resp = inspect_opc(req, adapter_cls, None)
+    assert len(resp.results) == 1
+    r = resp.results[0]
+    assert r["status"] == "error"
+    assert r["hresult"] == 0x80020009
+    assert r["error"] != "Endereço OPC não encontrado."
+    assert "0x80020009" in r["error"]
+
+
+def test_inspect_opc_disp_exception_with_unrelated_inner_scode_remains_generic():
+    # DISP_E_EXCEPTION (0x80020009) with excepinfo scode = E_FAIL (0x80004005 / -2147467259)
+    exc = PywinAutomationComError(-2147352567, "Exception occurred.", (0, None, None, None, 0, -2147467259), None)
+    adapter_cls = _make_failing_additem_adapter(exc)
+
+    req = InspectionRequest(str(uuid.uuid4()), "tags", PROG_ID, ["Fail.Tag"])
+    resp = inspect_opc(req, adapter_cls, None)
+    assert len(resp.results) == 1
+    r = resp.results[0]
+    assert r["status"] == "error"
+    assert r["hresult"] == 0x80004005
+    assert r["error"] != "Endereço OPC não encontrado."
+    assert "0x80004005" in r["error"]
+
+
+def test_inspect_opc_different_com_error_remains_generic():
+    # E_ACCESSDENIED (0x80070005 / -2147024891)
+    exc = PywinAutomationComError(-2147024891, "Access Denied", None, None)
+    adapter_cls = _make_failing_additem_adapter(exc)
+
+    req = InspectionRequest(str(uuid.uuid4()), "tags", PROG_ID, ["Denied.Tag"])
+    resp = inspect_opc(req, adapter_cls, None)
+    assert len(resp.results) == 1
+    r = resp.results[0]
+    assert r["status"] == "error"
+    assert r["hresult"] == 0x80070005
+    assert r["error"] != "Endereço OPC não encontrado."
+    assert "0x80070005" in r["error"]
+
+
+def test_snapshot_mixed_valid_and_excepinfo_unknown_tag_without_interruption(runtime, monkeypatch):
+    app, bridge, database, created, active = runtime
+
+    class MixedInspectionItems(DevelopmentComItems):
+        def AddItem(self, path, handle):
+            if path == "Unknown.Excepinfo.Tag":
+                raise PywinAutomationComError(-2147352567, "Exception occurred.", (0, None, None, None, 0, -1073479673), None)
+            return super().AddItem(path, handle)
+
+    class MixedInspectionGroup(NonPicklableComGroup):
+        def __init__(self, name):
+            super().__init__(name)
+            self.OPCItems = MixedInspectionItems()
+
+    class MixedInspectionGroups(NonPicklableGroups):
+        def Add(self, name):
+            group = MixedInspectionGroup(name)
+            self._groups[name] = group
+            return group
+
+    class MixedInspectionServer(NonPicklableComServer):
+        def __init__(self):
+            super().__init__()
+            self.OPCGroups = MixedInspectionGroups()
+
+    class MixedAdapter(SerializedInspectionAdapter):
+        def __init__(self):
+            super().__init__()
+            self.worker = OpcDaAdapter(com_factory=MixedInspectionServer)
+
+    monkeypatch.setattr(bridge, "inspect_agent_threadsafe",
+                        lambda agent, req: inspect_opc(req, MixedAdapter, active))
+
+    status, _, result = validate(app, plan(["Good.Tag.1", "Unknown.Excepinfo.Tag", "Good.Tag.2"]))
+    assert status.startswith("200")
+    assert result["valid"] is False
+    assert result["validation_id"] is None
+    assert len(result["results"]) == 3
+
+    res_by_path = {r["opc_item_path"]: r for r in result["results"]}
+    r1 = res_by_path["Good.Tag.1"]
+    r2 = res_by_path["Unknown.Excepinfo.Tag"]
+    r3 = res_by_path["Good.Tag.2"]
+
+    assert r1["status"] == "valid"
+    assert r1["value"] is not None
+    assert r1["quality_text"] == "Good"
+
+    assert r2["status"] == "invalid"
+    assert r2["hresult"] == 0xC0040007
+    assert r2["error"] == "Endereço OPC não encontrado."
+    assert r2["value"] is None
+
+    assert r3["status"] == "valid"
+    assert r3["value"] is not None
+    assert r3["quality_text"] == "Good"

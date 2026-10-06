@@ -685,6 +685,73 @@ class TestOpcDaAdapter:
             assert "Tag.BadHandle" not in adapter._groups[group.name]["id_by_path"]
             adapter.disconnect()
 
+    def test_opc_hresult_unwraps_excepinfo_unknown_item_id(self):
+        """DISP_E_EXCEPTION with OPC_E_UNKNOWNITEMID in excepinfo must unwrap to 0xC0040007."""
+        from opc_bridge.adapters.base import opc_hresult
+
+        class MockComError(Exception):
+            def __init__(self, hr, msg, excepinfo=None):
+                super().__init__(hr, msg, excepinfo)
+                self.hresult = hr
+                self.excepinfo = excepinfo
+
+        # signed -1073479673 is 0xC0040007
+        err = MockComError(-2147352567, "Exception occurred.", (0, None, None, None, 0, -1073479673))
+        assert opc_hresult(err) == 0xC0040007
+
+        # Also when wrapped in RuntimeError with __cause__
+        try:
+            raise RuntimeError("Failed to add OPC item 'Missing'") from err
+        except RuntimeError as wrapped:
+            assert opc_hresult(wrapped) == 0xC0040007
+
+    def test_opc_hresult_unwraps_excepinfo_invalid_item_id(self):
+        """DISP_E_EXCEPTION with OPC_E_INVALIDITEMID in excepinfo must unwrap to 0xC0040008."""
+        from opc_bridge.adapters.base import opc_hresult
+
+        class MockComError(Exception):
+            def __init__(self, hr, msg, excepinfo=None):
+                super().__init__(hr, msg, excepinfo)
+                self.hresult = hr
+                self.excepinfo = excepinfo
+
+        # signed -1073479672 is 0xC0040008
+        err = MockComError(-2147352567, "Exception occurred.", (0, None, None, None, 0, -1073479672))
+        assert opc_hresult(err) == 0xC0040008
+
+    def test_opc_hresult_disp_exception_without_inner_scode(self):
+        """DISP_E_EXCEPTION without inner SCODE remains 0x80020009."""
+        from opc_bridge.adapters.base import opc_hresult
+
+        class MockComError(Exception):
+            def __init__(self, hr, msg, excepinfo=None):
+                super().__init__(hr, msg, excepinfo)
+                self.hresult = hr
+                self.excepinfo = excepinfo
+
+        err1 = MockComError(-2147352567, "Exception occurred.", (0, None, None, None, 0, 0))
+        assert opc_hresult(err1) == 0x80020009
+
+        err2 = MockComError(-2147352567, "Exception occurred.", None)
+        assert opc_hresult(err2) == 0x80020009
+
+    def test_opc_hresult_other_com_error_remains_generic(self):
+        """Other COM errors (e.g., E_ACCESSDENIED, E_FAIL) preserve their own HRESULT."""
+        from opc_bridge.adapters.base import opc_hresult
+
+        class MockComError(Exception):
+            def __init__(self, hr, msg, excepinfo=None):
+                super().__init__(hr, msg, excepinfo)
+                self.hresult = hr
+                self.excepinfo = excepinfo
+
+        err = MockComError(-2147024891, "Access Denied")  # 0x80070005
+        assert opc_hresult(err) == 0x80070005
+
+        err2 = MockComError(-2147352567, "Exception occurred.", (0, None, None, None, 0, -2147467259))  # E_FAIL 0x80004005
+        assert opc_hresult(err2) == 0x80004005
+
+
 
 class TestSupervisedOpcAdapter:
     """Tests for out-of-process COM supervision and crash recovery."""
@@ -957,7 +1024,11 @@ if __name__ == "__main__":
     tda.test_read_device_maps_two_tags_from_one_based_arrays()
     tda.test_read_device_preserves_real_hresult_on_syncread_failure()
     tda.test_add_items_rejects_invalid_server_handle()
-    print("[PASS] TestOpcDaAdapter (13 unit tests)")
+    tda.test_opc_hresult_unwraps_excepinfo_unknown_item_id()
+    tda.test_opc_hresult_unwraps_excepinfo_invalid_item_id()
+    tda.test_opc_hresult_disp_exception_without_inner_scode()
+    tda.test_opc_hresult_other_com_error_remains_generic()
+    print("[PASS] TestOpcDaAdapter (17 unit tests)")
 
     # 3. SupervisedOpcAdapter tests (lifecycle, crash recovery, blocked call timeout + reaping)
     tsup = TestSupervisedOpcAdapter()

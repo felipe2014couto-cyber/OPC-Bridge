@@ -135,10 +135,16 @@ def inspect_opc(request: InspectionRequest, adapter_factory, active_adapter) -> 
                 if isinstance(exc, TimeoutError):
                     deadline = 0
                 hresult = opc_hresult(exc)
-                if hresult is None:
-                    exc_str = str(exc).upper()
+                if hresult is None or hresult == 0x80020009:
+                    exc_str = str(exc)
                     for code in (0xC0040007, 0xC0040008, 0x80040001):
-                        if f"{code:08X}" in exc_str or hex(code).upper() in exc_str:
+                        signed_code = code if code < 0x80000000 else code - 0x100000000
+                        if (
+                            f"{code:08X}" in exc_str.upper()
+                            or hex(code).upper() in exc_str.upper()
+                            or str(signed_code) in exc_str
+                            or str(code) in exc_str
+                        ):
                             hresult = code
                             break
                 if hresult in (0xC0040007, 0xC0040008, 0x80040001):
