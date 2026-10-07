@@ -38,15 +38,13 @@ As seguintes variáveis de ambiente devem ser configuradas externamente (fora do
 | :--- | :--- | :--- | :--- |
 | `OPC_BRIDGE_PI_OUTPUT_ENABLED` | Booleano | `false` | **Kill switch mandatório.** Apenas `"true"` habilita chamadas de rede reais ao PI. |
 | `OPC_BRIDGE_PI_OUTPUT_MODE` | String | `simulated` | Modo de operação: `simulated` (seguro/testes) ou `web_api` (PI Web API real). |
-| `OPC_BRIDGE_PI_WEB_API_URL` | String | `""` | URL base do PI Web API (ex: `https://piserver.corp.local/piwebapi`). |
-| `OPC_BRIDGE_PI_DATA_SERVER` | String | `PIMS` | Nome do PI Data Server para o path canônico (`\\dataserver\point`). |
-| `OPC_BRIDGE_PI_WEB_API_AUTH_TYPE` | String | `basic` | Tipo de autenticação: `basic`, `bearer` ou `anonymous`. |
-| `OPC_BRIDGE_PI_WEB_API_USERNAME` | String | `""` | Nome de usuário de serviço para Basic Auth. |
-| `OPC_BRIDGE_PI_WEB_API_PASSWORD` | String | `""` | Senha de serviço para Basic Auth. |
-| `OPC_BRIDGE_PI_WEB_API_BEARER_TOKEN` | String | `""` | Token para autenticação Bearer. |
-| `OPC_BRIDGE_PI_WEB_API_TIMEOUT_SECONDS` | Float | `10.0` | Timeout máximo em segundos por chamada HTTP (mínimo 1.0s). |
-| `OPC_BRIDGE_PI_WEB_API_CA_BUNDLE` | String | `""` | Caminho do arquivo de certificados CA customizados (PEM/CRT). |
-| `OPC_BRIDGE_PI_WEB_API_VERIFY_SSL` | Booleano | `true` | Se `true`, valida certificados TLS. Usar `false` apenas em homologação restrita. |
+| `OPC_BRIDGE_PIWEBAPI_BASE_URL` | String | `""` | URL base do PI Web API (ex: `https://piserver.corp.local/piwebapi`). |
+| `OPC_BRIDGE_PI_SERVER` | String | `PIMS` | Nome do PI Data Server para resolução de WebId (`\\dataserver\point`). |
+| `OPC_BRIDGE_PIWEBAPI_USERNAME` | String | `""` | Nome de usuário de serviço para Basic Auth (montado apenas em memória). |
+| `OPC_BRIDGE_PIWEBAPI_PASSWORD` | String | `""` | Senha de serviço para Basic Auth (nunca persistida ou registrada). |
+| `OPC_BRIDGE_PIWEBAPI_CA_FILE` | String | `""` | Caminho do arquivo de certificados CA customizados (PEM/CRT). |
+| `OPC_BRIDGE_PIWEBAPI_TIMEOUT_SECONDS` | Float | `60.0` | Timeout máximo em segundos por chamada HTTP (padrão 60s, mínimo 1.0s). |
+| `OPC_BRIDGE_PIWEBAPI_VERIFY_SSL` | Booleano | `true` | Validação TLS obrigatória por padrão (`true`). |
 
 ---
 
@@ -58,16 +56,14 @@ No servidor de produção (fora do diretório versionado):
 # Permissões recomendadas: chmod 600 /etc/opc-bridge/pi.env
 # Pertencente ao usuário de execução do serviço central
 
-OPC_BRIDGE_PI_OUTPUT_ENABLED=true
+OPC_BRIDGE_PI_OUTPUT_ENABLED=false
 OPC_BRIDGE_PI_OUTPUT_MODE=web_api
-OPC_BRIDGE_PI_WEB_API_URL=https://piwebapi.empresa.local/piwebapi
-OPC_BRIDGE_PI_DATA_SERVER=PIMS
-OPC_BRIDGE_PI_WEB_API_AUTH_TYPE=basic
-OPC_BRIDGE_PI_WEB_API_USERNAME=svc_opcbridge_pi
-OPC_BRIDGE_PI_WEB_API_PASSWORD=SegredoForteAqui123!
-OPC_BRIDGE_PI_WEB_API_TIMEOUT_SECONDS=10.0
-OPC_BRIDGE_PI_WEB_API_CA_BUNDLE=/etc/ssl/certs/ca-corporativa.crt
-OPC_BRIDGE_PI_WEB_API_VERIFY_SSL=true
+OPC_BRIDGE_PIWEBAPI_BASE_URL=https://piwebapi.empresa.local/piwebapi
+OPC_BRIDGE_PI_SERVER=PIMS
+OPC_BRIDGE_PIWEBAPI_USERNAME=svc_opcbridge_pi
+OPC_BRIDGE_PIWEBAPI_PASSWORD=SegredoForteAqui123!
+OPC_BRIDGE_PIWEBAPI_CA_FILE=/etc/ssl/certs/ca-corporativa.crt
+OPC_BRIDGE_PIWEBAPI_TIMEOUT_SECONDS=60
 ```
 
 No systemd service (`opc-bridge-server.service`):

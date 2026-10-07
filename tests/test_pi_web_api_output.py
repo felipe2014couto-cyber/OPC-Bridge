@@ -108,35 +108,38 @@ def pi_runtime(tmp_path, monkeypatch):
 def test_pi_output_config_defaults_and_env(monkeypatch):
     # Default values with clean env
     for k in list(os.environ.keys()):
-        if k.startswith("OPC_BRIDGE_PI_"):
+        if k.startswith("OPC_BRIDGE_PI"):
             monkeypatch.delenv(k, raising=False)
 
     cfg = PiOutputConfig.load_from_env()
     assert cfg.enabled is False
     assert cfg.mode == "simulated"
     assert cfg.base_url == ""
-    assert cfg.timeout_seconds == 10.0
+    assert cfg.data_server == "PIMS"
+    assert cfg.timeout_seconds == 60.0
     assert cfg.verify_ssl is True
 
-    # Custom environment variables
+    # Custom environment variables using the exact target schema
     monkeypatch.setenv("OPC_BRIDGE_PI_OUTPUT_ENABLED", "true")
     monkeypatch.setenv("OPC_BRIDGE_PI_OUTPUT_MODE", "web_api")
-    monkeypatch.setenv("OPC_BRIDGE_PI_WEB_API_URL", "https://piwebapi.corp.local/piwebapi/")
-    monkeypatch.setenv("OPC_BRIDGE_PI_WEB_API_AUTH_TYPE", "basic")
-    monkeypatch.setenv("OPC_BRIDGE_PI_WEB_API_USERNAME", "pi_user")
-    monkeypatch.setenv("OPC_BRIDGE_PI_WEB_API_PASSWORD", "SuperSecret123!")
-    monkeypatch.setenv("OPC_BRIDGE_PI_WEB_API_TIMEOUT_SECONDS", "5.5")
-    monkeypatch.setenv("OPC_BRIDGE_PI_WEB_API_VERIFY_SSL", "false")
+    monkeypatch.setenv("OPC_BRIDGE_PIWEBAPI_BASE_URL", "https://piwebapi.corp.local/piwebapi/")
+    monkeypatch.setenv("OPC_BRIDGE_PI_SERVER", "PIMS")
+    monkeypatch.setenv("OPC_BRIDGE_PIWEBAPI_USERNAME", "pi_user")
+    monkeypatch.setenv("OPC_BRIDGE_PIWEBAPI_PASSWORD", "SuperSecret123!")
+    monkeypatch.setenv("OPC_BRIDGE_PIWEBAPI_TIMEOUT_SECONDS", "45")
+    monkeypatch.setenv("OPC_BRIDGE_PIWEBAPI_CA_FILE", "/etc/ssl/ca.pem")
+    monkeypatch.setenv("OPC_BRIDGE_PIWEBAPI_VERIFY_SSL", "true")
 
     cfg_custom = PiOutputConfig.load_from_env()
     assert cfg_custom.enabled is True
     assert cfg_custom.mode == "web_api"
     assert cfg_custom.base_url == "https://piwebapi.corp.local/piwebapi"
-    assert cfg_custom.auth_type == "basic"
+    assert cfg_custom.data_server == "PIMS"
     assert cfg_custom.username == "pi_user"
     assert cfg_custom.password == "SuperSecret123!"
-    assert cfg_custom.timeout_seconds == 5.5
-    assert cfg_custom.verify_ssl is False
+    assert cfg_custom.timeout_seconds == 45.0
+    assert cfg_custom.ca_bundle == "/etc/ssl/ca.pem"
+    assert cfg_custom.verify_ssl is True
 
 
 def test_sanitize_error_message():
@@ -263,10 +266,11 @@ def test_pi_web_api_channel_with_mocked_http():
         assert conn_res_err["status_code"] == 401
         assert "401" in conn_res_err["message"]
 
-    # 3. Successful publish via canonical streams/recorded endpoint
+    # 3. Successful publish via 2-step flow: GET /points?path=... then POST /streams/{webid}/value?updateOption=Replace
+    points_resp = (200, {"WebId": "P0123456789WebId", "Name": "BOBIN_VEL"})
     write_resp = (202, {"Status": "Created"})
 
-    with patch.object(channel, "_execute_http", return_value=write_resp) as mock_exec:
+    with patch.object(channel, "_execute_http", side_effect=[points_resp, write_resp]) as mock_exec:
         pub_res = channel.publish(
             pi_point_name="BOBIN_VEL",
             value=85.2,
@@ -278,12 +282,153 @@ def test_pi_web_api_channel_with_mocked_http():
         assert pub_res.error is None
         assert pub_res.details.get("web_api") is True
         assert pub_res.details.get("status_code") == 202
+        assert pub_res.details.get("web_id") == "P0123456789WebId"
 
-        # Verify single HTTP call made to streams/recorded with quoted path
+        # Verify two HTTP calls: GET /points?path=... and POST /streams/{WebId}/value?updateOption=Replace
+        assert mock_exec.call_count == 2
+        req_resolve = mock_exec.call_args_list[0][0][0]
+        assert req_resolve.get_method() == "GET"
+        assert "/points?path=" in req_resolve.full_url
+        assert "%5C%5CPIMS%5CBOBIN_VEL" in req_resolve.full_url
+
+        req_write = mock_exec.call_args_list[1][0][0]
+        assert req_write.get_method() == "POST"
+        assert "/streams/P0123456789WebId/value?updateOption=Replace" in req_write.full_url
+        payload_sent = json.loads(req_write.data.decode("utf-8"))
+        assert payload_sent == {
+            "Timestamp": "2026-10-07T12:00:00+00:00",
+            "Value": 85.2,
+        }
+
+
+def test_webid_resolution_using_path_and_caching():
+    cfg = PiOutputConfig(
+        enabled=True,
+        mode="web_api",
+        base_url="https://piwebapi.corp/piwebapi",
+        data_server="PIMS",
+    )
+    channel = PiWebApiOutputChannel(cfg)
+
+    # 1. First resolution call queries GET /points?path=\\PIMS\\TAG_SPEED
+    points_resp = (200, {"WebId": "WEBID_PIMS_SPEED_001", "Name": "TAG_SPEED"})
+    with patch.object(channel, "_execute_http", return_value=points_resp) as mock_exec:
+        web_id = channel.resolve_point_web_id("TAG_SPEED")
+        assert web_id == "WEBID_PIMS_SPEED_001"
         assert mock_exec.call_count == 1
-        req_sent = mock_exec.call_args[0][0]
-        assert "/streams/recorded?path=" in req_sent.full_url
-        assert "%5C%5CPIMS%5CBOBIN_VEL" in req_sent.full_url
+        req = mock_exec.call_args[0][0]
+        assert req.get_method() == "GET"
+        assert "/points?path=" in req.full_url
+        assert "%5C%5CPIMS%5CTAG_SPEED" in req.full_url
+
+    # 2. Second resolution call uses in-memory cache without making any HTTP call
+    with patch.object(channel, "_execute_http") as mock_exec_cached:
+        web_id_cached = channel.resolve_point_web_id("TAG_SPEED")
+        assert web_id_cached == "WEBID_PIMS_SPEED_001"
+        assert mock_exec_cached.call_count == 0
+
+
+def test_publish_workflow_post_streams_value_update_option_replace():
+    cfg = PiOutputConfig(
+        enabled=True,
+        mode="web_api",
+        base_url="https://piwebapi.corp/piwebapi",
+        data_server="PIMS",
+    )
+    channel = PiWebApiOutputChannel(cfg)
+
+    # Mock sequence: 1st call GET /points, 2nd call POST /streams/{webid}/value?updateOption=Replace
+    points_resp = (200, {"WebId": "WEBID_PIMS_TAG_99", "Name": "BOBIN_PESO"})
+    stream_resp = (202, {})
+
+    with patch.object(channel, "_execute_http", side_effect=[points_resp, stream_resp]) as mock_exec:
+        dt = datetime(2026, 10, 7, 12, 30, 0, tzinfo=timezone.utc)
+        res = channel.publish("BOBIN_PESO", 1234.5, timestamp=dt)
+
+        assert res.status == "Publicado"
+        assert res.value == 1234.5
+        assert res.details.get("web_id") == "WEBID_PIMS_TAG_99"
+        assert mock_exec.call_count == 2
+
+        # Verify call 1: GET /points?path=\\PIMS\\BOBIN_PESO
+        req_resolve = mock_exec.call_args_list[0][0][0]
+        assert req_resolve.get_method() == "GET"
+        assert "/points?path=%5C%5CPIMS%5CBOBIN_PESO" in req_resolve.full_url
+
+        # Verify call 2: POST /streams/{webid}/value?updateOption=Replace
+        req_post = mock_exec.call_args_list[1][0][0]
+        assert req_post.get_method() == "POST"
+        assert "/streams/WEBID_PIMS_TAG_99/value?updateOption=Replace" in req_post.full_url
+        assert req_post.headers["Content-type"] == "application/json"
+
+        # Verify body contains Timestamp and Value
+        sent_body = json.loads(req_post.data.decode("utf-8"))
+        assert sent_body["Timestamp"] == "2026-10-07T12:30:00+00:00"
+        assert sent_body["Value"] == 1234.5
+
+    # Repeat call for the same tag: cache skips GET /points, only POST /streams is called
+    with patch.object(channel, "_execute_http", return_value=stream_resp) as mock_exec_cached:
+        res2 = channel.publish("BOBIN_PESO", 1235.0, timestamp=dt)
+        assert res2.status == "Publicado"
+        assert mock_exec_cached.call_count == 1
+        req_cached = mock_exec_cached.call_args[0][0]
+        assert "/streams/WEBID_PIMS_TAG_99/value?updateOption=Replace" in req_cached.full_url
+
+
+def test_basic_auth_in_memory_only_and_no_secrets_in_logs_or_errors(caplog):
+    cfg = PiOutputConfig(
+        enabled=True,
+        mode="web_api",
+        base_url="https://piwebapi.corp/piwebapi",
+        username="pi_admin_svc",
+        password="TopSecretPasswordXYZ!",
+    )
+    channel = PiWebApiOutputChannel(cfg)
+
+    # 1. Authorization header built in memory
+    req = channel._build_request("https://piwebapi.corp/piwebapi/system/landing", "GET")
+    auth_header = req.headers.get("Authorization")
+    assert auth_header is not None
+    assert auth_header.startswith("Basic ")
+
+    # 2. No password leaked in logs or error representations
+    import io
+    err_401 = urllib.error.HTTPError(
+        url="https://piwebapi.corp/piwebapi/points?path=%5C%5CPIMS%5CTAG",
+        code=401,
+        msg="Unauthorized",
+        hdrs={},
+        fp=io.BytesIO(b"{}"),
+    )
+    with patch.object(channel, "_execute_http", side_effect=err_401):
+        res = channel.publish("TAG_SECRET", 100.0)
+        assert res.status == "Erro"
+        assert "TopSecretPasswordXYZ!" not in res.error
+        assert "TopSecretPasswordXYZ!" not in caplog.text
+        assert "Authorization" not in caplog.text
+
+
+def test_kill_switch_total_blocking_guarantee():
+    cfg = PiOutputConfig(
+        enabled=False,
+        mode="web_api",
+        base_url="https://piwebapi.corp/piwebapi",
+        username="pi_user",
+        password="pi_password",
+    )
+    channel = PiWebApiOutputChannel(cfg)
+
+    # Total blocking: publish, test_connection, and _execute_http
+    pub_res = channel.publish("TAG_ANY", 50.0)
+    assert pub_res.status == "Desabilitado"
+    assert pub_res.error == "Saída PI desabilitada"
+
+    test_res = channel.test_connection()
+    assert test_res["connected"] is False
+    assert test_res["error"] == "output_disabled"
+
+    with pytest.raises(PiOutputDisabledError):
+        channel._execute_http(MagicMock())
 
 
 def test_default_pi_point_name_extraction():
@@ -336,41 +481,50 @@ def test_pi_publisher_real_http_success_and_error():
         quality=192,
     )
 
-    # 1. Success mock
-    mock_resp = MagicMock()
-    mock_resp.status = 202
-    mock_resp.getcode.return_value = 202
-    mock_resp.read.return_value = b"{}"
-    mock_resp.__enter__.return_value = mock_resp
-    with patch("urllib.request.urlopen", return_value=mock_resp):
+    # 1. Success mock: resolve WebId then post stream value
+    mock_resp_resolve = MagicMock()
+    mock_resp_resolve.status = 200
+    mock_resp_resolve.getcode.return_value = 200
+    mock_resp_resolve.read.return_value = b'{"WebId": "WEBID_SPEED_01"}'
+    mock_resp_resolve.__enter__.return_value = mock_resp_resolve
+
+    mock_resp_post = MagicMock()
+    mock_resp_post.status = 202
+    mock_resp_post.getcode.return_value = 202
+    mock_resp_post.read.return_value = b"{}"
+    mock_resp_post.__enter__.return_value = mock_resp_post
+
+    with patch("urllib.request.urlopen", side_effect=[mock_resp_resolve, mock_resp_post]):
         res = pub.publish_single(payload)
         assert res.status == "published"
         assert res.http_status == 202
 
     # 2. HTTP 404 Point Not Found error mock
     mock_err = urllib.error.HTTPError(
-        url="http://10.247.224.39/piwebapi/streams/recorded",
+        url="http://10.247.224.39/piwebapi/points?path=%5C%5CPIMS%5CSPEED_TAG_ERR",
         code=404,
         msg="Not Found",
         hdrs={},
         fp=io.BytesIO(b"{}"),
     )
     with patch("urllib.request.urlopen", side_effect=mock_err):
-        res_err = pub.publish_single(payload)
+        payload_err = PiValuePayload(opc_item_path="Line1.Speed", pi_point="SPEED_TAG_ERR", value=500.0)
+        res_err = pub.publish_single(payload_err)
         assert res_err.status == "error"
         assert "não encontrado no servidor PIMS" in res_err.error
         assert res_err.http_status == 404
 
     # 3. HTTP 401 Unauthorized mock
     mock_auth_err = urllib.error.HTTPError(
-        url="http://10.247.224.39/piwebapi/streams/recorded",
+        url="http://10.247.224.39/piwebapi/points?path=%5C%5CPIMS%5CSPEED_TAG_AUTH",
         code=401,
         msg="Unauthorized",
         hdrs={},
         fp=io.BytesIO(b"{}"),
     )
     with patch("urllib.request.urlopen", side_effect=mock_auth_err):
-        res_auth = pub.publish_single(payload)
+        payload_auth = PiValuePayload(opc_item_path="Line1.Speed", pi_point="SPEED_TAG_AUTH", value=500.0)
+        res_auth = pub.publish_single(payload_auth)
         assert res_auth.status == "error"
         assert "Acesso não autorizado ao PI Web API (HTTP 401)" in res_auth.error
         assert res_auth.http_status == 401
