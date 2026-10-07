@@ -727,14 +727,14 @@ class PiIntegrationAdministration:
 
                 query_sql = (
                     "SELECT event_id, agent_id, event_type, detail_json, occurred_at "
-                    "FROM audit_events WHERE (event_type LIKE 'pi_mapping.%' OR event_type LIKE 'pi_profile.%') "
+                    "FROM audit_events WHERE (event_type LIKE ? OR event_type LIKE ?) "
                 )
-                sql_params: tuple = ()
+                sql_params = ["pi_mapping.%", "pi_profile.%"]
                 if agent_id:
                     query_sql += "AND agent_id = ? "
-                    sql_params = (agent_id,)
+                    sql_params.append(agent_id)
                 query_sql += f"ORDER BY occurred_at DESC LIMIT {max(1, min(limit, 200))}"
-                rows = repo._dicts(repo._execute(query_sql, sql_params))
+                rows = repo._dicts(repo._execute(query_sql, tuple(sql_params)))
 
             events = []
             for r in rows:
