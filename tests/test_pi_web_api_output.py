@@ -27,11 +27,16 @@ from opc_bridge.server.persistence import sqlite_for_tests, upgrade_database
 from opc_bridge.server.pi_output import (
     PiOutputConfig,
     PiOutputDisabledError,
+    PiPublisher,
+    PiPublishResult,
+    PiValuePayload,
     PiWebApiOutputChannel,
     SimulatedPiOutputChannel,
     create_pi_output_channel,
+    default_pi_point_name,
     evaluate_mapping_publication,
     format_iso_timestamp,
+    format_pi_timestamp,
     sanitize_error_message,
 )
 from opc_bridge.server.pi_publisher import PiPublisherService
@@ -258,12 +263,10 @@ def test_pi_web_api_channel_with_mocked_http():
         assert conn_res_err["status_code"] == 401
         assert "401" in conn_res_err["message"]
 
-    # 3. Successful publish
-    # First call resolves WebID via search; second call writes stream value
-    search_resp = (200, {"Items": [{"WebId": "P0123456789WebId"}]})
+    # 3. Successful publish via canonical streams/recorded endpoint
     write_resp = (202, {"Status": "Created"})
 
-    with patch.object(channel, "_execute_http", side_effect=[search_resp, write_resp]):
+    with patch.object(channel, "_execute_http", return_value=write_resp) as mock_exec:
         pub_res = channel.publish(
             pi_point_name="BOBIN_VEL",
             value=85.2,
@@ -274,6 +277,113 @@ def test_pi_web_api_channel_with_mocked_http():
         assert pub_res.value == 85.2
         assert pub_res.error is None
         assert pub_res.details.get("web_api") is True
+        assert pub_res.details.get("status_code") == 202
+
+        # Verify single HTTP call made to streams/recorded with quoted path
+        assert mock_exec.call_count == 1
+        req_sent = mock_exec.call_args[0][0]
+        assert "/streams/recorded?path=" in req_sent.full_url
+        assert "%5C%5CPIMS%5CBOBIN_VEL" in req_sent.full_url
+
+
+def test_default_pi_point_name_extraction():
+    assert default_pi_point_name("Pims_A40:gUsw.ToPims.DIAMETRO_CALC_BOBIN") == "DIAMETRO_CALC_BOBIN"
+    assert default_pi_point_name("PESO_CALC_BOBINADEIRA") == "PESO_CALC_BOBINADEIRA"
+    assert default_pi_point_name("ABB.Tag.1.Value") == "Value"
+    assert default_pi_point_name("MyTag", configured_pi_point="CUSTOM_PI_POINT") == "CUSTOM_PI_POINT"
+    assert default_pi_point_name("") == ""
+
+
+def test_format_pi_timestamp():
+    ts1 = format_pi_timestamp("2026-10-07T12:00:00Z")
+    assert "2026-10-07" in ts1
+
+    ts2 = format_pi_timestamp(None)
+    assert "T" in ts2
+
+    ts3 = format_pi_timestamp(1700000000.0)
+    assert "2023" in ts3
+
+
+def test_pi_publisher_simulated():
+    pub = PiPublisher(simulated=True)
+    payload = PiValuePayload(
+        opc_item_path="Line1.Speed",
+        pi_point="SPEED_TAG",
+        value=123.45,
+        timestamp="2026-10-07T10:00:00Z",
+        quality=192,
+    )
+    res = pub.publish_single(payload)
+    assert res.status == "published"
+    assert res.value == 123.45
+    assert res.pi_point == "SPEED_TAG"
+    assert res.http_status == 200
+
+    # Batch
+    batch_res = pub.publish_batch([payload])
+    assert len(batch_res) == 1
+    assert batch_res[0].status == "published"
+
+
+def test_pi_publisher_real_http_success_and_error():
+    import io
+    pub = PiPublisher(base_url="http://10.247.224.39/piwebapi", data_server="PIMS", simulated=False)
+    payload = PiValuePayload(
+        opc_item_path="Line1.Speed",
+        pi_point="SPEED_TAG",
+        value=500.0,
+        quality=192,
+    )
+
+    # 1. Success mock
+    mock_resp = MagicMock()
+    mock_resp.status = 202
+    mock_resp.getcode.return_value = 202
+    mock_resp.read.return_value = b"{}"
+    mock_resp.__enter__.return_value = mock_resp
+    with patch("urllib.request.urlopen", return_value=mock_resp):
+        res = pub.publish_single(payload)
+        assert res.status == "published"
+        assert res.http_status == 202
+
+    # 2. HTTP 404 Point Not Found error mock
+    mock_err = urllib.error.HTTPError(
+        url="http://10.247.224.39/piwebapi/streams/recorded",
+        code=404,
+        msg="Not Found",
+        hdrs={},
+        fp=io.BytesIO(b"{}"),
+    )
+    with patch("urllib.request.urlopen", side_effect=mock_err):
+        res_err = pub.publish_single(payload)
+        assert res_err.status == "error"
+        assert "não encontrado no servidor PIMS" in res_err.error
+        assert res_err.http_status == 404
+
+    # 3. HTTP 401 Unauthorized mock
+    mock_auth_err = urllib.error.HTTPError(
+        url="http://10.247.224.39/piwebapi/streams/recorded",
+        code=401,
+        msg="Unauthorized",
+        hdrs={},
+        fp=io.BytesIO(b"{}"),
+    )
+    with patch("urllib.request.urlopen", side_effect=mock_auth_err):
+        res_auth = pub.publish_single(payload)
+        assert res_auth.status == "error"
+        assert "Acesso não autorizado ao PI Web API (HTTP 401)" in res_auth.error
+        assert res_auth.http_status == 401
+
+    # 4. Empty point name
+    empty_payload = PiValuePayload(
+        opc_item_path="Line1.Speed",
+        pi_point="",
+        value=500.0,
+    )
+    res_empty = pub.publish_single(empty_payload)
+    assert res_empty.status == "error"
+    assert res_empty.error == "Ponto PI de destino não informado"
 
 
 def test_create_pi_output_channel_factory(monkeypatch):

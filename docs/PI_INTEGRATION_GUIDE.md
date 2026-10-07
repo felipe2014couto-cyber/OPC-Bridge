@@ -39,6 +39,7 @@ As seguintes variáveis de ambiente devem ser configuradas externamente (fora do
 | `OPC_BRIDGE_PI_OUTPUT_ENABLED` | Booleano | `false` | **Kill switch mandatório.** Apenas `"true"` habilita chamadas de rede reais ao PI. |
 | `OPC_BRIDGE_PI_OUTPUT_MODE` | String | `simulated` | Modo de operação: `simulated` (seguro/testes) ou `web_api` (PI Web API real). |
 | `OPC_BRIDGE_PI_WEB_API_URL` | String | `""` | URL base do PI Web API (ex: `https://piserver.corp.local/piwebapi`). |
+| `OPC_BRIDGE_PI_DATA_SERVER` | String | `PIMS` | Nome do PI Data Server para o path canônico (`\\dataserver\point`). |
 | `OPC_BRIDGE_PI_WEB_API_AUTH_TYPE` | String | `basic` | Tipo de autenticação: `basic`, `bearer` ou `anonymous`. |
 | `OPC_BRIDGE_PI_WEB_API_USERNAME` | String | `""` | Nome de usuário de serviço para Basic Auth. |
 | `OPC_BRIDGE_PI_WEB_API_PASSWORD` | String | `""` | Senha de serviço para Basic Auth. |
@@ -60,6 +61,7 @@ No servidor de produção (fora do diretório versionado):
 OPC_BRIDGE_PI_OUTPUT_ENABLED=true
 OPC_BRIDGE_PI_OUTPUT_MODE=web_api
 OPC_BRIDGE_PI_WEB_API_URL=https://piwebapi.empresa.local/piwebapi
+OPC_BRIDGE_PI_DATA_SERVER=PIMS
 OPC_BRIDGE_PI_WEB_API_AUTH_TYPE=basic
 OPC_BRIDGE_PI_WEB_API_USERNAME=svc_opcbridge_pi
 OPC_BRIDGE_PI_WEB_API_PASSWORD=SegredoForteAqui123!

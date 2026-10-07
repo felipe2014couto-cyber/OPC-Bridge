@@ -45,8 +45,8 @@ def sanitize_error_message(msg: Any) -> str:
     return text
 
 
-def format_iso_timestamp(ts: Any) -> str:
-    """Format any timestamp representation into ISO 8601 UTC string."""
+def format_pi_timestamp(ts: Any) -> str:
+    """Format any timestamp representation into ISO 8601 UTC string for PI Web API."""
     if ts is None:
         return datetime.now(timezone.utc).isoformat()
     if isinstance(ts, datetime):
@@ -69,12 +69,62 @@ def format_iso_timestamp(ts: Any) -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# Backwards compatibility alias
+format_iso_timestamp = format_pi_timestamp
+
+
+def default_pi_point_name(opc_item_path: str, configured_pi_point: str | None = None) -> str:
+    """Derive default target PI Point name from OPC tag path or configured name."""
+    if configured_pi_point and configured_pi_point.strip():
+        return configured_pi_point.strip()
+    clean = (opc_item_path or "").strip()
+    if not clean:
+        return ""
+    # In industrial setups, the last segment after '.' is typically the tag name
+    # e.g., Pims_A40:gUsw.ToPims.DIAMETRO_CALC_BOBIN -> DIAMETRO_CALC_BOBIN
+    parts = clean.split(".")
+    candidate = parts[-1].strip()
+    return candidate if candidate else clean
+
+
+@dataclass
+class PiValuePayload:
+    opc_item_path: str
+    pi_point: str
+    value: Any
+    timestamp: Any = None
+    quality: int | None = None
+
+
+@dataclass
+class PiPublishResult:
+    opc_item_path: str
+    pi_point: str
+    value: Any
+    status: str  # "published", "error", "skipped"
+    error: str | None = None
+    timestamp: str | None = None
+    http_status: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "opc_item_path": self.opc_item_path,
+            "pi_point": self.pi_point,
+            "value": self.value,
+            "status": self.status,
+            "error": self.error,
+            "timestamp": self.timestamp,
+            "http_status": self.http_status,
+        }
+
+
 @dataclass
 class PiOutputConfig:
     """Configuration for PI output channel loaded exclusively from external environment."""
     enabled: bool = False
     mode: str = "simulated"  # "simulated" or "web_api"
     base_url: str = ""       # e.g. "https://piserver.corp.local/piwebapi"
+    data_server: str = "PIMS" # e.g. "PIMS"
     auth_type: str = "basic" # "basic", "bearer", "anonymous"
     username: str = ""
     password: str = ""
@@ -91,16 +141,32 @@ class PiOutputConfig:
         mode_raw = os.getenv("OPC_BRIDGE_PI_OUTPUT_MODE", "simulated").strip().lower()
         mode = "web_api" if mode_raw == "web_api" else "simulated"
 
-        base_url = os.getenv("OPC_BRIDGE_PI_WEB_API_URL", "").strip().rstrip("/")
-        auth_type = os.getenv("OPC_BRIDGE_PI_WEB_API_AUTH_TYPE", "basic").strip().lower()
-        if auth_type not in ("basic", "bearer", "anonymous"):
+        base_url = (
+            os.getenv("OPC_BRIDGE_PI_WEB_API_URL")
+            or os.getenv("PI_WEB_API_BASE_URL", "")
+        ).strip().rstrip("/")
+
+        data_server = (
+            os.getenv("OPC_BRIDGE_PI_DATA_SERVER")
+            or os.getenv("PI_DATA_SERVER_NAME", "PIMS")
+        ).strip()
+        if not data_server:
+            data_server = "PIMS"
+
+        auth_type = (
+            os.getenv("OPC_BRIDGE_PI_WEB_API_AUTH_TYPE")
+            or os.getenv("PI_WEB_API_AUTH_MODE", "basic")
+        ).strip().lower()
+        if auth_type in ("none", "anonymous"):
+            auth_type = "anonymous"
+        elif auth_type not in ("basic", "bearer"):
             auth_type = "basic"
 
-        username = os.getenv("OPC_BRIDGE_PI_WEB_API_USERNAME", "")
-        password = os.getenv("OPC_BRIDGE_PI_WEB_API_PASSWORD", "")
+        username = os.getenv("OPC_BRIDGE_PI_WEB_API_USERNAME") or os.getenv("PI_WEB_API_USERNAME", "")
+        password = os.getenv("OPC_BRIDGE_PI_WEB_API_PASSWORD") or os.getenv("PI_WEB_API_PASSWORD", "")
         bearer_token = os.getenv("OPC_BRIDGE_PI_WEB_API_BEARER_TOKEN", "")
 
-        timeout_raw = os.getenv("OPC_BRIDGE_PI_WEB_API_TIMEOUT_SECONDS", "10.0")
+        timeout_raw = os.getenv("OPC_BRIDGE_PI_WEB_API_TIMEOUT_SECONDS") or os.getenv("PI_WEB_API_TIMEOUT_SECONDS", "10.0")
         try:
             timeout_seconds = max(1.0, float(timeout_raw))
         except (ValueError, TypeError):
@@ -117,6 +183,7 @@ class PiOutputConfig:
             enabled=enabled,
             mode=mode,
             base_url=base_url,
+            data_server=data_server,
             auth_type=auth_type,
             username=username,
             password=password,
@@ -227,11 +294,126 @@ class SimulatedPiOutputChannel(PiOutputChannel):
 
 
 class PiWebApiOutputChannel(PiOutputChannel):
-    """Production output channel publishing to OSIsoft/AVEVA PI Web API via HTTPS."""
+    """Production output channel publishing to OSIsoft/AVEVA PI Web API via HTTPS.
 
-    def __init__(self, config: PiOutputConfig) -> None:
-        self.config = config
-        self._web_id_cache: dict[str, str] = {}
+    Functional model aligned with OSIsoft/AVEVA PI Web API recorded streams endpoint:
+    POST {base_url}/streams/recorded?path=\\{data_server}\\{pi_point}
+    """
+
+    def __init__(
+        self,
+        config: Optional[PiOutputConfig] = None,
+        *,
+        base_url: Optional[str] = None,
+        data_server: Optional[str] = None,
+        auth_mode: Optional[str] = None,
+        username: Optional[str] = None,
+        password: Optional[str] = None,
+        verify_ssl: Optional[bool] = None,
+        timeout_seconds: Optional[float] = None,
+        simulated: Optional[bool] = None,
+        enabled: Optional[bool] = None,
+    ) -> None:
+        if config is not None:
+            self.config = config
+        else:
+            env_sim = os.environ.get("PI_PUBLISH_SIMULATED", "false").lower() in ("true", "1", "yes")
+            is_sim = simulated if simulated is not None else env_sim
+
+            if enabled is not None:
+                eff_enabled = enabled
+            elif simulated is not None:
+                eff_enabled = not is_sim
+            else:
+                eff_enabled = os.environ.get("OPC_BRIDGE_PI_OUTPUT_ENABLED", "false").lower() == "true"
+
+            eff_base_url = (base_url or os.environ.get("PI_WEB_API_BASE_URL") or os.environ.get("OPC_BRIDGE_PI_WEB_API_URL", "http://10.247.224.39/piwebapi")).rstrip("/")
+            eff_data_server = data_server or os.environ.get("PI_DATA_SERVER_NAME") or os.environ.get("OPC_BRIDGE_PI_DATA_SERVER", "PIMS")
+            eff_auth_type = (auth_mode or os.environ.get("PI_WEB_API_AUTH_MODE") or os.environ.get("OPC_BRIDGE_PI_WEB_API_AUTH_TYPE", "basic")).lower()
+            eff_username = username or os.environ.get("PI_WEB_API_USERNAME") or os.environ.get("OPC_BRIDGE_PI_WEB_API_USERNAME", "")
+            eff_password = password or os.environ.get("PI_WEB_API_PASSWORD") or os.environ.get("OPC_BRIDGE_PI_WEB_API_PASSWORD", "")
+            eff_verify_ssl = verify_ssl if verify_ssl is not None else (os.environ.get("OPC_BRIDGE_PI_WEB_API_VERIFY_SSL", "false").lower() in ("true", "1"))
+            eff_timeout = timeout_seconds if timeout_seconds is not None else float(os.environ.get("OPC_BRIDGE_PI_WEB_API_TIMEOUT_SECONDS", "10.0"))
+
+            self.config = PiOutputConfig(
+                enabled=eff_enabled,
+                mode="simulated" if is_sim else "web_api",
+                base_url=eff_base_url,
+                data_server=eff_data_server,
+                auth_type=eff_auth_type,
+                username=eff_username,
+                password=eff_password,
+                verify_ssl=eff_verify_ssl,
+                timeout_seconds=eff_timeout,
+            )
+
+    @property
+    def base_url(self) -> str:
+        return self.config.base_url
+
+    @base_url.setter
+    def base_url(self, val: str) -> None:
+        self.config.base_url = (val or "").rstrip("/")
+
+    @property
+    def data_server(self) -> str:
+        return self.config.data_server
+
+    @data_server.setter
+    def data_server(self, val: str) -> None:
+        self.config.data_server = val or "PIMS"
+
+    @property
+    def auth_mode(self) -> str:
+        return self.config.auth_type
+
+    @auth_mode.setter
+    def auth_mode(self, val: str) -> None:
+        self.config.auth_type = val
+
+    @property
+    def username(self) -> str:
+        return self.config.username
+
+    @username.setter
+    def username(self, val: str) -> None:
+        self.config.username = val
+
+    @property
+    def password(self) -> str:
+        return self.config.password
+
+    @password.setter
+    def password(self, val: str) -> None:
+        self.config.password = val
+
+    @property
+    def verify_ssl(self) -> bool:
+        return self.config.verify_ssl
+
+    @verify_ssl.setter
+    def verify_ssl(self, val: bool) -> None:
+        self.config.verify_ssl = val
+
+    @property
+    def timeout_seconds(self) -> float:
+        return self.config.timeout_seconds
+
+    @timeout_seconds.setter
+    def timeout_seconds(self, val: float) -> None:
+        self.config.timeout_seconds = val
+
+    @property
+    def simulated(self) -> bool:
+        return not self.config.enabled or self.config.mode == "simulated"
+
+    @simulated.setter
+    def simulated(self, val: bool) -> None:
+        if val:
+            self.config.mode = "simulated"
+        else:
+            self.config.mode = "web_api"
+            self.config.enabled = True
 
     def _build_request(self, url: str, method: str, body: Optional[dict[str, Any]] = None) -> urllib.request.Request:
         headers: dict[str, str] = {
@@ -242,11 +424,11 @@ class PiWebApiOutputChannel(PiOutputChannel):
         data_bytes = None
         if body is not None:
             headers["Content-Type"] = "application/json; charset=utf-8"
-            data_bytes = json.dumps(body).encode("utf-8")
+            data_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
 
-        if self.config.auth_type == "basic" and self.config.username:
-            user_pass = f"{self.config.username}:{self.config.password}"
-            encoded = base64.b64encode(user_pass.encode("utf-8")).decode("ascii")
+        if (self.config.auth_type == "basic" or self.auth_mode == "basic") and self.username:
+            user_pass = f"{self.username}:{self.password}".encode("utf-8")
+            encoded = base64.b64encode(user_pass).decode("ascii")
             headers["Authorization"] = f"Basic {encoded}"
         elif self.config.auth_type == "bearer" and self.config.bearer_token:
             headers["Authorization"] = f"Bearer {self.config.bearer_token}"
@@ -271,7 +453,7 @@ class PiWebApiOutputChannel(PiOutputChannel):
 
         ssl_ctx = self._get_ssl_context()
         with urllib.request.urlopen(req, timeout=self.config.timeout_seconds, context=ssl_ctx) as response:
-            code = response.getcode()
+            code = getattr(response, "status", None) or response.getcode()
             body_bytes = response.read()
             if not body_bytes:
                 return code, {}
@@ -279,6 +461,201 @@ class PiWebApiOutputChannel(PiOutputChannel):
                 return code, json.loads(body_bytes.decode("utf-8"))
             except Exception:
                 return code, {"raw": body_bytes.decode("utf-8", errors="replace")}
+
+    def _resolve_stream_url(self, pi_point_name: str) -> str:
+        """Build PI Web API recorded streams URL by path for the target PI Point."""
+        path_param = f"\\\\{self.data_server}\\{pi_point_name.strip()}"
+        return f"{self.base_url}/streams/recorded?path={urllib.parse.quote(path_param)}"
+
+    def publish(
+        self,
+        pi_point_name: str,
+        value: Any,
+        timestamp: Optional[Any] = None,
+        quality: Optional[int] = None,
+        point_source: str = "",
+        location1: int = 0,
+    ) -> PiOutputResult:
+        iso_ts = format_pi_timestamp(timestamp)
+
+        clean_point = (pi_point_name or "").strip()
+        if not clean_point:
+            return PiOutputResult(
+                pi_point_name="",
+                value=value,
+                status="Erro",
+                timestamp=iso_ts,
+                point_source=point_source,
+                location1=location1,
+                error="Ponto PI de destino não informado",
+                details={},
+            )
+
+        # KILL-SWITCH CHECK: Mandatory Industrial Safety
+        if not self.config.enabled:
+            logger.info("Saída PI desabilitada")
+            return PiOutputResult(
+                pi_point_name=clean_point,
+                value=value,
+                status="Desabilitado",
+                timestamp=iso_ts,
+                point_source=point_source,
+                location1=location1,
+                error="Saída PI desabilitada",
+                details={"enabled": False},
+            )
+
+        if not self.config.base_url:
+            return PiOutputResult(
+                pi_point_name=clean_point,
+                value=value,
+                status="Erro",
+                timestamp=iso_ts,
+                point_source=point_source,
+                location1=location1,
+                error="URL base do PI Web API não configurada",
+                details={"missing_config": "OPC_BRIDGE_PI_WEB_API_URL"},
+            )
+
+        is_good = bool(quality is None or quality >= 192)
+        stream_payload = {
+            "Timestamp": iso_ts,
+            "Value": value,
+            "Good": is_good,
+        }
+
+        try:
+            target_url = self._resolve_stream_url(clean_point)
+            req = self._build_request(target_url, "POST", body=stream_payload)
+            code, resp_data = self._execute_http(req)
+
+            if code in (200, 201, 202, 204):
+                logger.info("PI publish success: %s = %s (HTTP %d)", clean_point, value, code)
+                return PiOutputResult(
+                    pi_point_name=clean_point,
+                    value=value,
+                    status="Publicado",
+                    timestamp=iso_ts,
+                    point_source=point_source,
+                    location1=location1,
+                    error=None,
+                    details={"status_code": code, "web_api": True},
+                )
+            sanitized_body = sanitize_error_message(resp_data)
+            err_msg = f"PI Web API retornou HTTP {code}"
+            if sanitized_body:
+                err_msg += f": {sanitized_body}"
+            logger.warning("PI publish rejected for %s: %s", clean_point, err_msg)
+            return PiOutputResult(
+                pi_point_name=clean_point,
+                value=value,
+                status="Erro",
+                timestamp=iso_ts,
+                point_source=point_source,
+                location1=location1,
+                error=err_msg,
+                details={"status_code": code},
+            )
+
+        except urllib.error.HTTPError as exc:
+            err_msg = f"HTTP {exc.code}: {exc.reason}"
+            if exc.code == 404:
+                err_msg = f"Ponto PI '{clean_point}' não encontrado no servidor {self.data_server} (HTTP 404)"
+            elif exc.code in (401, 403):
+                err_msg = f"Acesso não autorizado ao PI Web API (HTTP {exc.code})"
+            sanitized = sanitize_error_message(err_msg)
+            logger.warning("PI publish HTTP error for %s: %s", clean_point, sanitized)
+            return PiOutputResult(
+                pi_point_name=clean_point,
+                value=value,
+                status="Erro",
+                timestamp=iso_ts,
+                point_source=point_source,
+                location1=location1,
+                error=sanitized,
+                details={"status_code": exc.code},
+            )
+        except Exception as exc:
+            err_msg = f"Falha de conexão com PI Web API ({self.base_url}): {exc}"
+            sanitized = sanitize_error_message(err_msg)
+            logger.exception("PI publish connection failure for %s", clean_point)
+            return PiOutputResult(
+                pi_point_name=clean_point,
+                value=value,
+                status="Erro",
+                timestamp=iso_ts,
+                point_source=point_source,
+                location1=location1,
+                error=sanitized,
+                details={},
+            )
+
+    def publish_single(self, item: PiValuePayload) -> PiPublishResult:
+        """Publish a single already-read OPC value into the target PI Point."""
+        ts_str = format_pi_timestamp(item.timestamp)
+
+        clean_point = (item.pi_point or "").strip()
+        if not clean_point:
+            return PiPublishResult(
+                opc_item_path=item.opc_item_path,
+                pi_point="",
+                value=item.value,
+                status="error",
+                error="Ponto PI de destino não informado",
+                timestamp=ts_str,
+            )
+
+        if not self.config.enabled and self.config.mode != "simulated":
+            logger.info("Saída PI desabilitada")
+            return PiPublishResult(
+                opc_item_path=item.opc_item_path,
+                pi_point=clean_point,
+                value=item.value,
+                status="error",
+                error="Saída PI desabilitada",
+                timestamp=ts_str,
+                http_status=None,
+            )
+
+        if self.simulated:
+            logger.info(
+                "Simulating PI publication: opc=%s -> pi=%s, val=%s, ts=%s",
+                item.opc_item_path,
+                clean_point,
+                item.value,
+                ts_str,
+            )
+            return PiPublishResult(
+                opc_item_path=item.opc_item_path,
+                pi_point=clean_point,
+                value=item.value,
+                status="published",
+                error=None,
+                timestamp=ts_str,
+                http_status=200,
+            )
+
+        out_res = self.publish(
+            pi_point_name=clean_point,
+            value=item.value,
+            timestamp=item.timestamp,
+            quality=item.quality,
+        )
+
+        status_str = "published" if out_res.status == "Publicado" else "error"
+        return PiPublishResult(
+            opc_item_path=item.opc_item_path,
+            pi_point=clean_point,
+            value=item.value,
+            status=status_str,
+            error=out_res.error,
+            timestamp=out_res.timestamp,
+            http_status=out_res.details.get("status_code"),
+        )
+
+    def publish_batch(self, items: list[PiValuePayload]) -> list[PiPublishResult]:
+        """Publish a batch of already-read values to PI Points."""
+        return [self.publish_single(it) for it in items]
 
     def test_connection(self) -> dict[str, Any]:
         """Query PI Web API read-only health/system endpoint without writing any process data."""
@@ -338,135 +715,35 @@ class PiWebApiOutputChannel(PiOutputChannel):
                 "message": f"Erro de comunicação com PI Web API: {sanitized}.",
             }
 
-    def _resolve_stream_url(self, pi_point_name: str) -> str:
-        """Resolve destination PI Web API stream URL, caching WebId when discovered."""
-        if pi_point_name in self._web_id_cache:
-            return f"{self.config.base_url}/streams/{self._web_id_cache[pi_point_name]}/value"
 
-        # Query points search
-        try:
-            encoded_name = urllib.parse.quote(pi_point_name)
-            search_url = f"{self.config.base_url}/points/search?query=name:{encoded_name}"
-            req = self._build_request(search_url, "GET")
-            code, data = self._execute_http(req)
-            if 200 <= code < 300 and isinstance(data, dict):
-                items = data.get("Items", [])
-                if items and isinstance(items[0], dict) and items[0].get("WebId"):
-                    web_id = items[0]["WebId"]
-                    self._web_id_cache[pi_point_name] = web_id
-                    return f"{self.config.base_url}/streams/{web_id}/value"
-                if data.get("WebId"):
-                    web_id = data["WebId"]
-                    self._web_id_cache[pi_point_name] = web_id
-                    return f"{self.config.base_url}/streams/{web_id}/value"
-        except Exception as exc:
-            logger.debug("WebId resolution skipped for %s: %s", pi_point_name, sanitize_error_message(exc))
+class PiPublisher(PiWebApiOutputChannel):
+    """Client for publishing read process values into OSIsoft / AVEVA PI Web API."""
 
-        # Direct point stream endpoint fallback (standard in mocks and proxies)
-        encoded_name = urllib.parse.quote(pi_point_name)
-        return f"{self.config.base_url}/streams/{encoded_name}/value"
-
-    def publish(
+    def __init__(
         self,
-        pi_point_name: str,
-        value: Any,
-        timestamp: Optional[Any] = None,
-        quality: Optional[int] = None,
-        point_source: str = "",
-        location1: int = 0,
-    ) -> PiOutputResult:
-        iso_ts = format_iso_timestamp(timestamp)
-
-        # KILL-SWITCH CHECK
-        if not self.config.enabled:
-            logger.info("Saída PI desabilitada")
-            return PiOutputResult(
-                pi_point_name=pi_point_name,
-                value=value,
-                status="Desabilitado",
-                timestamp=iso_ts,
-                point_source=point_source,
-                location1=location1,
-                error="Saída PI desabilitada",
-                details={"enabled": False},
-            )
-
-        if not self.config.base_url:
-            return PiOutputResult(
-                pi_point_name=pi_point_name,
-                value=value,
-                status="Erro",
-                timestamp=iso_ts,
-                point_source=point_source,
-                location1=location1,
-                error="URL base do PI Web API não configurada",
-                details={"missing_config": "OPC_BRIDGE_PI_WEB_API_URL"},
-            )
-
-        is_good = quality is None or quality >= 192
-        stream_payload = {
-            "Timestamp": iso_ts,
-            "Value": value,
-            "Good": is_good,
-        }
-
-        try:
-            target_url = self._resolve_stream_url(pi_point_name)
-            req = self._build_request(target_url, "POST", body=stream_payload)
-            code, resp_data = self._execute_http(req)
-
-            if 200 <= code < 300:
-                logger.info("PI Web API publish success: %s = %s (%s)", pi_point_name, value, iso_ts)
-                return PiOutputResult(
-                    pi_point_name=pi_point_name,
-                    value=value,
-                    status="Publicado",
-                    timestamp=iso_ts,
-                    point_source=point_source,
-                    location1=location1,
-                    error=None,
-                    details={"status_code": code, "web_api": True},
-                )
-            sanitized_body = sanitize_error_message(resp_data)
-            err_msg = f"HTTP {code}: {sanitized_body}"
-            logger.warning("PI Web API publish rejected (%s): %s", pi_point_name, err_msg)
-            return PiOutputResult(
-                pi_point_name=pi_point_name,
-                value=value,
-                status="Erro",
-                timestamp=iso_ts,
-                point_source=point_source,
-                location1=location1,
-                error=err_msg,
-                details={"status_code": code},
-            )
-
-        except urllib.error.HTTPError as exc:
-            err_msg = sanitize_error_message(f"HTTP {exc.code} {exc.reason}")
-            logger.warning("PI Web API publish error for %s: %s", pi_point_name, err_msg)
-            return PiOutputResult(
-                pi_point_name=pi_point_name,
-                value=value,
-                status="Erro",
-                timestamp=iso_ts,
-                point_source=point_source,
-                location1=location1,
-                error=err_msg,
-                details={"status_code": exc.code},
-            )
-        except Exception as exc:
-            err_msg = sanitize_error_message(str(exc))
-            logger.warning("PI Web API publish connection failure for %s: %s", pi_point_name, err_msg)
-            return PiOutputResult(
-                pi_point_name=pi_point_name,
-                value=value,
-                status="Erro",
-                timestamp=iso_ts,
-                point_source=point_source,
-                location1=location1,
-                error=err_msg,
-                details={},
-            )
+        base_url: str | None = None,
+        data_server: str | None = None,
+        auth_mode: str | None = None,
+        username: str | None = None,
+        password: str | None = None,
+        verify_ssl: bool = False,
+        timeout_seconds: float = 10.0,
+        simulated: bool = False,
+        config: Optional[PiOutputConfig] = None,
+        enabled: Optional[bool] = None,
+    ) -> None:
+        super().__init__(
+            config=config,
+            base_url=base_url,
+            data_server=data_server,
+            auth_mode=auth_mode,
+            username=username,
+            password=password,
+            verify_ssl=verify_ssl,
+            timeout_seconds=timeout_seconds,
+            simulated=simulated,
+            enabled=enabled,
+        )
 
 
 def create_pi_output_channel(config: Optional[PiOutputConfig] = None) -> PiOutputChannel:
