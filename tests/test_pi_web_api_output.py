@@ -76,7 +76,7 @@ def pi_runtime(tmp_path, monkeypatch):
         repo.add_pi_profile(
             profile_id="prof-unit",
             equipment_id="eq-unit",
-            opc_config_id="cfg-unit",
+            opc_prog_id="ABB.AfwOpcDaSurrogate.1",
             point_source="OPC",
             location1=1,
             enabled=True,
@@ -85,12 +85,9 @@ def pi_runtime(tmp_path, monkeypatch):
         repo.add_pi_mapping(
             mapping_id="map-unit-1",
             equipment_id="eq-unit",
-            opc_config_id="cfg-unit",
+            opc_prog_id="ABB.AfwOpcDaSurrogate.1",
             opc_item_path="TAG.BOBINADEIRA.PESO",
-            item_id=1,
             pi_point_name="PI_BOBIN_PESO",
-            point_source="OPC",
-            location1=1,
             publish_interval_ms=2000,
             enabled=True,
         )

@@ -81,7 +81,11 @@ class PiPublisherService:
 
         # Gather cached live values for relevant agents (pure read-only from memory cache)
         live_cache: dict[tuple[str, str], dict[str, Any]] = {}
+        admin_cache: dict[tuple[str, str, str], dict[str, Any]] = {}
         if self.bridge_server is not None:
+            admin_app = getattr(self.bridge_server, "_admin_app", None)
+            if admin_app is not None and hasattr(admin_app, "_pi_live_values"):
+                admin_cache = admin_app._pi_live_values
             seen_agents = {m["agent_id"] for m in mappings if m.get("agent_id")}
             for ag_id in seen_agents:
                 try:
@@ -99,8 +103,10 @@ class PiPublisherService:
                 continue
 
             ag_id = m.get("agent_id") or ""
+            eq_id = m.get("equipment_id") or ""
+            prog_id = m.get("opc_prog_id") or ""
             opc_tag = m.get("opc_item_path") or ""
-            live_item = live_cache.get((ag_id, opc_tag))
+            live_item = admin_cache.get((eq_id, prog_id, opc_tag)) or live_cache.get((ag_id, opc_tag))
 
             try:
                 eval_res = evaluate_mapping_publication(

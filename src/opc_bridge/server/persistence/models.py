@@ -102,7 +102,7 @@ class NamedOpcConfig:
 class PiMapping:
     mapping_id: str
     equipment_id: str
-    opc_config_id: str
+    opc_prog_id: str
     opc_item_path: str
     item_id: int
     pi_point_name: str
@@ -110,6 +110,7 @@ class PiMapping:
     location1: int
     publish_interval_ms: int
     enabled: bool = True
+    profile_id: Optional[str] = None
     last_publish_status: str = "Não configurado"
     last_published_at: Optional[str] = None
     last_published_value: Optional[str] = None
@@ -124,7 +125,7 @@ class PiMapping:
 class PiProfile:
     profile_id: str
     equipment_id: str
-    opc_config_id: str
+    opc_prog_id: str
     point_source: str
     location1: int
     enabled: bool = True

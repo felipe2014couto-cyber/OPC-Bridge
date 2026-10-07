@@ -104,6 +104,8 @@ class AdminApplication(TagAdministration, PiIntegrationAdministration):
     def __init__(self, database: Database, bridge_server: BridgeServer | None = None) -> None:
         self._database = database
         self._bridge_server = bridge_server
+        if bridge_server is not None:
+            bridge_server._admin_app = self
         self._admin_token = _configured_admin_token().encode("utf-8")
         self._service_version = _service_version()
         self.init_tag_ui()

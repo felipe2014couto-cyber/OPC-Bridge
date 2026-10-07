@@ -4,9 +4,10 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from typing import Any, Optional
+from typing import Any, List, Optional
 from urllib.parse import parse_qs
 
+from opc_bridge.protocol.inspection import InspectionRequest, InspectionResponse
 from opc_bridge.server.admin.tags import read_json
 from opc_bridge.server.pi_output import (
     PiOutputChannel,
@@ -22,10 +23,10 @@ logger = logging.getLogger(__name__)
 
 def validate_pi_mapping_input(
     data: dict[str, Any],
-    config: dict[str, Any],
     profile: Optional[dict[str, Any]] = None,
+    config: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
-    """Validate mapping payload and ensure publish_interval_ms >= config.interval_ms.
+    """Validate mapping payload and ensure publish_interval_ms is between 1000 and 60000 ms.
 
     PointSource and Location1 are inherited from the mandatory PI profile.
     """
@@ -60,11 +61,6 @@ def validate_pi_mapping_input(
     if not 1000 <= raw_interval <= 60000:
         raise ValueError("invalid_publish_interval_bounds")
 
-    # Critical industrial safety rule: publication rate cannot be faster than OPC update rate
-    opc_rate = config.get("interval_ms") or config.get("opc_interval_ms") or 1000
-    if raw_interval < opc_rate:
-        raise ValueError("interval_faster_than_opc")
-
     raw_enabled = data.get("enabled", True)
     enabled = bool(raw_enabled) if raw_enabled is not None else True
 
@@ -88,11 +84,39 @@ class PiIntegrationAdministration:
     def _get_pi_output_channel(self) -> PiOutputChannel:
         if getattr(self, "_pi_output_channel", None) is not None:
             return self._pi_output_channel
-        pub = getattr(self._bridge_server, "_pi_publisher", None) if getattr(self, "_bridge_server", None) else None
+        pub = (
+            getattr(self._bridge_server, "_pi_publisher", None)
+            if getattr(self, "_bridge_server", None)
+            else None
+        )
         if pub is not None and getattr(pub, "channel", None) is not None:
             return pub.channel
         cfg = self._get_pi_output_config()
         return create_pi_output_channel(cfg)
+
+    def _get_pi_live_cache(self) -> dict[tuple[str, str, str], dict[str, Any]]:
+        if not hasattr(self, "_pi_live_values"):
+            self._pi_live_values = {}
+        return self._pi_live_values
+
+    def _get_live_item(
+        self, equipment_id: str, opc_prog_id: str, opc_item_path: str, agent_id: Optional[str] = None
+    ) -> Optional[dict[str, Any]]:
+        cache = self._get_pi_live_cache()
+        live_it = cache.get((equipment_id, opc_prog_id, opc_item_path))
+        if live_it:
+            return live_it
+        if not agent_id and equipment_id:
+            with self._database.session() as repo:
+                eq = repo.get_equipment(equipment_id)
+                if eq:
+                    agent_id = eq.get("agent_id")
+        if agent_id and self._bridge_server:
+            live_data = self._bridge_server.get_live_values(agent_id) or {}
+            for it in live_data.get("items", []):
+                if it.get("opc_item_path") == opc_item_path:
+                    return it
+        return None
 
     def pi_integration_route(
         self, method: str, path: str, query: str, environ: dict[str, Any], start_response
@@ -132,6 +156,120 @@ class PiIntegrationAdministration:
                 test_result,
             )
 
+        # 3. GET /api/v1/pi-integration/discover-servers?equipment_id=<id>
+        if len(parts) == 1 and parts[0] == "discover-servers":
+            if method != "GET":
+                return self._json_response(start_response, "405 Method Not Allowed", {"error": "method_not_allowed"})
+            params = parse_qs(query) if query else {}
+            equipment_id = params.get("equipment_id", [None])[0]
+            if not equipment_id:
+                return self._json_response(
+                    start_response, "400 Bad Request", {"error": "missing_equipment_id", "message": "Equipamento obrigatório."}
+                )
+            with self._database.session() as repo:
+                eq = repo.get_equipment(equipment_id)
+            if eq is None:
+                return self._json_response(start_response, "404 Not Found", {"error": "equipment_not_found"})
+
+            agent_id = eq.get("agent_id")
+            if not agent_id or self._bridge_server is None:
+                return self._json_response(
+                    start_response,
+                    "200 OK",
+                    {"servers": [], "message": "Nenhum agente vinculado ao equipamento selecionado."},
+                )
+
+            try:
+                req = InspectionRequest(str(uuid.uuid4()), action="servers")
+                resp = self._bridge_server.inspect_agent_threadsafe(agent_id, req)
+                servers = resp.servers or []
+                return self._json_response(start_response, "200 OK", {"servers": servers})
+            except Exception as exc:
+                sanitized = sanitize_error_message(exc)
+                logger.warning("Falha na descoberta de servidores OPC para equipamento %s: %s", equipment_id, sanitized)
+                return self._json_response(
+                    start_response, "200 OK", {"servers": [], "warning": f"Não foi possível listar servidores: {sanitized}."}
+                )
+
+        # 4. POST /api/v1/pi-integration/read-now
+        if len(parts) == 1 and parts[0] == "read-now":
+            if method != "POST":
+                return self._json_response(start_response, "405 Method Not Allowed", {"error": "method_not_allowed"})
+            try:
+                data = read_json(environ)
+            except Exception:
+                return self._json_response(start_response, "400 Bad Request", {"error": "invalid_json"})
+
+            equipment_id = str(data.get("equipment_id") or "").strip()
+            opc_prog_id = str(data.get("opc_prog_id") or "").strip()
+            raw_tags = data.get("tags") or []
+            tags = [str(t).strip() for t in raw_tags if str(t).strip()]
+
+            if not equipment_id or not opc_prog_id or not tags:
+                return self._json_response(
+                    start_response,
+                    "400 Bad Request",
+                    {
+                        "error": "missing_required_fields",
+                        "message": "Equipamento, Servidor OPC e lista de tags são obrigatórios para leitura.",
+                    },
+                )
+
+            with self._database.session() as repo:
+                eq = repo.get_equipment(equipment_id)
+            if eq is None:
+                return self._json_response(start_response, "404 Not Found", {"error": "equipment_not_found"})
+
+            agent_id = eq.get("agent_id")
+            if not agent_id or self._bridge_server is None:
+                return self._json_response(
+                    start_response,
+                    "409 Conflict",
+                    {
+                        "error": "agent_unavailable",
+                        "message": "Nenhum agente online conectado ao equipamento para leitura OPC.",
+                    },
+                )
+
+            # Chunk tags into batches of up to 50
+            all_results: List[dict[str, Any]] = []
+            chunk_size = 50
+            for i in range(0, len(tags), chunk_size):
+                chunk = tags[i:i + chunk_size]
+                try:
+                    req = InspectionRequest(str(uuid.uuid4()), action="tags", opc_prog_id=opc_prog_id, tags=chunk)
+                    resp = self._bridge_server.inspect_agent_threadsafe(agent_id, req)
+                    chunk_results = resp.results or []
+                    all_results.extend(chunk_results)
+                except Exception as exc:
+                    err_msg = sanitize_error_message(exc)
+                    logger.warning("Falha na leitura OPC isolada para tags %s: %s", chunk, err_msg)
+                    for tag in chunk:
+                        all_results.append({
+                            "opc_item_path": tag,
+                            "status": "error",
+                            "value": None,
+                            "quality": None,
+                            "quality_text": None,
+                            "opc_timestamp": None,
+                            "error": err_msg,
+                        })
+
+            # Cache results in memory and update DB mappings if present
+            cache = self._get_pi_live_cache()
+            with self._database.session() as repo:
+                existing_maps = repo.list_pi_mappings(equipment_id=equipment_id, opc_prog_id=opc_prog_id)
+                tag_to_map_id = {m["opc_item_path"]: m["mapping_id"] for m in existing_maps}
+
+                for r in all_results:
+                    tag = r.get("opc_item_path", "")
+                    cache[(equipment_id, opc_prog_id, tag)] = r
+                    m_id = tag_to_map_id.get(tag)
+                    if m_id and r.get("value") is not None:
+                        repo.update_pi_mapping_status(m_id, "Lido via OPC", str(r.get("value")))
+
+            return self._json_response(start_response, "200 OK", {"results": all_results})
+
         return self._json_response(start_response, "404 Not Found", {"error": "not_found"})
 
     def pi_profile_route(
@@ -150,10 +288,10 @@ class PiIntegrationAdministration:
             if method == "GET":
                 params = parse_qs(query) if query else {}
                 equipment_id = params.get("equipment_id", [None])[0]
-                opc_config_id = params.get("opc_config_id", [None])[0]
+                opc_prog_id = params.get("opc_prog_id", [None])[0]
                 with self._database.session() as repo:
-                    if equipment_id and opc_config_id:
-                        prof = repo.get_pi_profile(equipment_id, opc_config_id)
+                    if equipment_id and opc_prog_id:
+                        prof = repo.get_pi_profile(equipment_id, opc_prog_id)
                         return self._json_response(start_response, "200 OK", {"profile": prof})
                     profs = repo.list_pi_profiles(equipment_id)
                 return self._json_response(start_response, "200 OK", {"profiles": profs})
@@ -165,7 +303,7 @@ class PiIntegrationAdministration:
                     return self._json_response(start_response, "400 Bad Request", {"error": "invalid_json"})
 
                 equipment_id = str(data.get("equipment_id") or "").strip()
-                opc_config_id = str(data.get("opc_config_id") or "").strip()
+                opc_prog_id = str(data.get("opc_prog_id") or "").strip()
                 point_source = str(data.get("point_source") or "").strip()
                 raw_loc1 = data.get("location1", 0)
                 try:
@@ -173,11 +311,11 @@ class PiIntegrationAdministration:
                 except (TypeError, ValueError):
                     return self._json_response(start_response, "400 Bad Request", {"error": "invalid_location1"})
 
-                if not equipment_id or not opc_config_id:
+                if not equipment_id or not opc_prog_id:
                     return self._json_response(
                         start_response,
                         "400 Bad Request",
-                        {"error": "missing_required_fields", "message": "Equipamento e Configuração OPC são obrigatórios."},
+                        {"error": "missing_required_fields", "message": "Equipamento e Servidor OPC (ProgID) são obrigatórios."},
                     )
 
                 if not point_source or len(point_source) > 64:
@@ -195,11 +333,7 @@ class PiIntegrationAdministration:
                     if eq is None:
                         return self._json_response(start_response, "404 Not Found", {"error": "equipment_not_found"})
 
-                    cfg = repo.get_named_config(opc_config_id)
-                    if cfg is None or cfg.get("equipment_id") != equipment_id:
-                        return self._json_response(start_response, "404 Not Found", {"error": "opc_config_not_found"})
-
-                    existing = repo.get_pi_profile(equipment_id, opc_config_id)
+                    existing = repo.get_pi_profile(equipment_id, opc_prog_id)
                     if existing:
                         profile_id = existing["profile_id"]
                         changed = (
@@ -211,9 +345,9 @@ class PiIntegrationAdministration:
                         deactivated_count = 0
                         if changed:
                             deactivated_count = repo.deactivate_mappings_for_profile(
-                                equipment_id, opc_config_id, point_source, location1
+                                equipment_id, opc_prog_id, point_source, location1
                             )
-                        agent_id = cfg.get("agent_id") or eq.get("agent_id")
+                        agent_id = eq.get("agent_id")
                         if agent_id:
                             repo.add_audit_event(
                                 agent_id,
@@ -222,7 +356,7 @@ class PiIntegrationAdministration:
                                 json.dumps({
                                     "profile_id": profile_id,
                                     "equipment_id": equipment_id,
-                                    "opc_config_id": opc_config_id,
+                                    "opc_prog_id": opc_prog_id,
                                     "point_source": point_source,
                                     "location1": location1,
                                     "enabled": enabled,
@@ -245,12 +379,12 @@ class PiIntegrationAdministration:
                         repo.add_pi_profile(
                             profile_id=profile_id,
                             equipment_id=equipment_id,
-                            opc_config_id=opc_config_id,
+                            opc_prog_id=opc_prog_id,
                             point_source=point_source,
                             location1=location1,
                             enabled=enabled,
                         )
-                        agent_id = cfg.get("agent_id") or eq.get("agent_id")
+                        agent_id = eq.get("agent_id")
                         if agent_id:
                             repo.add_audit_event(
                                 agent_id,
@@ -259,7 +393,7 @@ class PiIntegrationAdministration:
                                 json.dumps({
                                     "profile_id": profile_id,
                                     "equipment_id": equipment_id,
-                                    "opc_config_id": opc_config_id,
+                                    "opc_prog_id": opc_prog_id,
                                     "point_source": point_source,
                                     "location1": location1,
                                     "enabled": enabled,
@@ -287,7 +421,7 @@ class PiIntegrationAdministration:
                     if existing is None:
                         return self._json_response(start_response, "404 Not Found", {"error": "profile_not_found"})
                     repo.delete_pi_profile(profile_id)
-                    repo.deactivate_mappings_for_profile(existing["equipment_id"], existing["opc_config_id"])
+                    repo.deactivate_mappings_for_profile(existing["equipment_id"], existing["opc_prog_id"])
                     agent_id = existing.get("agent_id")
                     if agent_id:
                         repo.add_audit_event(
@@ -297,7 +431,7 @@ class PiIntegrationAdministration:
                             json.dumps({
                                 "profile_id": profile_id,
                                 "equipment_id": existing["equipment_id"],
-                                "opc_config_id": existing["opc_config_id"],
+                                "opc_prog_id": existing["opc_prog_id"],
                                 "user": user,
                             }),
                         )
@@ -323,45 +457,155 @@ class PiIntegrationAdministration:
         parts = [p for p in subpath.split("/") if p]
         user = str(environ.get("REMOTE_USER") or "admin").strip() or "admin"
 
-        # 1. GET or POST /api/v1/pi-mappings
+        # 1. Batch save: POST /api/v1/pi-mappings/batch
+        if len(parts) == 1 and parts[0] == "batch":
+            if method != "POST":
+                return self._json_response(start_response, "405 Method Not Allowed", {"error": "method_not_allowed"})
+            try:
+                data = read_json(environ)
+            except Exception:
+                return self._json_response(start_response, "400 Bad Request", {"error": "invalid_json"})
+
+            equipment_id = str(data.get("equipment_id") or "").strip()
+            opc_prog_id = str(data.get("opc_prog_id") or "").strip()
+            rows = data.get("rows", [])
+            if not isinstance(rows, list):
+                return self._json_response(start_response, "400 Bad Request", {"error": "invalid_rows_format"})
+
+            with self._database.session() as repo:
+                eq = repo.get_equipment(equipment_id)
+                if eq is None:
+                    return self._json_response(start_response, "404 Not Found", {"error": "equipment_not_found"})
+
+                profile = repo.get_pi_profile(equipment_id, opc_prog_id)
+                if profile is None or not profile.get("enabled"):
+                    return self._json_response(
+                        start_response,
+                        "400 Bad Request",
+                        {
+                            "error": "profile_required",
+                            "message": "É obrigatório configurar e ativar o Perfil PI antes de salvar a planilha de mapeamentos.",
+                        },
+                    )
+
+                # Validate rows
+                row_errors: List[dict[str, Any]] = []
+                seen_tags: dict[str, int] = {}
+                seen_points: dict[str, int] = {}
+                cleaned_rows: List[dict[str, Any]] = []
+
+                for idx, row in enumerate(rows):
+                    tag = str(row.get("opc_item_path") or "").strip()
+                    point = str(row.get("pi_point_name") or "").strip()
+                    raw_interval = row.get("publish_interval_ms", 1000)
+                    try:
+                        interval = int(raw_interval)
+                    except (TypeError, ValueError):
+                        interval = 0
+
+                    if not tag:
+                        row_errors.append({"row_index": idx, "field": "opc_item_path", "message": "Endereço OPC obrigatório."})
+                    elif tag in seen_tags:
+                        row_errors.append({
+                            "row_index": idx,
+                            "field": "opc_item_path",
+                            "message": f"Endereço OPC duplicado na planilha (linhas {seen_tags[tag] + 1} e {idx + 1}).",
+                        })
+                    else:
+                        seen_tags[tag] = idx
+
+                    if not point:
+                        row_errors.append({"row_index": idx, "field": "pi_point_name", "message": "PI Point obrigatório."})
+                    elif point.upper() in seen_points:
+                        row_errors.append({
+                            "row_index": idx,
+                            "field": "pi_point_name",
+                            "message": f"PI Point duplicado na planilha (linhas {seen_points[point.upper()] + 1} e {idx + 1}).",
+                        })
+                    else:
+                        seen_points[point.upper()] = idx
+
+                    if not (1000 <= interval <= 60000):
+                        row_errors.append({
+                            "row_index": idx,
+                            "field": "publish_interval_ms",
+                            "message": "Velocidade deve ser entre 1000 e 60000 ms.",
+                        })
+
+                    cleaned_rows.append({
+                        "mapping_id": str(row.get("mapping_id") or "").strip(),
+                        "opc_item_path": tag,
+                        "pi_point_name": point,
+                        "publish_interval_ms": interval,
+                        "enabled": bool(row.get("enabled", True)),
+                    })
+
+                if row_errors:
+                    return self._json_response(
+                        start_response,
+                        "400 Bad Request",
+                        {
+                            "error": "validation_failed",
+                            "message": "Existem erros de validação na planilha. Corrija as células destacadas.",
+                            "row_errors": row_errors,
+                        },
+                    )
+
+                saved_mappings = repo.save_pi_mappings_batch(equipment_id, opc_prog_id, cleaned_rows)
+
+                agent_id = eq.get("agent_id")
+                if agent_id:
+                    repo.add_audit_event(
+                        agent_id,
+                        str(uuid.uuid4()),
+                        "pi_mapping.batch_saved",
+                        json.dumps({
+                            "equipment_id": equipment_id,
+                            "opc_prog_id": opc_prog_id,
+                            "row_count": len(saved_mappings),
+                            "user": user,
+                        }),
+                    )
+
+            return self._json_response(
+                start_response, "200 OK", {"saved_count": len(saved_mappings), "mappings": saved_mappings}
+            )
+
+        # 2. GET or POST /api/v1/pi-mappings
         if len(parts) == 0:
             if method == "GET":
                 params = parse_qs(query) if query else {}
                 equipment_id = params.get("equipment_id", [None])[0]
-                opc_config_id = params.get("opc_config_id", [None])[0]
+                opc_prog_id = params.get("opc_prog_id", [None])[0]
 
                 with self._database.session() as repo:
-                    mappings = repo.list_pi_mappings(equipment_id, opc_config_id)
-
-                # Augment mappings with live readings already captured from OPC
-                live_map: dict[str, dict[str, Any]] = {}
-                if self._bridge_server is not None:
-                    # Gather live readings for relevant agents
-                    seen_agents: set[str] = {m["agent_id"] for m in mappings if m.get("agent_id")}
-                    for ag_id in seen_agents:
-                        live_data = self._bridge_server.get_live_values(ag_id)
-                        for it in live_data.get("items", []):
-                            live_map[(ag_id, it["opc_item_path"])] = it
+                    mappings = repo.list_pi_mappings(equipment_id=equipment_id, opc_prog_id=opc_prog_id)
 
                 augmented = []
                 for m in mappings:
                     m_copy = dict(m)
-                    ag_id = m.get("agent_id")
-                    tag_path = m.get("opc_item_path")
-                    live_it = live_map.get((ag_id, tag_path)) if ag_id and tag_path else None
+                    eq_id = m.get("equipment_id", "")
+                    prog_id = m.get("opc_prog_id", "")
+                    tag_path = m.get("opc_item_path", "")
+                    agent_id = m.get("agent_id")
+                    live_it = self._get_live_item(eq_id, prog_id, tag_path, agent_id)
                     if live_it:
                         m_copy["current_value"] = live_it.get("value")
                         m_copy["quality"] = live_it.get("quality")
                         m_copy["quality_text"] = live_it.get("quality_text")
-                        m_copy["opc_timestamp"] = live_it.get("opc_timestamp") or live_it.get("received_at")
-                        m_copy["age_ms"] = live_it.get("age_ms")
-                        m_copy["stale"] = bool(live_it.get("stale") or live_it.get("status") == "stale")
+                        m_copy["opc_timestamp"] = live_it.get("opc_timestamp")
+                        m_copy["stale"] = bool(live_it.get("stale", False))
+                    elif m.get("last_published_value") is not None:
+                        m_copy["current_value"] = m.get("last_published_value")
+                        m_copy["quality"] = 192
+                        m_copy["quality_text"] = "Good"
+                        m_copy["opc_timestamp"] = m.get("last_published_at")
+                        m_copy["stale"] = False
                     else:
                         m_copy["current_value"] = None
                         m_copy["quality"] = None
                         m_copy["quality_text"] = None
                         m_copy["opc_timestamp"] = None
-                        m_copy["age_ms"] = None
                         m_copy["stale"] = False
                     augmented.append(m_copy)
 
@@ -374,19 +618,14 @@ class PiIntegrationAdministration:
                     return self._json_response(start_response, "400 Bad Request", {"error": "invalid_json"})
 
                 equipment_id = str(data.get("equipment_id") or "").strip()
-                opc_config_id = str(data.get("opc_config_id") or "").strip()
+                opc_prog_id = str(data.get("opc_prog_id") or "").strip()
                 opc_item_path = str(data.get("opc_item_path") or "").strip()
-                raw_item_id = data.get("item_id", 0)
-                try:
-                    item_id = int(raw_item_id)
-                except (TypeError, ValueError):
-                    item_id = 0
 
-                if not equipment_id or not opc_config_id or not opc_item_path:
+                if not equipment_id or not opc_prog_id or not opc_item_path:
                     return self._json_response(
                         start_response,
                         "400 Bad Request",
-                        {"error": "missing_required_fields", "message": "Equipamento, Configuração OPC e Tag são obrigatórios."},
+                        {"error": "missing_required_fields", "message": "Equipamento, Servidor OPC e Endereço OPC são obrigatórios."},
                     )
 
                 with self._database.session() as repo:
@@ -394,75 +633,53 @@ class PiIntegrationAdministration:
                     if eq is None:
                         return self._json_response(start_response, "404 Not Found", {"error": "equipment_not_found"})
 
-                    cfg = repo.get_named_config(opc_config_id)
-                    if cfg is None or cfg.get("equipment_id") != equipment_id:
-                        return self._json_response(start_response, "404 Not Found", {"error": "opc_config_not_found"})
-
-                    tags_list = json.loads(cfg.get("tags_json", "[]"))
-                    # Support both list of strings or list of dicts
-                    known_paths = [t if isinstance(t, str) else (t.get("opc_item_path") or t.get("path")) for t in tags_list]
-                    if opc_item_path not in known_paths:
-                        return self._json_response(
-                            start_response,
-                            "400 Bad Request",
-                            {"error": "tag_not_in_config", "message": f"A tag '{opc_item_path}' não pertence à configuração OPC selecionada."},
-                        )
-
-                    profile = repo.get_pi_profile(equipment_id, opc_config_id)
+                    profile = repo.get_pi_profile(equipment_id, opc_prog_id)
                     if profile is None or not profile.get("enabled"):
                         return self._json_response(
                             start_response,
                             "400 Bad Request",
                             {
                                 "error": "profile_required",
-                                "message": "É obrigatório configurar e ativar o Perfil PI para este Equipamento e Configuração OPC antes de cadastrar mapeamentos.",
+                                "message": "É obrigatório configurar e ativar o Perfil PI para este Equipamento e Servidor OPC antes de cadastrar mapeamentos.",
                             },
                         )
 
                     try:
-                        validated = validate_pi_mapping_input(data, cfg, profile=profile)
+                        validated = validate_pi_mapping_input(data, profile=profile)
                     except ValueError as exc:
-                        code = str(exc)
-                        if code == "interval_faster_than_opc":
-                            return self._json_response(
-                                start_response,
-                                "400 Bad Request",
-                                {
-                                    "error": "interval_faster_than_opc",
-                                    "message": (
-                                        f"A velocidade de publicação informada ({data.get('publish_interval_ms')} ms) "
-                                        f"não pode ser menor que o intervalo de coleta OPC ({cfg['interval_ms']} ms), "
-                                        "pois não existem valores novos nessa frequência."
-                                    ),
-                                },
-                            )
-                        return self._json_response(start_response, "400 Bad Request", {"error": code})
+                        return self._json_response(start_response, "400 Bad Request", {"error": str(exc)})
 
                     # Check for duplicate mapping
-                    existing_list = repo.list_pi_mappings(equipment_id=equipment_id, opc_config_id=opc_config_id)
+                    existing_list = repo.list_pi_mappings(equipment_id=equipment_id, opc_prog_id=opc_prog_id)
                     for em in existing_list:
                         if em.get("opc_item_path") == opc_item_path:
                             return self._json_response(
                                 start_response,
                                 "409 Conflict",
-                                {"error": "mapping_conflict", "message": f"Já existe um mapeamento cadastrado para a tag '{opc_item_path}' nesta configuração."},
+                                {"error": "mapping_conflict", "message": f"Já existe um mapeamento cadastrado para o endereço '{opc_item_path}' neste perfil."},
+                            )
+                        if em.get("pi_point_name", "").upper() == validated["pi_point_name"].upper():
+                            return self._json_response(
+                                start_response,
+                                "409 Conflict",
+                                {"error": "point_conflict", "message": f"Já existe um mapeamento cadastrado para o PI Point '{validated['pi_point_name']}' neste perfil."},
                             )
 
                     mapping_id = str(uuid.uuid4())
-                    repo.add_pi_mapping(
+                    created = repo.add_pi_mapping(
                         mapping_id=mapping_id,
                         equipment_id=equipment_id,
-                        opc_config_id=opc_config_id,
+                        opc_prog_id=opc_prog_id,
                         opc_item_path=opc_item_path,
-                        item_id=item_id,
                         pi_point_name=validated["pi_point_name"],
-                        point_source=validated["point_source"],
-                        location1=validated["location1"],
+                        point_source=profile["point_source"],
+                        location1=profile["location1"],
                         publish_interval_ms=validated["publish_interval_ms"],
                         enabled=validated["enabled"],
+                        profile_id=profile["profile_id"],
                     )
 
-                    agent_id = cfg.get("agent_id") or eq.get("agent_id")
+                    agent_id = eq.get("agent_id")
                     if agent_id:
                         repo.add_audit_event(
                             agent_id,
@@ -471,31 +688,34 @@ class PiIntegrationAdministration:
                             json.dumps({
                                 "mapping_id": mapping_id,
                                 "equipment_id": equipment_id,
-                                "opc_config_id": opc_config_id,
+                                "opc_prog_id": opc_prog_id,
                                 "opc_item_path": opc_item_path,
                                 "pi_point_name": validated["pi_point_name"],
+                                "point_source": profile["point_source"],
+                                "location1": profile["location1"],
                                 "publish_interval_ms": validated["publish_interval_ms"],
+                                "enabled": validated["enabled"],
                                 "user": user,
                             }),
                         )
 
-                    created = repo.get_pi_mapping(mapping_id)
+                    mapping_dict = repo.get_pi_mapping(mapping_id)
 
-                return self._json_response(start_response, "201 Created", {"mapping": created})
+                return self._json_response(start_response, "201 Created", {"mapping": mapping_dict})
 
             return self._json_response(start_response, "405 Method Not Allowed", {"error": "method_not_allowed"})
 
-        # 2. GET /api/v1/pi-mappings/audit
+        # Audit events query: GET /api/v1/pi-mappings/audit
         if len(parts) == 1 and parts[0] == "audit":
             if method != "GET":
                 return self._json_response(start_response, "405 Method Not Allowed", {"error": "method_not_allowed"})
 
             params = parse_qs(query) if query else {}
             equipment_id = params.get("equipment_id", [None])[0]
-            limit_str = params.get("limit", ["50"])[0]
+            limit_raw = params.get("limit", [50])[0]
             try:
-                limit = int(limit_str)
-            except ValueError:
+                limit = int(limit_raw)
+            except (ValueError, TypeError):
                 limit = 50
 
             with self._database.session() as repo:
@@ -532,7 +752,7 @@ class PiIntegrationAdministration:
 
             return self._json_response(start_response, "200 OK", {"audit_events": events})
 
-        # 3. Actions on a specific mapping: /api/v1/pi-mappings/<id>[/action]
+        # 3. Operations on specific mapping: /api/v1/pi-mappings/<id>[/action]
         mapping_id = parts[0]
 
         # Simulation: POST /api/v1/pi-mappings/<id>/simulate
@@ -545,7 +765,7 @@ class PiIntegrationAdministration:
                 if mapping is None:
                     return self._json_response(start_response, "404 Not Found", {"error": "mapping_not_found"})
 
-                profile = repo.get_pi_profile(mapping["equipment_id"], mapping["opc_config_id"])
+                profile = repo.get_pi_profile(mapping["equipment_id"], mapping["opc_prog_id"])
                 if profile is None or not profile.get("enabled"):
                     return self._json_response(
                         start_response,
@@ -556,7 +776,6 @@ class PiIntegrationAdministration:
                         },
                     )
 
-                # Requirement 4: only active (enabled) mappings can be published/simulated
                 if not mapping.get("enabled"):
                     return self._json_response(
                         start_response,
@@ -567,35 +786,28 @@ class PiIntegrationAdministration:
                 agent_id = mapping.get("agent_id")
                 opc_path = mapping.get("opc_item_path")
 
-                # Retrieve last reading already available from active cache (strictly read-only)
-                live_item = None
-                if agent_id and self._bridge_server is not None:
-                    live_data = self._bridge_server.get_live_values(agent_id)
-                    for it in live_data.get("items", []):
-                        if it.get("opc_item_path") == opc_path:
-                            live_item = it
-                            break
+                # Retrieve last reading from PI cache or active live collection
+                live_item = self._get_live_item(
+                    mapping["equipment_id"], mapping["opc_prog_id"], opc_path, agent_id
+                )
 
                 current_val = live_item.get("value") if live_item else None
                 opc_ts = live_item.get("opc_timestamp") if live_item else None
                 quality = live_item.get("quality") if live_item else None
 
-                # Execute controlled simulated publication
                 channel = self._get_pi_output_channel()
                 sim_res = channel.publish(
                     pi_point_name=mapping["pi_point_name"],
                     value=current_val if current_val is not None else 0.0,
                     timestamp=opc_ts,
                     quality=quality,
-                    point_source=mapping.get("point_source", ""),
-                    location1=mapping.get("location1", 0),
+                    point_source=profile["point_source"],
+                    location1=profile["location1"],
                 )
 
-                # Persist updated status
                 val_str = str(current_val) if current_val is not None else "0.0"
                 repo.update_pi_mapping_status(mapping_id, sim_res.status, val_str)
 
-                # Record persistent audit event
                 if agent_id:
                     repo.add_audit_event(
                         agent_id,
@@ -605,8 +817,8 @@ class PiIntegrationAdministration:
                             "mapping_id": mapping_id,
                             "opc_item_path": opc_path,
                             "pi_point_name": mapping["pi_point_name"],
-                            "point_source": mapping.get("point_source", ""),
-                            "location1": mapping.get("location1", 0),
+                            "point_source": profile["point_source"],
+                            "location1": profile["location1"],
                             "value": current_val,
                             "quality": quality,
                             "opc_timestamp": opc_ts,
@@ -633,7 +845,7 @@ class PiIntegrationAdministration:
                 if mapping is None:
                     return self._json_response(start_response, "404 Not Found", {"error": "mapping_not_found"})
 
-                profile = repo.get_pi_profile(mapping["equipment_id"], mapping["opc_config_id"])
+                profile = repo.get_pi_profile(mapping["equipment_id"], mapping["opc_prog_id"])
                 if profile is None or not profile.get("enabled"):
                     return self._json_response(
                         start_response,
@@ -654,14 +866,9 @@ class PiIntegrationAdministration:
                 agent_id = mapping.get("agent_id")
                 opc_path = mapping.get("opc_item_path")
 
-                # Retrieve last reading already available from active cache (strictly read-only)
-                live_item = None
-                if agent_id and self._bridge_server is not None:
-                    live_data = self._bridge_server.get_live_values(agent_id)
-                    for it in live_data.get("items", []):
-                        if it.get("opc_item_path") == opc_path:
-                            live_item = it
-                            break
+                live_item = self._get_live_item(
+                    mapping["equipment_id"], mapping["opc_prog_id"], opc_path, agent_id
+                )
 
                 channel = self._get_pi_output_channel()
                 config = self._get_pi_output_config()
@@ -675,8 +882,14 @@ class PiIntegrationAdministration:
                 )
 
                 if eval_res.get("action") == "skipped":
-                    reason = eval_res.get("reason")
-                    msg = eval_res.get("message", "Publicação bloqueada.")
+                    reason = eval_res.get("reason", "skipped")
+                    msg_map = {
+                        "no_value": "Nenhum valor recente disponível na leitura OPC.",
+                        "quality_not_good": f"Qualidade do valor OPC ({eval_res.get('quality')}) não é Good (>= 192).",
+                        "stale_data": "O dado no cache OPC está obsoleto.",
+                        "mapping_disabled": "Mapeamento desativado.",
+                    }
+                    msg = msg_map.get(reason, f"Publicação não executada ({reason}).")
                     return self._json_response(
                         start_response,
                         "400 Bad Request",
@@ -702,8 +915,8 @@ class PiIntegrationAdministration:
                             "mapping_id": mapping_id,
                             "opc_item_path": opc_path,
                             "pi_point_name": mapping["pi_point_name"],
-                            "point_source": mapping.get("point_source", ""),
-                            "location1": mapping.get("location1", 0),
+                            "point_source": profile["point_source"],
+                            "location1": profile["location1"],
                             "value": eval_res["value"],
                             "quality": eval_res["quality"],
                             "opc_timestamp": eval_res["timestamp"],
@@ -734,14 +947,14 @@ class PiIntegrationAdministration:
 
                 new_enabled = not bool(mapping.get("enabled"))
                 if new_enabled:
-                    profile = repo.get_pi_profile(mapping["equipment_id"], mapping["opc_config_id"])
+                    profile = repo.get_pi_profile(mapping["equipment_id"], mapping["opc_prog_id"])
                     if profile is None or not profile.get("enabled"):
                         return self._json_response(
                             start_response,
                             "400 Bad Request",
                             {
                                 "error": "profile_required",
-                                "message": "Não é possível ativar o mapeamento sem um Perfil PI ativo para esta configuração.",
+                                "message": "Não é possível ativar o mapeamento sem um Perfil PI ativo para este servidor OPC.",
                             },
                         )
 
@@ -775,7 +988,7 @@ class PiIntegrationAdministration:
                 if mapping is None:
                     return self._json_response(start_response, "404 Not Found", {"error": "mapping_not_found"})
 
-                profile = repo.get_pi_profile(mapping["equipment_id"], mapping["opc_config_id"])
+                profile = repo.get_pi_profile(mapping["equipment_id"], mapping["opc_prog_id"])
                 if profile is None or not profile.get("enabled"):
                     return self._json_response(
                         start_response,
@@ -823,7 +1036,28 @@ class PiIntegrationAdministration:
                     mapping = repo.get_pi_mapping(mapping_id)
                 if mapping is None:
                     return self._json_response(start_response, "404 Not Found", {"error": "mapping_not_found"})
-                return self._json_response(start_response, "200 OK", {"mapping": mapping})
+                m_copy = dict(mapping)
+                live_it = self._get_live_item(
+                    mapping.get("equipment_id", ""),
+                    mapping.get("opc_prog_id", ""),
+                    mapping.get("opc_item_path", ""),
+                    mapping.get("agent_id"),
+                )
+                if live_it:
+                    m_copy["current_value"] = live_it.get("value")
+                    m_copy["quality"] = live_it.get("quality")
+                    m_copy["quality_text"] = live_it.get("quality_text")
+                    m_copy["opc_timestamp"] = live_it.get("opc_timestamp")
+                    m_copy["stale"] = bool(live_it.get("stale", False))
+                elif mapping.get("last_published_value") is not None:
+                    m_copy["current_value"] = mapping.get("last_published_value")
+                    m_copy["quality"] = 192
+                    m_copy["quality_text"] = "Good"
+                    m_copy["opc_timestamp"] = mapping.get("last_published_at")
+                    m_copy["stale"] = False
+                else:
+                    m_copy["stale"] = False
+                return self._json_response(start_response, "200 OK", {"mapping": m_copy})
 
             if method in ("PUT", "POST"):
                 try:
@@ -836,11 +1070,7 @@ class PiIntegrationAdministration:
                     if existing is None:
                         return self._json_response(start_response, "404 Not Found", {"error": "mapping_not_found"})
 
-                    cfg = repo.get_named_config(existing["opc_config_id"])
-                    if cfg is None:
-                        return self._json_response(start_response, "404 Not Found", {"error": "opc_config_not_found"})
-
-                    profile = repo.get_pi_profile(existing["equipment_id"], existing["opc_config_id"])
+                    profile = repo.get_pi_profile(existing["equipment_id"], existing["opc_prog_id"])
                     raw_en = data.get("enabled", True)
                     if bool(raw_en) and (profile is None or not profile.get("enabled")):
                         return self._json_response(
@@ -853,29 +1083,15 @@ class PiIntegrationAdministration:
                         )
 
                     try:
-                        validated = validate_pi_mapping_input(data, cfg, profile=profile)
+                        validated = validate_pi_mapping_input(data, profile=profile)
                     except ValueError as exc:
-                        code = str(exc)
-                        if code == "interval_faster_than_opc":
-                            return self._json_response(
-                                start_response,
-                                "400 Bad Request",
-                                {
-                                    "error": "interval_faster_than_opc",
-                                    "message": (
-                                        f"A velocidade de publicação informada ({data.get('publish_interval_ms')} ms) "
-                                        f"não pode ser menor que o intervalo de coleta OPC ({cfg['interval_ms']} ms), "
-                                        "pois não existem valores novos nessa frequência."
-                                    ),
-                                },
-                            )
-                        return self._json_response(start_response, "400 Bad Request", {"error": code})
+                        return self._json_response(start_response, "400 Bad Request", {"error": str(exc)})
 
+                    new_path = str(data.get("opc_item_path") or existing["opc_item_path"]).strip()
                     repo.update_pi_mapping(
                         mapping_id=mapping_id,
+                        opc_item_path=new_path,
                         pi_point_name=validated["pi_point_name"],
-                        point_source=validated["point_source"],
-                        location1=validated["location1"],
                         publish_interval_ms=validated["publish_interval_ms"],
                         enabled=validated["enabled"],
                     )
@@ -888,6 +1104,7 @@ class PiIntegrationAdministration:
                             "pi_mapping.updated",
                             json.dumps({
                                 "mapping_id": mapping_id,
+                                "opc_item_path": new_path,
                                 "pi_point_name": validated["pi_point_name"],
                                 "publish_interval_ms": validated["publish_interval_ms"],
                                 "enabled": validated["enabled"],

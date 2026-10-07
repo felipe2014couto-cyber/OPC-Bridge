@@ -500,3 +500,48 @@ tr.row-error td {
   background: #f1f3f5;
   color: var(--muted);
 }
+
+/* Planilha de Mapeamentos PI */
+.cell-input {
+  width: 100%;
+  padding: 6px 8px;
+  font-size: 13px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  box-sizing: border-box;
+  background: #ffffff;
+  font-family: inherit;
+  transition: border-color 0.15s, background-color 0.15s;
+}
+
+.cell-input:focus {
+  border-color: var(--primary);
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(10, 80, 160, 0.15);
+}
+
+.cell-input.is-invalid {
+  border-color: var(--status-red) !important;
+  background-color: #fff2f2 !important;
+  box-shadow: 0 0 0 1px var(--status-red) !important;
+}
+
+.cell-quality {
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  display: inline-block;
+  font-weight: 500;
+}
+
+.cell-quality.good {
+  background: var(--status-green-bg);
+  color: var(--status-green);
+  border: 1px solid var(--status-green);
+}
+
+.cell-quality.bad {
+  background: var(--status-red-bg);
+  color: var(--status-red);
+  border: 1px solid var(--status-red);
+}

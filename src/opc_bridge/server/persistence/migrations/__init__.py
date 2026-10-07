@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from typing import Any, List
 
-REVISION = "0007_pi_profiles"
+REVISION = "0008_pi_independent_profiles"
+_PI_INDEPENDENT_PROFILES_REVISION = "0008_pi_independent_profiles"
 _PI_PROFILES_REVISION = "0007_pi_profiles"
 _PI_TRACKING_REVISION = "0006_pi_publication_tracking"
 _PI_MAPPINGS_REVISION = "0005_pi_mappings"
@@ -261,6 +262,79 @@ def _apply_pi_profiles(cursor: Any, database: Any, marker: str, timestamp_type: 
     )
 
 
+def _apply_pi_independent_profiles(
+    cursor: Any, database: Any, marker: str, timestamp_type: str
+) -> None:
+    statements = [
+        """CREATE TABLE pi_profiles_v2 (
+            profile_id VARCHAR(128) PRIMARY KEY,
+            equipment_id VARCHAR(128) NOT NULL REFERENCES equipments(equipment_id) ON DELETE CASCADE,
+            opc_prog_id VARCHAR(256) NOT NULL,
+            point_source VARCHAR(64) NOT NULL,
+            location1 INTEGER NOT NULL DEFAULT 0,
+            enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+            created_at __TIMESTAMP__ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at __TIMESTAMP__ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (equipment_id, opc_prog_id)
+        )""",
+        """CREATE TABLE pi_mappings_v2 (
+            mapping_id VARCHAR(128) PRIMARY KEY,
+            profile_id VARCHAR(128) REFERENCES pi_profiles_v2(profile_id) ON DELETE CASCADE,
+            equipment_id VARCHAR(128) NOT NULL REFERENCES equipments(equipment_id) ON DELETE CASCADE,
+            opc_prog_id VARCHAR(256) NOT NULL,
+            opc_item_path VARCHAR(512) NOT NULL,
+            item_id INTEGER NOT NULL DEFAULT 0,
+            pi_point_name VARCHAR(255) NOT NULL,
+            point_source VARCHAR(64) NOT NULL DEFAULT '',
+            location1 INTEGER NOT NULL DEFAULT 0,
+            publish_interval_ms INTEGER NOT NULL CHECK (publish_interval_ms >= 1000 AND publish_interval_ms <= 60000),
+            enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+            last_publish_status VARCHAR(64) NOT NULL DEFAULT 'Não configurado',
+            last_published_at __TIMESTAMP__,
+            last_published_value TEXT,
+            next_publish_due_at __TIMESTAMP__,
+            last_publish_error TEXT,
+            failure_count INTEGER NOT NULL DEFAULT 0,
+            created_at __TIMESTAMP__ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at __TIMESTAMP__ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (equipment_id, opc_prog_id, opc_item_path),
+            UNIQUE (equipment_id, opc_prog_id, pi_point_name)
+        )""",
+        """INSERT INTO pi_profiles_v2 (profile_id, equipment_id, opc_prog_id, point_source, location1, enabled, created_at, updated_at)
+        SELECT p.profile_id, p.equipment_id, COALESCE(c.opc_prog_id, 'UNKNOWN'), p.point_source, p.location1, 0, p.created_at, p.updated_at
+        FROM pi_profiles p
+        LEFT JOIN named_opc_configs c ON p.opc_config_id = c.config_id
+        WHERE p.profile_id IN (
+            SELECT MIN(p2.profile_id)
+            FROM pi_profiles p2
+            LEFT JOIN named_opc_configs c2 ON p2.opc_config_id = c2.config_id
+            GROUP BY p2.equipment_id, COALESCE(c2.opc_prog_id, 'UNKNOWN')
+        )""",
+        """INSERT INTO pi_mappings_v2 (mapping_id, profile_id, equipment_id, opc_prog_id, opc_item_path, item_id, pi_point_name, point_source, location1, publish_interval_ms, enabled, last_publish_status, last_published_at, last_published_value, next_publish_due_at, last_publish_error, failure_count, created_at, updated_at)
+        SELECT m.mapping_id, p.profile_id, m.equipment_id, COALESCE(c.opc_prog_id, 'UNKNOWN'), m.opc_item_path, m.item_id, m.pi_point_name, m.point_source, m.location1, m.publish_interval_ms, 0, m.last_publish_status, m.last_published_at, m.last_published_value, m.next_publish_due_at, m.last_publish_error, m.failure_count, m.created_at, m.updated_at
+        FROM pi_mappings m
+        LEFT JOIN named_opc_configs c ON m.opc_config_id = c.config_id
+        LEFT JOIN pi_profiles_v2 p ON p.equipment_id = m.equipment_id AND p.opc_prog_id = COALESCE(c.opc_prog_id, 'UNKNOWN')
+        WHERE m.mapping_id IN (
+            SELECT MIN(m2.mapping_id)
+            FROM pi_mappings m2
+            LEFT JOIN named_opc_configs c2 ON m2.opc_config_id = c2.config_id
+            GROUP BY m2.equipment_id, COALESCE(c2.opc_prog_id, 'UNKNOWN'), m2.opc_item_path
+        )""",
+        "DROP TABLE pi_mappings",
+        "DROP TABLE pi_profiles",
+        "ALTER TABLE pi_profiles_v2 RENAME TO pi_profiles",
+        "ALTER TABLE pi_mappings_v2 RENAME TO pi_mappings",
+    ]
+    for statement in statements:
+        statement = statement.replace("__TIMESTAMP__", timestamp_type)
+        cursor.execute(statement)
+    cursor.execute(
+        "INSERT INTO schema_migrations(revision) VALUES (" + marker + ")",
+        (_PI_INDEPENDENT_PROFILES_REVISION,),
+    )
+
+
 def upgrade_database(database: Any) -> None:
     """Apply pending migration revisions to an isolated target database."""
     connection = database._connect()
@@ -292,6 +366,8 @@ def upgrade_database(database: Any) -> None:
             _apply_pi_publication_tracking(cursor, database, marker, timestamp_type)
         if _PI_PROFILES_REVISION not in applied:
             _apply_pi_profiles(cursor, database, marker, timestamp_type)
+        if _PI_INDEPENDENT_PROFILES_REVISION not in applied:
+            _apply_pi_independent_profiles(cursor, database, marker, timestamp_type)
         connection.commit()
     except Exception:
         connection.rollback()

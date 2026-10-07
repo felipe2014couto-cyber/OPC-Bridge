@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any, List, Optional, Type, TypeVar
+import uuid
 
 from .models import (
     Agent,
@@ -671,32 +672,37 @@ class PersistenceRepository:
         return self._dicts(cursor)
 
     def list_pi_mappings(
-        self, equipment_id: Optional[str] = None, opc_config_id: Optional[str] = None
+        self,
+        equipment_id: Optional[str] = None,
+        opc_prog_id: Optional[str] = None,
+        profile_id: Optional[str] = None,
     ) -> List[dict[str, Any]]:
         query = (
-            "SELECT m.mapping_id, m.mapping_id AS id, m.equipment_id, m.opc_config_id, "
+            "SELECT m.mapping_id, m.mapping_id AS id, m.equipment_id, m.opc_prog_id, "
             "m.opc_item_path, m.item_id, m.pi_point_name, "
             "COALESCE(p.point_source, m.point_source) AS point_source, "
             "COALESCE(p.location1, m.location1) AS location1, "
-            "p.profile_id, p.enabled AS profile_enabled, "
+            "COALESCE(m.profile_id, p.profile_id) AS profile_id, "
+            "p.enabled AS profile_enabled, "
             "m.publish_interval_ms, m.enabled, m.last_publish_status, m.last_published_at, "
             "m.last_published_value, m.next_publish_due_at, m.last_publish_error, m.failure_count, "
             "m.created_at, m.updated_at, "
-            "e.name AS equipment_name, e.agent_id, c.name AS config_name, c.interval_ms AS opc_interval_ms, "
-            "c.opc_prog_id "
+            "e.name AS equipment_name, e.agent_id "
             "FROM pi_mappings m "
             "JOIN equipments e ON e.equipment_id = m.equipment_id "
-            "JOIN named_opc_configs c ON c.config_id = m.opc_config_id "
-            "LEFT JOIN pi_profiles p ON p.equipment_id = m.equipment_id AND p.opc_config_id = m.opc_config_id "
+            "LEFT JOIN pi_profiles p ON p.equipment_id = m.equipment_id AND p.opc_prog_id = m.opc_prog_id "
         )
         params: list[Any] = []
         clauses: list[str] = []
         if equipment_id:
             clauses.append("m.equipment_id = ?")
             params.append(equipment_id)
-        if opc_config_id:
-            clauses.append("m.opc_config_id = ?")
-            params.append(opc_config_id)
+        if opc_prog_id:
+            clauses.append("m.opc_prog_id = ?")
+            params.append(opc_prog_id)
+        if profile_id:
+            clauses.append("(m.profile_id = ? OR p.profile_id = ?)")
+            params.extend([profile_id, profile_id])
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
         query += " ORDER BY m.pi_point_name, m.mapping_id"
@@ -704,20 +710,19 @@ class PersistenceRepository:
 
     def get_pi_mapping(self, mapping_id: str) -> Optional[dict[str, Any]]:
         query = (
-            "SELECT m.mapping_id, m.mapping_id AS id, m.equipment_id, m.opc_config_id, "
+            "SELECT m.mapping_id, m.mapping_id AS id, m.equipment_id, m.opc_prog_id, "
             "m.opc_item_path, m.item_id, m.pi_point_name, "
             "COALESCE(p.point_source, m.point_source) AS point_source, "
             "COALESCE(p.location1, m.location1) AS location1, "
-            "p.profile_id, p.enabled AS profile_enabled, "
+            "COALESCE(m.profile_id, p.profile_id) AS profile_id, "
+            "p.enabled AS profile_enabled, "
             "m.publish_interval_ms, m.enabled, m.last_publish_status, m.last_published_at, "
             "m.last_published_value, m.next_publish_due_at, m.last_publish_error, m.failure_count, "
             "m.created_at, m.updated_at, "
-            "e.name AS equipment_name, e.agent_id, c.name AS config_name, c.interval_ms AS opc_interval_ms, "
-            "c.opc_prog_id "
+            "e.name AS equipment_name, e.agent_id "
             "FROM pi_mappings m "
             "JOIN equipments e ON e.equipment_id = m.equipment_id "
-            "JOIN named_opc_configs c ON c.config_id = m.opc_config_id "
-            "LEFT JOIN pi_profiles p ON p.equipment_id = m.equipment_id AND p.opc_config_id = m.opc_config_id "
+            "LEFT JOIN pi_profiles p ON p.equipment_id = m.equipment_id AND p.opc_prog_id = m.opc_prog_id "
             "WHERE m.mapping_id = ?"
         )
         rows = self._dicts(self._execute(query, (mapping_id,)))
@@ -727,23 +732,25 @@ class PersistenceRepository:
         self,
         mapping_id: str,
         equipment_id: str,
-        opc_config_id: str,
+        opc_prog_id: str,
         opc_item_path: str,
-        item_id: int,
         pi_point_name: str,
-        point_source: str,
-        location1: int,
         publish_interval_ms: int,
         enabled: bool = True,
+        point_source: str = "",
+        location1: int = 0,
+        profile_id: Optional[str] = None,
+        item_id: int = 0,
     ) -> PiMapping:
         self._execute(
-            "INSERT INTO pi_mappings (mapping_id, equipment_id, opc_config_id, opc_item_path, "
+            "INSERT INTO pi_mappings (mapping_id, profile_id, equipment_id, opc_prog_id, opc_item_path, "
             "item_id, pi_point_name, point_source, location1, publish_interval_ms, enabled) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 mapping_id,
+                profile_id,
                 equipment_id,
-                opc_config_id,
+                opc_prog_id,
                 opc_item_path,
                 item_id,
                 pi_point_name,
@@ -755,8 +762,9 @@ class PersistenceRepository:
         )
         return PiMapping(
             mapping_id=mapping_id,
+            profile_id=profile_id,
             equipment_id=equipment_id,
-            opc_config_id=opc_config_id,
+            opc_prog_id=opc_prog_id,
             opc_item_path=opc_item_path,
             item_id=item_id,
             pi_point_name=pi_point_name,
@@ -770,27 +778,90 @@ class PersistenceRepository:
         self,
         mapping_id: str,
         pi_point_name: str,
-        point_source: str,
-        location1: int,
         publish_interval_ms: int,
         enabled: bool,
+        opc_item_path: Optional[str] = None,
+        point_source: Optional[str] = None,
+        location1: Optional[int] = None,
     ) -> Optional[dict[str, Any]]:
-        cursor = self._execute(
-            "UPDATE pi_mappings SET pi_point_name = ?, point_source = ?, location1 = ?, "
-            "publish_interval_ms = ?, enabled = ?, updated_at = CURRENT_TIMESTAMP "
-            "WHERE mapping_id = ?",
-            (
-                pi_point_name,
-                point_source,
-                location1,
-                publish_interval_ms,
-                1 if enabled else 0,
-                mapping_id,
-            ),
-        )
-        if cursor.rowcount == 0:
-            return None
+        if opc_item_path is not None:
+            self._execute(
+                "UPDATE pi_mappings SET opc_item_path = ?, pi_point_name = ?, "
+                "publish_interval_ms = ?, enabled = ?, updated_at = CURRENT_TIMESTAMP "
+                "WHERE mapping_id = ?",
+                (
+                    opc_item_path,
+                    pi_point_name,
+                    publish_interval_ms,
+                    1 if enabled else 0,
+                    mapping_id,
+                ),
+            )
+        else:
+            self._execute(
+                "UPDATE pi_mappings SET pi_point_name = ?, "
+                "publish_interval_ms = ?, enabled = ?, updated_at = CURRENT_TIMESTAMP "
+                "WHERE mapping_id = ?",
+                (
+                    pi_point_name,
+                    publish_interval_ms,
+                    1 if enabled else 0,
+                    mapping_id,
+                ),
+            )
         return self.get_pi_mapping(mapping_id)
+
+    def save_pi_mappings_batch(
+        self,
+        equipment_id: str,
+        opc_prog_id: str,
+        rows: List[dict[str, Any]],
+    ) -> List[dict[str, Any]]:
+        profile = self.get_pi_profile(equipment_id, opc_prog_id)
+        profile_id = profile["profile_id"] if profile else None
+        ps = profile["point_source"] if profile else ""
+        loc1 = profile["location1"] if profile else 0
+
+        existing = {m["mapping_id"]: m for m in self.list_pi_mappings(equipment_id, opc_prog_id)}
+        kept_ids: set[str] = set()
+
+        for row in rows:
+            m_id = str(row.get("mapping_id") or "").strip()
+            path = str(row.get("opc_item_path") or "").strip()
+            pt_name = str(row.get("pi_point_name") or "").strip()
+            interval = int(row.get("publish_interval_ms", 5000))
+            en = bool(row.get("enabled", True))
+
+            if m_id and m_id in existing:
+                self.update_pi_mapping(
+                    mapping_id=m_id,
+                    opc_item_path=path,
+                    pi_point_name=pt_name,
+                    publish_interval_ms=interval,
+                    enabled=en,
+                )
+                kept_ids.add(m_id)
+            else:
+                new_id = m_id if m_id else str(uuid.uuid4())
+                self.add_pi_mapping(
+                    mapping_id=new_id,
+                    equipment_id=equipment_id,
+                    opc_prog_id=opc_prog_id,
+                    opc_item_path=path,
+                    pi_point_name=pt_name,
+                    publish_interval_ms=interval,
+                    enabled=en,
+                    point_source=ps,
+                    location1=loc1,
+                    profile_id=profile_id,
+                )
+                kept_ids.add(new_id)
+
+        for ex_id in existing:
+            if ex_id not in kept_ids:
+                self.delete_pi_mapping(ex_id)
+
+        return self.list_pi_mappings(equipment_id, opc_prog_id)
 
     def set_pi_mapping_enabled(self, mapping_id: str, enabled: bool) -> bool:
         cursor = self._execute(
@@ -830,27 +901,25 @@ class PersistenceRepository:
         cursor = self._execute("DELETE FROM pi_mappings WHERE mapping_id = ?", (mapping_id,))
         return cursor.rowcount > 0
 
-    def get_pi_profile(self, equipment_id: str, opc_config_id: str) -> Optional[dict[str, Any]]:
+    def get_pi_profile(self, equipment_id: str, opc_prog_id: str) -> Optional[dict[str, Any]]:
         query = (
-            "SELECT p.profile_id, p.profile_id AS id, p.equipment_id, p.opc_config_id, "
+            "SELECT p.profile_id, p.profile_id AS id, p.equipment_id, p.opc_prog_id, "
             "p.point_source, p.location1, p.enabled, p.created_at, p.updated_at, "
-            "e.name AS equipment_name, c.name AS config_name "
+            "e.name AS equipment_name, e.agent_id "
             "FROM pi_profiles p "
             "JOIN equipments e ON e.equipment_id = p.equipment_id "
-            "JOIN named_opc_configs c ON c.config_id = p.opc_config_id "
-            "WHERE p.equipment_id = ? AND p.opc_config_id = ?"
+            "WHERE p.equipment_id = ? AND p.opc_prog_id = ?"
         )
-        rows = self._dicts(self._execute(query, (equipment_id, opc_config_id)))
+        rows = self._dicts(self._execute(query, (equipment_id, opc_prog_id)))
         return rows[0] if rows else None
 
     def get_pi_profile_by_id(self, profile_id: str) -> Optional[dict[str, Any]]:
         query = (
-            "SELECT p.profile_id, p.profile_id AS id, p.equipment_id, p.opc_config_id, "
+            "SELECT p.profile_id, p.profile_id AS id, p.equipment_id, p.opc_prog_id, "
             "p.point_source, p.location1, p.enabled, p.created_at, p.updated_at, "
-            "e.name AS equipment_name, c.name AS config_name "
+            "e.name AS equipment_name, e.agent_id "
             "FROM pi_profiles p "
             "JOIN equipments e ON e.equipment_id = p.equipment_id "
-            "JOIN named_opc_configs c ON c.config_id = p.opc_config_id "
             "WHERE p.profile_id = ?"
         )
         rows = self._dicts(self._execute(query, (profile_id,)))
@@ -858,38 +927,37 @@ class PersistenceRepository:
 
     def list_pi_profiles(self, equipment_id: Optional[str] = None) -> List[dict[str, Any]]:
         query = (
-            "SELECT p.profile_id, p.profile_id AS id, p.equipment_id, p.opc_config_id, "
+            "SELECT p.profile_id, p.profile_id AS id, p.equipment_id, p.opc_prog_id, "
             "p.point_source, p.location1, p.enabled, p.created_at, p.updated_at, "
-            "e.name AS equipment_name, c.name AS config_name "
+            "e.name AS equipment_name, e.agent_id "
             "FROM pi_profiles p "
-            "JOIN equipments e ON e.equipment_id = p.equipment_id "
-            "JOIN named_opc_configs c ON c.config_id = p.opc_config_id"
+            "JOIN equipments e ON e.equipment_id = p.equipment_id"
         )
         params: tuple = ()
         if equipment_id:
             query += " WHERE p.equipment_id = ?"
             params = (equipment_id,)
-        query += " ORDER BY e.name, c.name"
+        query += " ORDER BY e.name, p.opc_prog_id"
         return self._dicts(self._execute(query, params))
 
     def add_pi_profile(
         self,
         profile_id: str,
         equipment_id: str,
-        opc_config_id: str,
+        opc_prog_id: str,
         point_source: str,
         location1: int,
         enabled: bool = True,
     ) -> PiProfile:
         self._execute(
-            "INSERT INTO pi_profiles (profile_id, equipment_id, opc_config_id, point_source, location1, enabled) "
+            "INSERT INTO pi_profiles (profile_id, equipment_id, opc_prog_id, point_source, location1, enabled) "
             "VALUES (?, ?, ?, ?, ?, ?)",
-            (profile_id, equipment_id, opc_config_id, point_source, location1, 1 if enabled else 0),
+            (profile_id, equipment_id, opc_prog_id, point_source, location1, 1 if enabled else 0),
         )
         return PiProfile(
             profile_id=profile_id,
             equipment_id=equipment_id,
-            opc_config_id=opc_config_id,
+            opc_prog_id=opc_prog_id,
             point_source=point_source,
             location1=location1,
             enabled=enabled,
@@ -918,7 +986,7 @@ class PersistenceRepository:
     def deactivate_mappings_for_profile(
         self,
         equipment_id: str,
-        opc_config_id: str,
+        opc_prog_id: str,
         new_point_source: Optional[str] = None,
         new_location1: Optional[int] = None,
     ) -> int:
@@ -927,15 +995,15 @@ class PersistenceRepository:
                 "UPDATE pi_mappings SET enabled = 0, point_source = ?, location1 = ?, "
                 "last_publish_status = 'Perfil alterado — revalidação necessária', "
                 "updated_at = CURRENT_TIMESTAMP "
-                "WHERE equipment_id = ? AND opc_config_id = ?",
-                (new_point_source, new_location1, equipment_id, opc_config_id),
+                "WHERE equipment_id = ? AND opc_prog_id = ?",
+                (new_point_source, new_location1, equipment_id, opc_prog_id),
             )
         else:
             cursor = self._execute(
                 "UPDATE pi_mappings SET enabled = 0, "
                 "last_publish_status = 'Perfil alterado — revalidação necessária', "
                 "updated_at = CURRENT_TIMESTAMP "
-                "WHERE equipment_id = ? AND opc_config_id = ?",
-                (equipment_id, opc_config_id),
+                "WHERE equipment_id = ? AND opc_prog_id = ?",
+                (equipment_id, opc_prog_id),
             )
         return cursor.rowcount

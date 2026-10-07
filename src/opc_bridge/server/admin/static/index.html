@@ -228,10 +228,10 @@
         <button id="btn-test-pi-connection" type="button" style="white-space: nowrap;">Testar conexão PI</button>
       </div>
 
-      <!-- Card: Seleção de Contexto & Perfil PI (Equipamento + Configuração OPC) -->
+      <!-- Card: Seleção de Contexto & Perfil PI (Equipamento + Servidor OPC) -->
       <section class="card" id="pi-profile-card">
         <div class="section-title">
-          <h2>Contexto e Perfil PI (Equipamento + Servidor OPC)</h2>
+          <h2>Perfil PI (Equipamento + Servidor OPC)</h2>
           <span id="pi-profile-badge" class="badge">Perfil PI</span>
         </div>
         <div class="form-grid">
@@ -242,14 +242,16 @@
             </select>
           </div>
           <div>
-            <label for="pi-config-select">Configuração OPC existente *</label>
-            <select id="pi-config-select" required disabled>
-              <option value="">Selecione a configuração OPC...</option>
-            </select>
+            <label for="pi-prog-id">Servidor OPC / ProgID *</label>
+            <div class="input-with-button">
+              <input id="pi-prog-id" list="pi-servers-list" placeholder="Ex: ABB.AfwOpcDaServer" required disabled autocomplete="off">
+              <button type="button" id="btn-discover-pi-servers" disabled title="Descobrir servidores OPC disponíveis no equipamento">Descobrir</button>
+            </div>
+            <datalist id="pi-servers-list"></datalist>
           </div>
           <div>
             <label for="pi-point-source">Point Source PI *</label>
-            <input id="pi-point-source" required maxlength="64" placeholder="Ex: OPCBRIDGE" value="OPC" disabled>
+            <input id="pi-point-source" required maxlength="64" placeholder="Ex: OPCBRIDGE" value="OPCBRIDGE" disabled>
           </div>
           <div>
             <label for="pi-location1">Location1 PI *</label>
@@ -268,81 +270,54 @@
         <div class="actions" style="margin-top: 14px;">
           <button type="button" id="btn-save-pi-profile" class="primary" disabled>Salvar perfil PI</button>
         </div>
-        <p class="muted">Point Source e Location1 são definidos por perfil (Equipamento + Configuração OPC) e herdados por todas as tags mapeadas. Alterar o perfil desativa os mapeamentos desta configuração até nova validação.</p>
+        <p class="muted">Point Source e Location1 são definidos por perfil (Equipamento + Servidor OPC) e herdados por todas as linhas da planilha. Alterar o perfil desativa os mapeamentos deste servidor até nova validação.</p>
       </section>
 
-      <!-- Card superior para criar/editar um mapeamento -->
-      <section class="card" id="pi-mapping-form-card">
+      <!-- Card: Planilha manual de mapeamentos OPC → PI -->
+      <section class="card" id="pi-spreadsheet-card">
         <div class="section-title">
-          <h2 id="mapping-card-title">Mapeamentos OPC → PI</h2>
-          <span id="mapping-form-badge" class="badge">Criar mapeamento</span>
-        </div>
-        <div id="pi-mapping-profile-warning" class="banner warning">
-          Selecione um equipamento e uma configuração OPC com perfil PI ativo para cadastrar mapeamentos.
-        </div>
-        <form id="pi-mapping-form" onsubmit="return false;">
-          <input type="hidden" id="mapping-form-id">
-          <div class="form-grid">
-            <div>
-              <label for="pi-tag-select">Tag OPC cadastrada *</label>
-              <select id="pi-tag-select" required disabled>
-                <option value="">Selecione a tag OPC...</option>
-              </select>
-            </div>
-            <div>
-              <label for="pi-point-name">PI Point destino *</label>
-              <input id="pi-point-name" required maxlength="255" placeholder="Ex: DIAMETRO_CALC_BOBIN" disabled>
-            </div>
-            <div>
-              <label for="pi-interval">Velocidade de publicação (ms) *</label>
-              <input id="pi-interval" type="number" min="1000" max="60000" step="1" value="5000" required disabled>
-            </div>
-            <div style="display: flex; flex-direction: column; justify-content: flex-end; padding-bottom: 8px;">
-              <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
-                <input type="checkbox" id="pi-mapping-enabled" checked disabled>
-                <span>Ativo</span>
-              </label>
-            </div>
+          <h2>Planilha de Mapeamentos OPC → PI</h2>
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <span id="pi-profile-inherited-badge" class="badge" style="background: #eef2f6; color: #334155;">Point Source: — | Location1: —</span>
+            <span id="pi-mapping-count-badge" class="badge">0 linha(s)</span>
           </div>
-
-          <div id="pi-form-error" class="banner danger" hidden></div>
-
-          <div class="actions" style="margin-top: 14px;">
-            <button type="submit" id="btn-save-mapping" class="primary" disabled>Salvar mapeamento</button>
-            <button type="button" id="btn-cancel-mapping" hidden>Cancelar edição</button>
-          </div>
-        </form>
-      </section>
-
-      <!-- Tabela de mapeamentos do equipamento selecionado -->
-      <section class="card" id="pi-mappings-table-card">
-        <div class="section-title">
-          <h2>Mapeamentos do equipamento selecionado</h2>
-          <span id="pi-mapping-count-badge" class="badge">0 mapeamento(s)</span>
         </div>
+        <div id="pi-sheet-warning" class="banner warning">
+          Selecione um equipamento e informe o Servidor OPC com perfil PI ativo para carregar e editar a planilha.
+        </div>
+        <div id="pi-sheet-error" class="banner danger" style="margin-bottom: 12px;" hidden></div>
+        <div id="pi-sheet-success" class="banner success" style="margin-bottom: 12px;" hidden></div>
+
+        <!-- Toolbar da planilha -->
+        <div style="display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; flex-wrap: wrap;">
+          <div style="display: flex; gap: 8px;">
+            <button type="button" id="btn-add-pi-row" class="secondary" disabled>+ Adicionar linha</button>
+            <button type="button" id="btn-save-pi-sheet" class="primary" disabled>Salvar alterações</button>
+          </div>
+          <div>
+            <button type="button" id="btn-read-now-pi" class="secondary" disabled title="Executar leitura OPC sob demanda para preencher valores e validar endereços">⚡ Ler agora</button>
+          </div>
+        </div>
+
+        <!-- Tabela editável estilo planilha -->
         <div class="table-wrap">
-          <table>
+          <table id="pi-spreadsheet-table">
             <thead>
               <tr>
-                <th>Tag OPC origem</th>
-                <th>Último valor OPC</th>
-                <th>Qualidade</th>
-                <th>Último timestamp OPC</th>
-                <th>PI Point destino</th>
-                <th>Point Source</th>
-                <th>Location1</th>
-                <th>Velocidade</th>
-                <th>Estado</th>
-                <th>Último resultado</th>
-                <th>Último envio</th>
-                <th>Próximo envio</th>
-                <th>Erro</th>
-                <th>Ações</th>
+                <th style="min-width: 240px;">Endereço OPC *</th>
+                <th style="min-width: 200px;">PI Point *</th>
+                <th style="width: 140px;">Velocidade (ms) *</th>
+                <th style="width: 70px; text-align: center;">Ativo</th>
+                <th style="min-width: 120px;">Último valor</th>
+                <th style="min-width: 100px;">Qualidade</th>
+                <th style="min-width: 160px;">Último timestamp</th>
+                <th style="min-width: 180px;">Resultado</th>
+                <th style="width: 140px; text-align: center;">Ações</th>
               </tr>
             </thead>
-            <tbody id="pi-mappings-body">
+            <tbody id="pi-spreadsheet-body">
               <tr>
-                <td colspan="14" class="muted">Selecione um equipamento para visualizar os mapeamentos.</td>
+                <td colspan="9" class="muted">Selecione um equipamento e informe o Servidor OPC para carregar a planilha.</td>
               </tr>
             </tbody>
           </table>
