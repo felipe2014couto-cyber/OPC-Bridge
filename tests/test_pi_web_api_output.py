@@ -72,6 +72,15 @@ def pi_runtime(tmp_path, monkeypatch):
             tags_json=json.dumps(["TAG.BOBINADEIRA.PESO", "TAG.BOBINADEIRA.DIAMETRO"]),
             agent_id="agent-unit",
         )
+        # Create profile
+        repo.add_pi_profile(
+            profile_id="prof-unit",
+            equipment_id="eq-unit",
+            opc_config_id="cfg-unit",
+            point_source="OPC",
+            location1=1,
+            enabled=True,
+        )
         # Create a mapping
         repo.add_pi_mapping(
             mapping_id="map-unit-1",
@@ -266,16 +275,19 @@ def test_pi_web_api_channel_with_mocked_http():
         assert conn_res_err["status_code"] == 401
         assert "401" in conn_res_err["message"]
 
-    # 3. Successful publish via 2-step flow: GET /points?path=... then POST /streams/{webid}/value?updateOption=Replace
+    # 3. Successful publish via 3-step flow: GET /points?path=... then GET /points/{webid}/attributes then POST /streams/{webid}/value?updateOption=Replace
     points_resp = (200, {"WebId": "P0123456789WebId", "Name": "BOBIN_VEL"})
+    attrs_resp = (200, {"Items": [{"Name": "pointsource", "Value": "OPC"}, {"Name": "location1", "Value": 1}]})
     write_resp = (202, {"Status": "Created"})
 
-    with patch.object(channel, "_execute_http", side_effect=[points_resp, write_resp]) as mock_exec:
+    with patch.object(channel, "_execute_http", side_effect=[points_resp, attrs_resp, write_resp]) as mock_exec:
         pub_res = channel.publish(
             pi_point_name="BOBIN_VEL",
             value=85.2,
             timestamp=datetime(2026, 10, 7, 12, 0, 0, tzinfo=timezone.utc),
             quality=192,
+            point_source="OPC",
+            location1=1,
         )
         assert pub_res.status == "Publicado"
         assert pub_res.value == 85.2
@@ -284,14 +296,18 @@ def test_pi_web_api_channel_with_mocked_http():
         assert pub_res.details.get("status_code") == 202
         assert pub_res.details.get("web_id") == "P0123456789WebId"
 
-        # Verify two HTTP calls: GET /points?path=... and POST /streams/{WebId}/value?updateOption=Replace
-        assert mock_exec.call_count == 2
+        # Verify three HTTP calls: GET /points?path=..., GET /points/{WebId}/attributes and POST /streams/{WebId}/value?updateOption=Replace
+        assert mock_exec.call_count == 3
         req_resolve = mock_exec.call_args_list[0][0][0]
         assert req_resolve.get_method() == "GET"
         assert "/points?path=" in req_resolve.full_url
         assert "%5C%5CPIMS%5CBOBIN_VEL" in req_resolve.full_url
 
-        req_write = mock_exec.call_args_list[1][0][0]
+        req_attrs = mock_exec.call_args_list[1][0][0]
+        assert req_attrs.get_method() == "GET"
+        assert "/points/P0123456789WebId/attributes" in req_attrs.full_url
+
+        req_write = mock_exec.call_args_list[2][0][0]
         assert req_write.get_method() == "POST"
         assert "/streams/P0123456789WebId/value?updateOption=Replace" in req_write.full_url
         payload_sent = json.loads(req_write.data.decode("utf-8"))
@@ -299,6 +315,21 @@ def test_pi_web_api_channel_with_mocked_http():
             "Timestamp": "2026-10-07T12:00:00+00:00",
             "Value": 85.2,
         }
+
+    # 4. Fail-closed: Mismatch in PointSource or Location1 blocks publish
+    channel.clear_cache()
+    attrs_mismatch = (200, {"Items": [{"Name": "pointsource", "Value": "DIFF"}, {"Name": "location1", "Value": 99}]})
+    with patch.object(channel, "_execute_http", side_effect=[points_resp, attrs_mismatch]) as mock_exec_fail:
+        pub_blocked = channel.publish(
+            pi_point_name="BOBIN_VEL",
+            value=85.2,
+            point_source="OPC",
+            location1=1,
+        )
+        assert pub_blocked.status == "Erro"
+        assert "PointSource" in pub_blocked.error
+        # Stream POST was never called!
+        assert mock_exec_fail.call_count == 2
 
 
 def test_webid_resolution_using_path_and_caching():
@@ -337,26 +368,32 @@ def test_publish_workflow_post_streams_value_update_option_replace():
     )
     channel = PiWebApiOutputChannel(cfg)
 
-    # Mock sequence: 1st call GET /points, 2nd call POST /streams/{webid}/value?updateOption=Replace
+    # Mock sequence: 1st call GET /points, 2nd call GET /points/{webid}/attributes, 3rd call POST /streams/{webid}/value?updateOption=Replace
     points_resp = (200, {"WebId": "WEBID_PIMS_TAG_99", "Name": "BOBIN_PESO"})
+    attrs_resp = (200, {"Items": [{"Name": "pointsource", "Value": "OPC"}, {"Name": "location1", "Value": 1}]})
     stream_resp = (202, {})
 
-    with patch.object(channel, "_execute_http", side_effect=[points_resp, stream_resp]) as mock_exec:
+    with patch.object(channel, "_execute_http", side_effect=[points_resp, attrs_resp, stream_resp]) as mock_exec:
         dt = datetime(2026, 10, 7, 12, 30, 0, tzinfo=timezone.utc)
-        res = channel.publish("BOBIN_PESO", 1234.5, timestamp=dt)
+        res = channel.publish("BOBIN_PESO", 1234.5, timestamp=dt, point_source="OPC", location1=1)
 
         assert res.status == "Publicado"
         assert res.value == 1234.5
         assert res.details.get("web_id") == "WEBID_PIMS_TAG_99"
-        assert mock_exec.call_count == 2
+        assert mock_exec.call_count == 3
 
         # Verify call 1: GET /points?path=\\PIMS\\BOBIN_PESO
         req_resolve = mock_exec.call_args_list[0][0][0]
         assert req_resolve.get_method() == "GET"
         assert "/points?path=%5C%5CPIMS%5CBOBIN_PESO" in req_resolve.full_url
 
-        # Verify call 2: POST /streams/{webid}/value?updateOption=Replace
-        req_post = mock_exec.call_args_list[1][0][0]
+        # Verify call 2: GET /points/WEBID_PIMS_TAG_99/attributes
+        req_attrs = mock_exec.call_args_list[1][0][0]
+        assert req_attrs.get_method() == "GET"
+        assert "/points/WEBID_PIMS_TAG_99/attributes" in req_attrs.full_url
+
+        # Verify call 3: POST /streams/{webid}/value?updateOption=Replace
+        req_post = mock_exec.call_args_list[2][0][0]
         assert req_post.get_method() == "POST"
         assert "/streams/WEBID_PIMS_TAG_99/value?updateOption=Replace" in req_post.full_url
         assert req_post.headers["Content-type"] == "application/json"
@@ -366,9 +403,9 @@ def test_publish_workflow_post_streams_value_update_option_replace():
         assert sent_body["Timestamp"] == "2026-10-07T12:30:00+00:00"
         assert sent_body["Value"] == 1234.5
 
-    # Repeat call for the same tag: cache skips GET /points, only POST /streams is called
+    # Repeat call for the same tag: cache skips GET /points and GET /attributes, only POST /streams is called
     with patch.object(channel, "_execute_http", return_value=stream_resp) as mock_exec_cached:
-        res2 = channel.publish("BOBIN_PESO", 1235.0, timestamp=dt)
+        res2 = channel.publish("BOBIN_PESO", 1235.0, timestamp=dt, point_source="OPC", location1=1)
         assert res2.status == "Publicado"
         assert mock_exec_cached.call_count == 1
         req_cached = mock_exec_cached.call_args[0][0]
@@ -479,14 +516,22 @@ def test_pi_publisher_real_http_success_and_error():
         pi_point="SPEED_TAG",
         value=500.0,
         quality=192,
+        point_source="OPC",
+        location1=1,
     )
 
-    # 1. Success mock: resolve WebId then post stream value
+    # 1. Success mock: resolve WebId, get attributes, then post stream value
     mock_resp_resolve = MagicMock()
     mock_resp_resolve.status = 200
     mock_resp_resolve.getcode.return_value = 200
     mock_resp_resolve.read.return_value = b'{"WebId": "WEBID_SPEED_01"}'
     mock_resp_resolve.__enter__.return_value = mock_resp_resolve
+
+    mock_resp_attrs = MagicMock()
+    mock_resp_attrs.status = 200
+    mock_resp_attrs.getcode.return_value = 200
+    mock_resp_attrs.read.return_value = b'{"Items": [{"Name": "pointsource", "Value": "OPC"}, {"Name": "location1", "Value": 1}]}'
+    mock_resp_attrs.__enter__.return_value = mock_resp_attrs
 
     mock_resp_post = MagicMock()
     mock_resp_post.status = 202
@@ -494,7 +539,7 @@ def test_pi_publisher_real_http_success_and_error():
     mock_resp_post.read.return_value = b"{}"
     mock_resp_post.__enter__.return_value = mock_resp_post
 
-    with patch("urllib.request.urlopen", side_effect=[mock_resp_resolve, mock_resp_post]):
+    with patch("urllib.request.urlopen", side_effect=[mock_resp_resolve, mock_resp_attrs, mock_resp_post]):
         res = pub.publish_single(payload)
         assert res.status == "published"
         assert res.http_status == 202
@@ -658,7 +703,7 @@ def test_admin_api_pi_integration_status_endpoint(pi_runtime, monkeypatch):
     assert st.startswith("200")
     assert data["output_enabled"] is False
     assert data["output_mode"] == "simulated"
-    assert "simula" in data["banner_text"].lower()
+    assert "desabilitada" in data["banner_text"].lower()
 
     # 2. Output enabled
     monkeypatch.setenv("OPC_BRIDGE_PI_OUTPUT_ENABLED", "true")

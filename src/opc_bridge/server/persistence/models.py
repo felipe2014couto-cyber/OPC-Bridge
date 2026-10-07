@@ -118,3 +118,15 @@ class PiMapping:
     failure_count: int = 0
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class PiProfile:
+    profile_id: str
+    equipment_id: str
+    opc_config_id: str
+    point_source: str
+    location1: int
+    enabled: bool = True
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None

@@ -20,8 +20,15 @@ from opc_bridge.server.pi_output import (
 logger = logging.getLogger(__name__)
 
 
-def validate_pi_mapping_input(data: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
-    """Validate mapping payload and ensure publish_interval_ms >= config.interval_ms."""
+def validate_pi_mapping_input(
+    data: dict[str, Any],
+    config: dict[str, Any],
+    profile: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Validate mapping payload and ensure publish_interval_ms >= config.interval_ms.
+
+    PointSource and Location1 are inherited from the mandatory PI profile.
+    """
     if not isinstance(data, dict):
         raise ValueError("invalid_configuration")
 
@@ -29,15 +36,19 @@ def validate_pi_mapping_input(data: dict[str, Any], config: dict[str, Any]) -> d
     if not point_name or len(point_name) > 255:
         raise ValueError("invalid_pi_point_name")
 
-    point_source = str(data.get("point_source") or "").strip()
-    if len(point_source) > 64:
-        raise ValueError("invalid_point_source")
+    if profile is not None:
+        point_source = str(profile.get("point_source") or "").strip()
+        location1 = int(profile.get("location1", 0))
+    else:
+        point_source = str(data.get("point_source") or "").strip()
+        raw_loc1 = data.get("location1", 0)
+        try:
+            location1 = int(raw_loc1)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid_location1") from exc
 
-    raw_loc1 = data.get("location1", 0)
-    try:
-        location1 = int(raw_loc1)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("invalid_location1") from exc
+    if not point_source or len(point_source) > 64:
+        raise ValueError("invalid_point_source")
 
     raw_interval = data.get("publish_interval_ms")
     if type(raw_interval) is not int:
@@ -98,7 +109,7 @@ class PiIntegrationAdministration:
             if method != "GET":
                 return self._json_response(start_response, "405 Method Not Allowed", {"error": "method_not_allowed"})
             cfg = self._get_pi_output_config()
-            banner_text = "Saída PI habilitada" if cfg.enabled else "Saída PI: Simulação — nenhuma escrita real habilitada."
+            banner_text = "Saída PI habilitada" if cfg.enabled else "Saída PI desabilitada"
             return self._json_response(
                 start_response,
                 "200 OK",
@@ -123,11 +134,186 @@ class PiIntegrationAdministration:
 
         return self._json_response(start_response, "404 Not Found", {"error": "not_found"})
 
+    def pi_profile_route(
+        self, method: str, path: str, query: str, environ: dict[str, Any], start_response
+    ):
+        prefix = "/api/v1/pi-profiles"
+        if path != prefix and not path.startswith(prefix + "/"):
+            return None
+
+        subpath = path[len(prefix):]
+        parts = [p for p in subpath.split("/") if p]
+        user = str(environ.get("REMOTE_USER") or "admin").strip() or "admin"
+
+        # 1. GET or POST /api/v1/pi-profiles
+        if len(parts) == 0:
+            if method == "GET":
+                params = parse_qs(query) if query else {}
+                equipment_id = params.get("equipment_id", [None])[0]
+                opc_config_id = params.get("opc_config_id", [None])[0]
+                with self._database.session() as repo:
+                    if equipment_id and opc_config_id:
+                        prof = repo.get_pi_profile(equipment_id, opc_config_id)
+                        return self._json_response(start_response, "200 OK", {"profile": prof})
+                    profs = repo.list_pi_profiles(equipment_id)
+                return self._json_response(start_response, "200 OK", {"profiles": profs})
+
+            if method == "POST":
+                try:
+                    data = read_json(environ)
+                except Exception:
+                    return self._json_response(start_response, "400 Bad Request", {"error": "invalid_json"})
+
+                equipment_id = str(data.get("equipment_id") or "").strip()
+                opc_config_id = str(data.get("opc_config_id") or "").strip()
+                point_source = str(data.get("point_source") or "").strip()
+                raw_loc1 = data.get("location1", 0)
+                try:
+                    location1 = int(raw_loc1)
+                except (TypeError, ValueError):
+                    return self._json_response(start_response, "400 Bad Request", {"error": "invalid_location1"})
+
+                if not equipment_id or not opc_config_id:
+                    return self._json_response(
+                        start_response,
+                        "400 Bad Request",
+                        {"error": "missing_required_fields", "message": "Equipamento e Configuração OPC são obrigatórios."},
+                    )
+
+                if not point_source or len(point_source) > 64:
+                    return self._json_response(
+                        start_response,
+                        "400 Bad Request",
+                        {"error": "invalid_point_source", "message": "Point Source PI é obrigatório (máximo 64 caracteres)."},
+                    )
+
+                raw_enabled = data.get("enabled", True)
+                enabled = bool(raw_enabled) if raw_enabled is not None else True
+
+                with self._database.session() as repo:
+                    eq = repo.get_equipment(equipment_id)
+                    if eq is None:
+                        return self._json_response(start_response, "404 Not Found", {"error": "equipment_not_found"})
+
+                    cfg = repo.get_named_config(opc_config_id)
+                    if cfg is None or cfg.get("equipment_id") != equipment_id:
+                        return self._json_response(start_response, "404 Not Found", {"error": "opc_config_not_found"})
+
+                    existing = repo.get_pi_profile(equipment_id, opc_config_id)
+                    if existing:
+                        profile_id = existing["profile_id"]
+                        changed = (
+                            existing["point_source"] != point_source
+                            or existing["location1"] != location1
+                            or bool(existing["enabled"]) != enabled
+                        )
+                        repo.update_pi_profile(profile_id, point_source, location1, enabled)
+                        deactivated_count = 0
+                        if changed:
+                            deactivated_count = repo.deactivate_mappings_for_profile(
+                                equipment_id, opc_config_id, point_source, location1
+                            )
+                        agent_id = cfg.get("agent_id") or eq.get("agent_id")
+                        if agent_id:
+                            repo.add_audit_event(
+                                agent_id,
+                                str(uuid.uuid4()),
+                                "pi_profile.updated",
+                                json.dumps({
+                                    "profile_id": profile_id,
+                                    "equipment_id": equipment_id,
+                                    "opc_config_id": opc_config_id,
+                                    "point_source": point_source,
+                                    "location1": location1,
+                                    "enabled": enabled,
+                                    "mappings_deactivated": deactivated_count,
+                                    "user": user,
+                                }),
+                            )
+                        updated = repo.get_pi_profile_by_id(profile_id)
+                        return self._json_response(
+                            start_response,
+                            "200 OK",
+                            {
+                                "profile": updated,
+                                "mappings_deactivated": deactivated_count,
+                                "deactivated_mappings": deactivated_count,
+                            },
+                        )
+                    else:
+                        profile_id = str(uuid.uuid4())
+                        repo.add_pi_profile(
+                            profile_id=profile_id,
+                            equipment_id=equipment_id,
+                            opc_config_id=opc_config_id,
+                            point_source=point_source,
+                            location1=location1,
+                            enabled=enabled,
+                        )
+                        agent_id = cfg.get("agent_id") or eq.get("agent_id")
+                        if agent_id:
+                            repo.add_audit_event(
+                                agent_id,
+                                str(uuid.uuid4()),
+                                "pi_profile.created",
+                                json.dumps({
+                                    "profile_id": profile_id,
+                                    "equipment_id": equipment_id,
+                                    "opc_config_id": opc_config_id,
+                                    "point_source": point_source,
+                                    "location1": location1,
+                                    "enabled": enabled,
+                                    "user": user,
+                                }),
+                            )
+                        created = repo.get_pi_profile_by_id(profile_id)
+                        return self._json_response(start_response, "201 Created", {"profile": created})
+
+            return self._json_response(start_response, "405 Method Not Allowed", {"error": "method_not_allowed"})
+
+        # 2. Operations on /api/v1/pi-profiles/<profile_id>
+        profile_id = parts[0]
+        if len(parts) == 1:
+            if method == "GET":
+                with self._database.session() as repo:
+                    prof = repo.get_pi_profile_by_id(profile_id)
+                if prof is None:
+                    return self._json_response(start_response, "404 Not Found", {"error": "profile_not_found"})
+                return self._json_response(start_response, "200 OK", {"profile": prof})
+
+            if method == "DELETE":
+                with self._database.session() as repo:
+                    existing = repo.get_pi_profile_by_id(profile_id)
+                    if existing is None:
+                        return self._json_response(start_response, "404 Not Found", {"error": "profile_not_found"})
+                    repo.delete_pi_profile(profile_id)
+                    repo.deactivate_mappings_for_profile(existing["equipment_id"], existing["opc_config_id"])
+                    agent_id = existing.get("agent_id")
+                    if agent_id:
+                        repo.add_audit_event(
+                            agent_id,
+                            str(uuid.uuid4()),
+                            "pi_profile.deleted",
+                            json.dumps({
+                                "profile_id": profile_id,
+                                "equipment_id": existing["equipment_id"],
+                                "opc_config_id": existing["opc_config_id"],
+                                "user": user,
+                            }),
+                        )
+                return self._json_response(start_response, "200 OK", {"deleted": True, "profile_id": profile_id})
+
+            return self._json_response(start_response, "405 Method Not Allowed", {"error": "method_not_allowed"})
+
+        return self._json_response(start_response, "404 Not Found", {"error": "not_found"})
+
     def pi_mapping_route(
         self, method: str, path: str, query: str, environ: dict[str, Any], start_response
     ):
         if path.startswith("/api/v1/pi-integration"):
             return self.pi_integration_route(method, path, query, environ, start_response)
+        if path.startswith("/api/v1/pi-profiles"):
+            return self.pi_profile_route(method, path, query, environ, start_response)
 
         prefix = "/api/v1/pi-mappings"
         if path != prefix and not path.startswith(prefix + "/"):
@@ -222,8 +408,19 @@ class PiIntegrationAdministration:
                             {"error": "tag_not_in_config", "message": f"A tag '{opc_item_path}' não pertence à configuração OPC selecionada."},
                         )
 
+                    profile = repo.get_pi_profile(equipment_id, opc_config_id)
+                    if profile is None or not profile.get("enabled"):
+                        return self._json_response(
+                            start_response,
+                            "400 Bad Request",
+                            {
+                                "error": "profile_required",
+                                "message": "É obrigatório configurar e ativar o Perfil PI para este Equipamento e Configuração OPC antes de cadastrar mapeamentos.",
+                            },
+                        )
+
                     try:
-                        validated = validate_pi_mapping_input(data, cfg)
+                        validated = validate_pi_mapping_input(data, cfg, profile=profile)
                     except ValueError as exc:
                         code = str(exc)
                         if code == "interval_faster_than_opc":
@@ -310,7 +507,7 @@ class PiIntegrationAdministration:
 
                 query_sql = (
                     "SELECT event_id, agent_id, event_type, detail_json, occurred_at "
-                    "FROM audit_events WHERE event_type LIKE 'pi_mapping.%' "
+                    "FROM audit_events WHERE (event_type LIKE 'pi_mapping.%' OR event_type LIKE 'pi_profile.%') "
                 )
                 sql_params: tuple = ()
                 if agent_id:
@@ -347,6 +544,17 @@ class PiIntegrationAdministration:
                 mapping = repo.get_pi_mapping(mapping_id)
                 if mapping is None:
                     return self._json_response(start_response, "404 Not Found", {"error": "mapping_not_found"})
+
+                profile = repo.get_pi_profile(mapping["equipment_id"], mapping["opc_config_id"])
+                if profile is None or not profile.get("enabled"):
+                    return self._json_response(
+                        start_response,
+                        "400 Bad Request",
+                        {
+                            "error": "profile_required",
+                            "message": "Não é possível simular o mapeamento sem um Perfil PI ativo para esta configuração.",
+                        },
+                    )
 
                 # Requirement 4: only active (enabled) mappings can be published/simulated
                 if not mapping.get("enabled"):
@@ -424,6 +632,17 @@ class PiIntegrationAdministration:
                 mapping = repo.get_pi_mapping(mapping_id)
                 if mapping is None:
                     return self._json_response(start_response, "404 Not Found", {"error": "mapping_not_found"})
+
+                profile = repo.get_pi_profile(mapping["equipment_id"], mapping["opc_config_id"])
+                if profile is None or not profile.get("enabled"):
+                    return self._json_response(
+                        start_response,
+                        "400 Bad Request",
+                        {
+                            "error": "profile_required",
+                            "message": "Não é possível publicar o mapeamento sem um Perfil PI ativo para esta configuração.",
+                        },
+                    )
 
                 if not mapping.get("enabled"):
                     return self._json_response(
@@ -514,6 +733,18 @@ class PiIntegrationAdministration:
                     return self._json_response(start_response, "404 Not Found", {"error": "mapping_not_found"})
 
                 new_enabled = not bool(mapping.get("enabled"))
+                if new_enabled:
+                    profile = repo.get_pi_profile(mapping["equipment_id"], mapping["opc_config_id"])
+                    if profile is None or not profile.get("enabled"):
+                        return self._json_response(
+                            start_response,
+                            "400 Bad Request",
+                            {
+                                "error": "profile_required",
+                                "message": "Não é possível ativar o mapeamento sem um Perfil PI ativo para esta configuração.",
+                            },
+                        )
+
                 repo.set_pi_mapping_enabled(mapping_id, new_enabled)
 
                 agent_id = mapping.get("agent_id")
@@ -533,6 +764,57 @@ class PiIntegrationAdministration:
                 updated = repo.get_pi_mapping(mapping_id)
 
             return self._json_response(start_response, "200 OK", {"mapping": updated})
+
+        # Validate PI Point: POST /api/v1/pi-mappings/<id>/validate-point
+        if len(parts) == 2 and parts[1] == "validate-point":
+            if method != "POST":
+                return self._json_response(start_response, "405 Method Not Allowed", {"error": "method_not_allowed"})
+
+            with self._database.session() as repo:
+                mapping = repo.get_pi_mapping(mapping_id)
+                if mapping is None:
+                    return self._json_response(start_response, "404 Not Found", {"error": "mapping_not_found"})
+
+                profile = repo.get_pi_profile(mapping["equipment_id"], mapping["opc_config_id"])
+                if profile is None or not profile.get("enabled"):
+                    return self._json_response(
+                        start_response,
+                        "400 Bad Request",
+                        {
+                            "error": "profile_required",
+                            "message": "Não é possível validar o PI Point sem um Perfil PI ativo para esta configuração.",
+                        },
+                    )
+
+                channel = self._get_pi_output_channel()
+                val_res = channel.validate_point(
+                    pi_point_name=mapping["pi_point_name"],
+                    point_source=profile["point_source"],
+                    location1=profile["location1"],
+                )
+
+                agent_id = mapping.get("agent_id")
+                if agent_id:
+                    repo.add_audit_event(
+                        agent_id,
+                        str(uuid.uuid4()),
+                        "pi_mapping.validated",
+                        json.dumps({
+                            "mapping_id": mapping_id,
+                            "pi_point_name": mapping["pi_point_name"],
+                            "point_source": profile["point_source"],
+                            "location1": profile["location1"],
+                            "valid": val_res.get("valid"),
+                            "status": val_res.get("message") or val_res.get("error"),
+                            "user": user,
+                        }),
+                    )
+
+                status_code = "200 OK" if val_res.get("valid") else "400 Bad Request"
+                resp = dict(val_res)
+                resp["result"] = val_res
+                resp["mapping"] = mapping
+                return self._json_response(start_response, status_code, resp)
 
         # Single mapping operations: GET, PUT, DELETE /api/v1/pi-mappings/<id>
         if len(parts) == 1:
@@ -558,8 +840,20 @@ class PiIntegrationAdministration:
                     if cfg is None:
                         return self._json_response(start_response, "404 Not Found", {"error": "opc_config_not_found"})
 
+                    profile = repo.get_pi_profile(existing["equipment_id"], existing["opc_config_id"])
+                    raw_en = data.get("enabled", True)
+                    if bool(raw_en) and (profile is None or not profile.get("enabled")):
+                        return self._json_response(
+                            start_response,
+                            "400 Bad Request",
+                            {
+                                "error": "profile_required",
+                                "message": "Não é possível ativar o mapeamento sem um Perfil PI ativo para esta configuração.",
+                            },
+                        )
+
                     try:
-                        validated = validate_pi_mapping_input(data, cfg)
+                        validated = validate_pi_mapping_input(data, cfg, profile=profile)
                     except ValueError as exc:
                         code = str(exc)
                         if code == "interval_faster_than_opc":

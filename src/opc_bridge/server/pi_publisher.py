@@ -94,8 +94,8 @@ class PiPublisherService:
         results: List[dict[str, Any]] = []
 
         for m in mappings:
-            # Only process enabled mappings
-            if not m.get("enabled"):
+            # Only process enabled mappings with an active profile
+            if not m.get("enabled") or not m.get("profile_enabled"):
                 continue
 
             ag_id = m.get("agent_id") or ""

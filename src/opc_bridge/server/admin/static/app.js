@@ -18,6 +18,7 @@
   let generation = 0;
   let selectedPiEquipment = null;
   let selectedPiConfig = null;
+  let currentPiProfile = null;
   let piMappings = [];
   let editingMappingId = null;
   let deletingMappingId = null;
@@ -1033,6 +1034,187 @@
     }
   }
 
+  function clearProfileError() {
+    const errBox = el("pi-profile-error");
+    if (errBox) {
+      errBox.textContent = "";
+      errBox.hidden = true;
+    }
+  }
+
+  function renderPiProfileState() {
+    clearProfileError();
+    const psInput = el("pi-point-source");
+    const locInput = el("pi-location1");
+    const enInput = el("pi-profile-enabled");
+    const btnSaveProf = el("btn-save-pi-profile");
+    const badge = el("pi-profile-badge");
+    const notice = el("pi-profile-notice");
+    const mapWarning = el("pi-mapping-profile-warning");
+    const tagSelect = el("pi-tag-select");
+    const ptInput = el("pi-point-name");
+    const intInput = el("pi-interval");
+    const mapEnInput = el("pi-mapping-enabled");
+    const btnSaveMap = el("btn-save-mapping");
+
+    if (!selectedPiEquipment || !selectedPiConfig) {
+      if (psInput) { psInput.value = "OPC"; psInput.disabled = true; }
+      if (locInput) { locInput.value = "1"; locInput.disabled = true; }
+      if (enInput) { enInput.checked = true; enInput.disabled = true; }
+      if (btnSaveProf) btnSaveProf.disabled = true;
+      if (badge) { badge.textContent = "Perfil PI"; badge.className = "badge"; }
+      if (notice) { notice.textContent = ""; notice.hidden = true; }
+      if (mapWarning) {
+        mapWarning.textContent = "Selecione um equipamento e uma configuração OPC com perfil PI ativo para cadastrar mapeamentos.";
+        mapWarning.hidden = false;
+      }
+      if (tagSelect) tagSelect.disabled = true;
+      if (ptInput) ptInput.disabled = true;
+      if (intInput) intInput.disabled = true;
+      if (mapEnInput) mapEnInput.disabled = true;
+      if (btnSaveMap) btnSaveMap.disabled = true;
+      return;
+    }
+
+    // Configuração OPC selecionada
+    if (psInput) psInput.disabled = false;
+    if (locInput) locInput.disabled = false;
+    if (enInput) enInput.disabled = false;
+    if (btnSaveProf) btnSaveProf.disabled = false;
+
+    if (currentPiProfile) {
+      if (el("pi-profile-id")) el("pi-profile-id").value = currentPiProfile.id || "";
+      if (psInput) psInput.value = currentPiProfile.point_source || "OPC";
+      if (locInput) locInput.value = currentPiProfile.location1 !== null && currentPiProfile.location1 !== undefined ? currentPiProfile.location1 : 1;
+      if (enInput) enInput.checked = Boolean(currentPiProfile.enabled);
+
+      if (currentPiProfile.enabled) {
+        if (badge) { badge.textContent = "Perfil Ativo"; badge.className = "badge active-status"; }
+        if (notice) {
+          notice.textContent = `Perfil ativo para este servidor OPC (Point Source: ${currentPiProfile.point_source}, Location1: ${currentPiProfile.location1}).`;
+          notice.className = "banner success";
+          notice.hidden = false;
+        }
+        if (mapWarning) mapWarning.hidden = true;
+        if (tagSelect && selectedPiConfig.tags && selectedPiConfig.tags.length > 0) tagSelect.disabled = false;
+        if (ptInput) ptInput.disabled = false;
+        if (intInput) intInput.disabled = false;
+        if (mapEnInput) mapEnInput.disabled = false;
+        if (btnSaveMap) btnSaveMap.disabled = false;
+      } else {
+        if (badge) { badge.textContent = "Perfil Inativo"; badge.className = "badge inactive-status"; }
+        if (notice) {
+          notice.textContent = "Perfil PI desta configuração está desativado. Ative o perfil para permitir mapeamentos.";
+          notice.className = "banner warning";
+          notice.hidden = false;
+        }
+        if (mapWarning) {
+          mapWarning.textContent = "O perfil PI desta configuração está desativado. Ative o perfil acima para cadastrar ou editar mapeamentos.";
+          mapWarning.hidden = false;
+        }
+        if (tagSelect) tagSelect.disabled = true;
+        if (ptInput) ptInput.disabled = true;
+        if (intInput) intInput.disabled = true;
+        if (mapEnInput) mapEnInput.disabled = true;
+        if (btnSaveMap) btnSaveMap.disabled = true;
+      }
+    } else {
+      if (el("pi-profile-id")) el("pi-profile-id").value = "";
+      if (psInput) psInput.value = "OPC";
+      if (locInput) locInput.value = "1";
+      if (enInput) enInput.checked = true;
+      if (badge) { badge.textContent = "Não configurado"; badge.className = "badge unconfigured"; }
+      if (notice) {
+        notice.textContent = "Nenhum perfil PI cadastrado para esta configuração OPC. Defina o Point Source e Location1 e salve o perfil.";
+        notice.className = "banner warning";
+        notice.hidden = false;
+      }
+      if (mapWarning) {
+        mapWarning.textContent = "É obrigatório criar e ativar o perfil PI para este equipamento e configuração OPC antes de cadastrar mapeamentos.";
+        mapWarning.hidden = false;
+      }
+      if (tagSelect) tagSelect.disabled = true;
+      if (ptInput) ptInput.disabled = true;
+      if (intInput) intInput.disabled = true;
+      if (mapEnInput) mapEnInput.disabled = true;
+      if (btnSaveMap) btnSaveMap.disabled = true;
+    }
+  }
+
+  async function savePiProfile() {
+    clearProfileError();
+    if (!selectedPiEquipment || !selectedPiConfig) {
+      message("Selecione um equipamento e uma configuração OPC antes de salvar o perfil PI.", "error");
+      return;
+    }
+
+    const psInput = el("pi-point-source");
+    const locInput = el("pi-location1");
+    const enInput = el("pi-profile-enabled");
+    const errBox = el("pi-profile-error");
+
+    const pointSource = psInput ? psInput.value.trim() : "";
+    const locVal = locInput ? locInput.value.trim() : "";
+    const location1 = parseInt(locVal, 10);
+    const enabled = enInput ? enInput.checked : true;
+
+    if (!pointSource || isNaN(location1)) {
+      if (errBox) {
+        errBox.textContent = "Point Source e Location1 (número inteiro) são obrigatórios.";
+        errBox.hidden = false;
+      }
+      return;
+    }
+
+    if (currentPiProfile) {
+      const oldPs = currentPiProfile.point_source || "";
+      const oldLoc = currentPiProfile.location1;
+      if (oldPs !== pointSource || oldLoc !== location1) {
+        const proceed = confirm("Alterar o perfil PI irá desativar todos os mapeamentos desta configuração até que sejam novamente validados. Deseja continuar?");
+        if (!proceed) return;
+      }
+    }
+
+    const payload = {
+      equipment_id: selectedPiEquipment.equipment_id,
+      opc_config_id: selectedPiConfig.config_id,
+      point_source: pointSource,
+      location1: location1,
+      enabled: enabled
+    };
+
+    try {
+      const res = await api("/api/v1/pi-profiles", payload, "POST");
+      currentPiProfile = res.profile || null;
+      message("Perfil PI salvo com sucesso.", "success");
+      renderPiProfileState();
+      await loadPiMappings();
+      await loadPiAudit();
+    } catch (err) {
+      if (errBox) {
+        errBox.textContent = err.message;
+        errBox.hidden = false;
+      }
+      message(err.message, "error");
+    }
+  }
+
+  async function validatePiPointMapping(mappingId) {
+    try {
+      message("Validando PI Point na PI Web API...", "info");
+      const res = await api(`/api/v1/pi-mappings/${encodeURIComponent(mappingId)}/validate-point`, {}, "POST");
+      if (res.valid) {
+        message(`Ponto PI "${res.pi_point_name}" validado com sucesso! (PointSource: ${res.actual_point_source}, Location1: ${res.actual_location1})`, "success");
+      } else {
+        message(`Falha na validação do PI Point "${res.pi_point_name}": ${res.message || res.error}`, "warning");
+      }
+      await loadPiMappings();
+      await loadPiAudit();
+    } catch (err) {
+      message(`Erro ao validar PI Point: ${err.message}`, "error");
+    }
+  }
+
   async function onPiEquipmentSelected() {
     const eqSelect = el("pi-equipment-select");
     const cfgSelect = el("pi-config-select");
@@ -1041,6 +1223,7 @@
 
     selectedPiEquipment = equipments.find(e => e.equipment_id === eqId) || null;
     selectedPiConfig = null;
+    currentPiProfile = null;
     editingMappingId = null;
     piMappings = [];
 
@@ -1064,6 +1247,7 @@
       tagSelect.disabled = true;
     }
 
+    renderPiProfileState();
     cancelEditMapping();
     renderPiMappingsTable();
 
@@ -1109,8 +1293,10 @@
       el("pi-point-name").value = "";
     }
 
-    if (!cfgId) {
+    if (!cfgId || !selectedPiEquipment) {
       selectedPiConfig = null;
+      currentPiProfile = null;
+      renderPiProfileState();
       validatePiForm(false);
       await loadPiMappings();
       return;
@@ -1120,6 +1306,14 @@
       const res = await api(`/api/v1/opc-configs/${encodeURIComponent(cfgId)}`);
       const cfg = res.config || res;
       selectedPiConfig = cfg;
+
+      // Buscar perfil PI para este (equipment_id, opc_config_id)
+      try {
+        const profRes = await api(`/api/v1/pi-profiles?equipment_id=${encodeURIComponent(selectedPiEquipment.equipment_id)}&opc_config_id=${encodeURIComponent(cfgId)}`);
+        currentPiProfile = profRes.profile || null;
+      } catch (e) {
+        currentPiProfile = null;
+      }
 
       // Popular tags da configuração selecionada
       if (tagSelect) {
@@ -1136,8 +1330,9 @@
           opt.textContent = t;
           tagSelect.appendChild(opt);
         });
-        tagSelect.disabled = tags.length === 0;
       }
+
+      renderPiProfileState();
 
       // Sincronizar velocidade padrão com o intervalo OPC
       if (!editingMappingId) {
@@ -1159,11 +1354,16 @@
     const cfgVal = el("pi-config-select") ? el("pi-config-select").value : "";
     const tagVal = el("pi-tag-select") ? el("pi-tag-select").value : "";
     const pointVal = el("pi-point-name") ? el("pi-point-name").value.trim() : "";
-    const sourceVal = el("pi-point-source") ? el("pi-point-source").value.trim() : "";
-    const loc1Val = el("pi-location1") ? el("pi-location1").value.trim() : "";
     const intervalVal = intervalInput ? parseInt(intervalInput.value, 10) : NaN;
 
     if (!errorBox) return false;
+
+    // 0. Validar se existe perfil PI ativo para o equipamento e configuração
+    if (!currentPiProfile || !currentPiProfile.enabled) {
+      errorBox.textContent = "É obrigatório configurar e ativar o perfil PI para este Equipamento e Configuração OPC antes de cadastrar mapeamentos.";
+      errorBox.hidden = false;
+      return false;
+    }
 
     // 1. Validar intervalo entre 1000 e 60000 ms
     if (isNaN(intervalVal) || intervalVal < 1000 || intervalVal > 60000) {
@@ -1182,8 +1382,8 @@
 
     // 3. Validar preenchimento dos campos obrigatórios
     if (showMissingFields) {
-      if (!eqVal || !cfgVal || !tagVal || !pointVal || !sourceVal || loc1Val === "") {
-        errorBox.textContent = "Preencha todos os campos obrigatórios: Equipamento, Configuração, Tag OPC, PI Point, Point Source e Location1.";
+      if (!eqVal || !cfgVal || !tagVal || !pointVal) {
+        errorBox.textContent = "Preencha todos os campos obrigatórios: Equipamento, Configuração, Tag OPC e PI Point.";
         errorBox.hidden = false;
         return false;
       }
@@ -1349,6 +1549,15 @@
       const tdAct = document.createElement("td");
       tdAct.className = "actions";
 
+      // Botão Validar
+      const btnValidate = document.createElement("button");
+      btnValidate.type = "button";
+      btnValidate.className = "btn-sm";
+      btnValidate.textContent = "Validar";
+      btnValidate.title = "Validar se o PI Point existe e se Point Source e Location1 coincidem com o perfil ativo";
+      btnValidate.addEventListener("click", () => validatePiPointMapping(m.mapping_id));
+      tdAct.appendChild(btnValidate);
+
       // Botão Publicar uma vez
       const btnPubOnce = document.createElement("button");
       btnPubOnce.type = "button";
@@ -1405,8 +1614,6 @@
     const cfgSelect = el("pi-config-select");
     const tagSelect = el("pi-tag-select");
     const pointInput = el("pi-point-name");
-    const sourceInput = el("pi-point-source");
-    const locInput = el("pi-location1");
     const intervalInput = el("pi-interval");
     const enabledInput = el("pi-mapping-enabled");
     const formId = el("mapping-form-id").value;
@@ -1415,8 +1622,6 @@
     const cfgId = cfgSelect ? cfgSelect.value : "";
     const opcTag = tagSelect ? tagSelect.value : "";
     const piPointName = pointInput ? pointInput.value.trim() : "";
-    const pointSource = sourceInput ? (sourceInput.value.trim() || "OPC") : "OPC";
-    const location1 = locInput ? parseInt(locInput.value, 10) : 1;
     const publishIntervalMs = intervalInput ? parseInt(intervalInput.value, 10) : 5000;
     const enabled = enabledInput ? enabledInput.checked : true;
 
@@ -1425,8 +1630,6 @@
       opc_config_id: cfgId,
       opc_item_path: opcTag,
       pi_point_name: piPointName,
-      point_source: pointSource,
-      location1: isNaN(location1) ? 1 : location1,
       publish_interval_ms: publishIntervalMs,
       enabled: enabled
     };
@@ -1478,6 +1681,14 @@
       cfgSelect.disabled = false;
       cfgSelect.value = m.opc_config_id;
 
+      // Carregar perfil PI
+      try {
+        const profRes = await api(`/api/v1/pi-profiles?equipment_id=${encodeURIComponent(m.equipment_id)}&opc_config_id=${encodeURIComponent(m.opc_config_id)}`);
+        currentPiProfile = profRes.profile || null;
+      } catch (e) {
+        currentPiProfile = null;
+      }
+
       // Carregar tags da configuração
       const res = await api(`/api/v1/opc-configs/${encodeURIComponent(m.opc_config_id)}`);
       const cfg = res.config || res;
@@ -1495,17 +1706,16 @@
         opt.textContent = t;
         tagSelect.appendChild(opt);
       });
-      tagSelect.disabled = false;
       tagSelect.value = m.opc_item_path;
     } catch (err) {
       message(err.message, "error");
     }
 
+    renderPiProfileState();
+
     if (el("pi-point-name")) el("pi-point-name").value = m.pi_point_name;
-    if (el("pi-point-source")) el("pi-point-source").value = m.point_source || "OPC";
-    if (el("pi-location1")) el("pi-location1").value = m.location1 !== null && m.location1 !== undefined ? m.location1 : 1;
     if (el("pi-interval")) el("pi-interval").value = m.publish_interval_ms;
-    if (el("pi-mapping-enabled")) el("pi-mapping-enabled").checked = !!m.enabled;
+    if (el("pi-mapping-enabled")) el("pi-mapping-enabled").checked = Boolean(m.enabled);
 
     validatePiForm(false);
     el("pi-mapping-form").scrollIntoView({ behavior: "smooth" });
@@ -1519,8 +1729,6 @@
     el("btn-save-mapping").textContent = "Salvar mapeamento";
     el("btn-cancel-mapping").hidden = true;
     if (el("pi-point-name")) el("pi-point-name").value = "";
-    if (el("pi-point-source")) el("pi-point-source").value = "OPC";
-    if (el("pi-location1")) el("pi-location1").value = "1";
     if (selectedPiConfig && el("pi-interval")) {
       el("pi-interval").value = Math.max(selectedPiConfig.update_rate_ms || selectedPiConfig.interval_ms || 1000, 1000);
     } else if (el("pi-interval")) {
@@ -1532,6 +1740,7 @@
       errorBox.textContent = "";
       errorBox.hidden = true;
     }
+    renderPiProfileState();
   }
 
   async function togglePiMapping(mappingId, currentEnabled) {
@@ -1817,10 +2026,17 @@
       // PI Integration Module events
       el("pi-equipment-select").addEventListener("change", onPiEquipmentSelected);
       el("pi-config-select").addEventListener("change", onPiConfigSelected);
+      if (el("btn-save-pi-profile")) {
+        el("btn-save-pi-profile").addEventListener("click", savePiProfile);
+      }
+      if (el("pi-point-source")) {
+        el("pi-point-source").addEventListener("input", clearProfileError);
+      }
+      if (el("pi-location1")) {
+        el("pi-location1").addEventListener("input", clearProfileError);
+      }
       el("pi-tag-select").addEventListener("change", () => validatePiForm(false));
       el("pi-point-name").addEventListener("input", () => validatePiForm(false));
-      el("pi-point-source").addEventListener("input", () => validatePiForm(false));
-      el("pi-location1").addEventListener("input", () => validatePiForm(false));
       el("pi-interval").addEventListener("input", () => validatePiForm(false));
       el("pi-mapping-form").addEventListener("submit", e => {
         e.preventDefault();

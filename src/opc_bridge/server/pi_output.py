@@ -94,6 +94,8 @@ class PiValuePayload:
     value: Any
     timestamp: Any = None
     quality: int | None = None
+    point_source: str = ""
+    location1: int = 0
 
 
 @dataclass
@@ -264,6 +266,16 @@ class PiOutputChannel(ABC):
         """Test connectivity and authentication against PI Web API without writing any data."""
         pass
 
+    @abstractmethod
+    def validate_point(
+        self,
+        pi_point_name: str,
+        point_source: str,
+        location1: int,
+    ) -> dict[str, Any]:
+        """Verify PI Point existence and attribute alignment without writing process data."""
+        pass
+
 
 class SimulatedPiOutputChannel(PiOutputChannel):
     """Controlled simulation channel that records test/audit output without real PI writes."""
@@ -312,6 +324,31 @@ class SimulatedPiOutputChannel(PiOutputChannel):
             "message": "Canal simulado ativo (nenhuma chamada de rede ou credencial necessária).",
         }
 
+    def validate_point(
+        self,
+        pi_point_name: str,
+        point_source: str,
+        location1: int,
+    ) -> dict[str, Any]:
+        clean_point = (pi_point_name or "").strip()
+        if not clean_point:
+            return {
+                "valid": False,
+                "simulated": True,
+                "error": "invalid_pi_point",
+                "message": "Nome do ponto PI não informado.",
+            }
+        return {
+            "valid": True,
+            "simulated": True,
+            "pi_point_name": clean_point,
+            "point_source": point_source,
+            "location1": location1,
+            "actual_point_source": point_source,
+            "actual_location1": location1,
+            "message": f"Ponto PI '{clean_point}' validado com sucesso (modo simulado: PointSource='{point_source}', Location1={location1}). Nenhuma escrita realizada.",
+        }
+
 
 class PiWebApiOutputChannel(PiOutputChannel):
     """Production output channel publishing to OSIsoft/AVEVA PI Web API via HTTPS.
@@ -338,6 +375,7 @@ class PiWebApiOutputChannel(PiOutputChannel):
         enabled: Optional[bool] = None,
     ) -> None:
         self._web_id_cache: dict[str, str] = {}
+        self._attributes_cache: dict[str, dict[str, Any]] = {}
         if config is not None:
             self.config = config
         else:
@@ -556,6 +594,174 @@ class PiWebApiOutputChannel(PiOutputChannel):
         self._web_id_cache[clean_point] = str(web_id)
         return str(web_id)
 
+    def clear_cache(self) -> None:
+        """Clear cached WebIds and point attributes."""
+        self._web_id_cache.clear()
+        self._attributes_cache.clear()
+
+    def get_point_attributes(self, web_id: str) -> dict[str, Any]:
+        """Fetch real point attributes from PI Web API via GET /points/{web_id}/attributes.
+
+        Returns normalized lowercase attribute dictionary e.g. {'pointsource': 'OPCBRIDGE', 'location1': 1}.
+        """
+        if web_id in self._attributes_cache:
+            return self._attributes_cache[web_id]
+
+        url = f"{self.base_url}/points/{web_id}/attributes"
+        req = self._build_request(url, "GET")
+        code, resp_data = self._execute_http(req)
+        if not (200 <= code < 300) or not isinstance(resp_data, dict):
+            raise RuntimeError(f"Falha ao consultar atributos do ponto PI (HTTP {code})")
+
+        attrs: dict[str, Any] = {}
+        items = resp_data.get("Items", [])
+        if isinstance(items, list):
+            for it in items:
+                if isinstance(it, dict):
+                    name = str(it.get("Name", "")).strip().lower()
+                    if name:
+                        attrs[name] = it.get("Value")
+        for k, v in resp_data.items():
+            if k != "Items":
+                attrs[k.strip().lower()] = v
+        self._attributes_cache[web_id] = attrs
+        return attrs
+
+    def validate_point_attributes(
+        self,
+        pi_point_name: str,
+        expected_point_source: str,
+        expected_location1: int,
+    ) -> tuple[bool, Optional[str], dict[str, Any]]:
+        """Validate that destination PI Point exists and its actual PointSource and Location1 match profile.
+
+        Fail-closed: if point is not found, attribute query fails, or attributes do not match,
+        returns (False, error_message, attributes).
+        Guarantees: Zero writes performed.
+        """
+        clean_point = (pi_point_name or "").strip()
+        if not clean_point:
+            return False, "Ponto PI de destino não informado", {}
+
+        try:
+            web_id = self.resolve_point_web_id(clean_point)
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                err = f"Acesso não autorizado ao PI Web API (HTTP {exc.code})"
+            else:
+                err = f"Ponto PI '{clean_point}' não encontrado no servidor {self.data_server} (HTTP {exc.code})"
+            return False, sanitize_error_message(err), {"status_code": exc.code}
+        except Exception as exc:
+            err = f"Falha ao resolver ponto PI '{clean_point}': {exc}"
+            return False, sanitize_error_message(err), {}
+
+        try:
+            attrs = self.get_point_attributes(web_id)
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                err = f"Acesso não autorizado ao PI Web API (HTTP {exc.code})"
+            else:
+                err = f"Falha ao consultar atributos do ponto PI '{clean_point}' (HTTP {exc.code})"
+            return False, sanitize_error_message(err), {"status_code": exc.code}
+        except Exception as exc:
+            err = f"Falha ao consultar atributos do ponto PI '{clean_point}': {exc}"
+            return False, sanitize_error_message(err), {}
+
+        # 1. Check PointSource
+        actual_ps = None
+        for key in ("pointsource", "point_source", "ps"):
+            if key in attrs:
+                actual_ps = str(attrs[key]).strip()
+                break
+
+        if actual_ps is None:
+            return False, f"Atributo 'PointSource' não encontrado no ponto PI '{clean_point}'", attrs
+
+        exp_ps = str(expected_point_source or "").strip()
+        if actual_ps.upper() != exp_ps.upper():
+            return (
+                False,
+                f"PointSource do ponto PI ('{actual_ps}') não corresponde ao perfil configurado ('{exp_ps}')",
+                attrs,
+            )
+
+        # 2. Check Location1
+        actual_loc1 = None
+        for key in ("location1", "location_1", "loc1"):
+            if key in attrs:
+                try:
+                    actual_loc1 = int(attrs[key])
+                except (ValueError, TypeError):
+                    actual_loc1 = None
+                break
+
+        if actual_loc1 is None:
+            return False, f"Atributo 'Location1' não encontrado ou inválido no ponto PI '{clean_point}'", attrs
+
+        try:
+            exp_loc1 = int(expected_location1)
+        except (ValueError, TypeError):
+            exp_loc1 = 0
+
+        if actual_loc1 != exp_loc1:
+            return (
+                False,
+                f"Location1 do ponto PI ({actual_loc1}) não corresponde ao perfil configurado ({exp_loc1})",
+                attrs,
+            )
+
+        return True, None, {"web_id": web_id, "point_source": actual_ps, "location1": actual_loc1, "attributes": attrs}
+
+    def validate_point(
+        self,
+        pi_point_name: str,
+        point_source: str,
+        location1: int,
+    ) -> dict[str, Any]:
+        """Verify PI Point existence and attribute alignment without writing process data."""
+        clean_point = (pi_point_name or "").strip()
+        if not clean_point:
+            return {
+                "valid": False,
+                "simulated": False,
+                "error": "invalid_pi_point",
+                "message": "Nome do ponto PI não informado.",
+            }
+
+        if not self.config.enabled:
+            logger.info("Saída PI desabilitada")
+            return {
+                "valid": False,
+                "simulated": False,
+                "error": "output_disabled",
+                "message": "Saída PI desabilitada. Consulta ao PI Web API bloqueada pelo kill switch.",
+            }
+
+        valid, err, details = self.validate_point_attributes(
+            clean_point,
+            expected_point_source=point_source,
+            expected_location1=location1,
+        )
+        if not valid:
+            return {
+                "valid": False,
+                "simulated": False,
+                "error": "attribute_mismatch",
+                "message": err or "Validação de atributos do ponto PI falhou.",
+                "details": details,
+            }
+        return {
+            "valid": True,
+            "simulated": False,
+            "pi_point_name": clean_point,
+            "point_source": point_source,
+            "location1": location1,
+            "actual_point_source": details.get("point_source", point_source),
+            "actual_location1": details.get("location1", location1),
+            "message": f"Ponto PI '{clean_point}' validado com sucesso no servidor {self.data_server}. Atributos PointSource e Location1 correspondem ao perfil. Nenhuma escrita realizada.",
+            "details": details,
+        }
+
     def _resolve_stream_url(self, pi_point_name: str) -> str:
         """Build PI Web API stream value URL with updateOption=Replace using resolved WebId."""
         web_id = self.resolve_point_web_id(pi_point_name)
@@ -609,6 +815,28 @@ class PiWebApiOutputChannel(PiOutputChannel):
                 location1=location1,
                 error="URL base do PI Web API não configurada",
                 details={"missing_config": "OPC_BRIDGE_PIWEBAPI_BASE_URL"},
+            )
+
+        # Mandatory attribute alignment check against real PI Point before publishing
+        valid, attr_err, attr_details = self.validate_point_attributes(
+            clean_point,
+            expected_point_source=point_source,
+            expected_location1=location1,
+        )
+        if not valid:
+            logger.warning("PI publish blocked for %s: %s", clean_point, attr_err)
+            details_dict = {"validation_failed": True}
+            if isinstance(attr_details, dict):
+                details_dict.update(attr_details)
+            return PiOutputResult(
+                pi_point_name=clean_point,
+                value=value,
+                status="Erro",
+                timestamp=iso_ts,
+                point_source=point_source,
+                location1=location1,
+                error=attr_err or "Atributos do ponto PI não correspondem ao perfil",
+                details=details_dict,
             )
 
         stream_payload = {
@@ -732,6 +960,8 @@ class PiWebApiOutputChannel(PiOutputChannel):
             value=item.value,
             timestamp=item.timestamp,
             quality=item.quality,
+            point_source=item.point_source,
+            location1=item.location1,
         )
 
         status_str = "published" if out_res.status == "Publicado" else "error"

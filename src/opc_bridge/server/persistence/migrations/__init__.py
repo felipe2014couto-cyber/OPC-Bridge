@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from typing import Any, List
 
-REVISION = "0006_pi_publication_tracking"
+REVISION = "0007_pi_profiles"
+_PI_PROFILES_REVISION = "0007_pi_profiles"
 _PI_TRACKING_REVISION = "0006_pi_publication_tracking"
 _PI_MAPPINGS_REVISION = "0005_pi_mappings"
 _EQUIPMENT_REVISION = "0004_equipment_and_opc_configs"
@@ -233,6 +234,33 @@ def _apply_pi_publication_tracking(
     )
 
 
+def _apply_pi_profiles(cursor: Any, database: Any, marker: str, timestamp_type: str) -> None:
+    statements = [
+        """CREATE TABLE pi_profiles (
+            profile_id VARCHAR(128) PRIMARY KEY,
+            equipment_id VARCHAR(128) NOT NULL REFERENCES equipments(equipment_id) ON DELETE CASCADE,
+            opc_config_id VARCHAR(128) NOT NULL REFERENCES named_opc_configs(config_id) ON DELETE CASCADE,
+            point_source VARCHAR(64) NOT NULL,
+            location1 INTEGER NOT NULL DEFAULT 0,
+            enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+            created_at __TIMESTAMP__ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at __TIMESTAMP__ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (equipment_id, opc_config_id)
+        )""",
+        """UPDATE pi_mappings SET enabled = 0
+        WHERE (equipment_id, opc_config_id) NOT IN (
+            SELECT equipment_id, opc_config_id FROM pi_profiles WHERE enabled = 1
+        )""",
+    ]
+    for statement in statements:
+        statement = statement.replace("__TIMESTAMP__", timestamp_type)
+        cursor.execute(statement)
+    cursor.execute(
+        "INSERT INTO schema_migrations(revision) VALUES (" + marker + ")",
+        (_PI_PROFILES_REVISION,),
+    )
+
+
 def upgrade_database(database: Any) -> None:
     """Apply pending migration revisions to an isolated target database."""
     connection = database._connect()
@@ -262,6 +290,8 @@ def upgrade_database(database: Any) -> None:
             _apply_pi_mappings(cursor, database, marker, timestamp_type)
         if _PI_TRACKING_REVISION not in applied:
             _apply_pi_publication_tracking(cursor, database, marker, timestamp_type)
+        if _PI_PROFILES_REVISION not in applied:
+            _apply_pi_profiles(cursor, database, marker, timestamp_type)
         connection.commit()
     except Exception:
         connection.rollback()

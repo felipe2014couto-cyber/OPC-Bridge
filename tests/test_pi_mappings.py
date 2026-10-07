@@ -50,6 +50,14 @@ def pi_mapping_runtime(tmp_path, monkeypatch):
             tags_json=json.dumps(tags),
             agent_id="agent-pi",
         )
+        repo.add_pi_profile(
+            profile_id="prof-100",
+            equipment_id="eq-100",
+            opc_config_id="cfg-100",
+            point_source="OPC",
+            location1=1,
+            enabled=True,
+        )
 
     bridge = BridgeServer(ServerConfig(persistence=database))
     writer = Writer()
@@ -358,9 +366,11 @@ def test_ui_contains_pi_integration_tab_and_elements(pi_mapping_runtime):
 
     # 2. Fixed banner at top of tab
     assert "pi-simulation-banner" in html
-    assert "Saída PI: Simulação — nenhuma escrita real habilitada." in html
+    assert "Saída PI desabilitada" in html
 
-    # 3. Form elements in superior card
+    # 3. Form elements in profile and mapping cards
+    assert "Contexto e Perfil PI" in html
+    assert "btn-save-pi-profile" in html
     assert "Mapeamentos OPC → PI" in html
     assert "pi-equipment-select" in html
     assert "pi-config-select" in html
@@ -448,8 +458,8 @@ def test_crud_edit_mapping_lifecycle(pi_mapping_runtime):
     assert status_put.startswith("200")
     updated = put_data["mapping"]
     assert updated["pi_point_name"] == "UPDATED_PI_POINT"
-    assert updated["point_source"] == "L"
-    assert updated["location1"] == 42
+    assert updated["point_source"] == "OPC"
+    assert updated["location1"] == 1
     assert updated["publish_interval_ms"] == 10000
     assert bool(updated["enabled"]) is False
 
@@ -513,3 +523,104 @@ def test_app_js_auto_refresh_timer_isolated_to_pi_tab(pi_mapping_runtime):
     # Confirm no auto-refresh on equipments or opc tabs
     assert 'if (currentTab === "equipments")' not in js_content
     assert 'if (currentTab === "opc"' not in js_content
+
+
+def test_pi_profile_lifecycle_and_mapping_inheritance(pi_mapping_runtime):
+    app, _, database, _, _ = pi_mapping_runtime
+
+    # 1. Fetch profiles for eq-100 -> returns prof-100
+    st, _, data = request(app, "/api/v1/pi-profiles?equipment_id=eq-100", method="GET")
+    assert st.startswith("200")
+    profs = data.get("profiles", [])
+    assert len(profs) == 1
+    assert profs[0]["point_source"] == "OPC"
+    assert profs[0]["location1"] == 1
+
+    # 2. Create mapping inheriting from profile
+    st_map, _, map_data = request(app, "/api/v1/pi-mappings", method="POST", payload={
+        "equipment_id": "eq-100",
+        "opc_config_id": "cfg-100",
+        "opc_item_path": "Pims_A40:gUsw.ToPims.DIAMETRO_CALC_BOBIN",
+        "pi_point_name": "DIAMETRO_HERDADO",
+        "publish_interval_ms": 5000,
+        "enabled": True,
+    })
+    assert st_map.startswith("201")
+    m = map_data["mapping"]
+    assert m["point_source"] == "OPC"
+    assert m["location1"] == 1
+    mapping_id = m["mapping_id"]
+
+    # 3. Update profile with changed point_source and location1
+    # Must deactivate all mappings for this combination!
+    st_up, _, up_data = request(app, "/api/v1/pi-profiles", method="POST", payload={
+        "equipment_id": "eq-100",
+        "opc_config_id": "cfg-100",
+        "point_source": "OPCBRIDGE",
+        "location1": 42,
+        "enabled": True,
+    })
+    assert st_up.startswith("200")
+    assert up_data["deactivated_mappings"] >= 1
+
+    # 4. Verify mapping has been deactivated and inherited new profile values
+    st_get, _, get_data = request(app, f"/api/v1/pi-mappings/{mapping_id}", method="GET")
+    assert st_get.startswith("200")
+    m_updated = get_data["mapping"]
+    assert m_updated["enabled"] == 0
+    assert m_updated["point_source"] == "OPCBRIDGE"
+    assert m_updated["location1"] == 42
+    assert "Perfil alterado" in m_updated["last_publish_status"]
+
+    # 5. Verify audit event for profile modification and mapping deactivation
+    st_aud, _, aud_data = request(app, "/api/v1/pi-mappings/audit?equipment_id=eq-100", method="GET")
+    assert st_aud.startswith("200")
+    events = [e["event_type"] for e in aud_data.get("audit_events", [])]
+    assert "pi_profile.updated" in events
+
+
+def test_pi_mapping_blocked_when_profile_inactive_or_missing(pi_mapping_runtime):
+    app, _, database, _, _ = pi_mapping_runtime
+
+    # Deactivate profile
+    request(app, "/api/v1/pi-profiles", method="POST", payload={
+        "equipment_id": "eq-100",
+        "opc_config_id": "cfg-100",
+        "point_source": "OPC",
+        "location1": 1,
+        "enabled": False,
+    })
+
+    # Creating mapping should fail with 400 pi_profile_required
+    st_fail, _, fail_data = request(app, "/api/v1/pi-mappings", method="POST", payload={
+        "equipment_id": "eq-100",
+        "opc_config_id": "cfg-100",
+        "opc_item_path": "Pims_A40:gUsw.ToPims.PESO_CALC_BOBINADEIRA",
+        "pi_point_name": "PESO_FAIL",
+        "publish_interval_ms": 5000,
+    })
+    assert st_fail.startswith("400")
+    assert fail_data["error"] in ("profile_required", "pi_profile_required")
+
+
+def test_validate_point_endpoint(pi_mapping_runtime):
+    app, _, _, _, _ = pi_mapping_runtime
+
+    # Create mapping
+    st, _, data = request(app, "/api/v1/pi-mappings", method="POST", payload={
+        "equipment_id": "eq-100",
+        "opc_config_id": "cfg-100",
+        "opc_item_path": "Pims_A40:gUsw.ToPims.DIAMETRO_CALC_BOBIN",
+        "pi_point_name": "VALIDATE_TEST_POINT",
+        "publish_interval_ms": 5000,
+        "enabled": True,
+    })
+    mapping_id = data["mapping"]["mapping_id"]
+
+    # Call validate-point endpoint
+    st_val, _, val_data = request(app, f"/api/v1/pi-mappings/{mapping_id}/validate-point", method="POST")
+    assert st_val.startswith("200")
+    assert val_data["valid"] is True
+    assert val_data["pi_point_name"] == "VALIDATE_TEST_POINT"
+    assert val_data["actual_point_source"] == "OPC"
+    assert val_data["actual_location1"] == 1

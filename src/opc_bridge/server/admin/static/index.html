@@ -223,10 +223,53 @@
       <!-- Banner fixo no topo da aba -->
       <div style="display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px;">
         <div id="pi-simulation-banner" class="banner info" style="margin-bottom: 0; flex: 1; font-weight: 500;">
-          Saída PI: Simulação — nenhuma escrita real habilitada.
+          Saída PI desabilitada
         </div>
         <button id="btn-test-pi-connection" type="button" style="white-space: nowrap;">Testar conexão PI</button>
       </div>
+
+      <!-- Card: Seleção de Contexto & Perfil PI (Equipamento + Configuração OPC) -->
+      <section class="card" id="pi-profile-card">
+        <div class="section-title">
+          <h2>Contexto e Perfil PI (Equipamento + Servidor OPC)</h2>
+          <span id="pi-profile-badge" class="badge">Perfil PI</span>
+        </div>
+        <div class="form-grid">
+          <div>
+            <label for="pi-equipment-select">Equipamento *</label>
+            <select id="pi-equipment-select" required>
+              <option value="">Selecione um equipamento...</option>
+            </select>
+          </div>
+          <div>
+            <label for="pi-config-select">Configuração OPC existente *</label>
+            <select id="pi-config-select" required disabled>
+              <option value="">Selecione a configuração OPC...</option>
+            </select>
+          </div>
+          <div>
+            <label for="pi-point-source">Point Source PI *</label>
+            <input id="pi-point-source" required maxlength="64" placeholder="Ex: OPCBRIDGE" value="OPC" disabled>
+          </div>
+          <div>
+            <label for="pi-location1">Location1 PI *</label>
+            <input id="pi-location1" type="number" step="1" required value="1" placeholder="Ex: 1" disabled>
+          </div>
+          <div style="display: flex; align-items: flex-end; padding-bottom: 8px;">
+            <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+              <input type="checkbox" id="pi-profile-enabled" checked disabled>
+              <span>Perfil ativo</span>
+            </label>
+          </div>
+        </div>
+        <input type="hidden" id="pi-profile-id">
+        <div id="pi-profile-notice" class="banner info" style="margin-top: 12px;" hidden></div>
+        <div id="pi-profile-error" class="banner danger" style="margin-top: 12px;" hidden></div>
+        <div class="actions" style="margin-top: 14px;">
+          <button type="button" id="btn-save-pi-profile" class="primary" disabled>Salvar perfil PI</button>
+        </div>
+        <p class="muted">Point Source e Location1 são definidos por perfil (Equipamento + Configuração OPC) e herdados por todas as tags mapeadas. Alterar o perfil desativa os mapeamentos desta configuração até nova validação.</p>
+      </section>
 
       <!-- Card superior para criar/editar um mapeamento -->
       <section class="card" id="pi-mapping-form-card">
@@ -234,21 +277,12 @@
           <h2 id="mapping-card-title">Mapeamentos OPC → PI</h2>
           <span id="mapping-form-badge" class="badge">Criar mapeamento</span>
         </div>
+        <div id="pi-mapping-profile-warning" class="banner warning">
+          Selecione um equipamento e uma configuração OPC com perfil PI ativo para cadastrar mapeamentos.
+        </div>
         <form id="pi-mapping-form" onsubmit="return false;">
           <input type="hidden" id="mapping-form-id">
           <div class="form-grid">
-            <div>
-              <label for="pi-equipment-select">Equipamento *</label>
-              <select id="pi-equipment-select" required>
-                <option value="">Selecione um equipamento...</option>
-              </select>
-            </div>
-            <div>
-              <label for="pi-config-select">Configuração OPC existente *</label>
-              <select id="pi-config-select" required disabled>
-                <option value="">Selecione a configuração OPC...</option>
-              </select>
-            </div>
             <div>
               <label for="pi-tag-select">Tag OPC cadastrada *</label>
               <select id="pi-tag-select" required disabled>
@@ -256,24 +290,16 @@
               </select>
             </div>
             <div>
-              <label for="pi-point-name">PI Point *</label>
-              <input id="pi-point-name" required maxlength="255" placeholder="Ex: DIAMETRO_CALC_BOBIN">
-            </div>
-            <div>
-              <label for="pi-point-source">Point Source *</label>
-              <input id="pi-point-source" required maxlength="64" placeholder="Ex: OPC ou L" value="OPC">
-            </div>
-            <div>
-              <label for="pi-location1">Location1 *</label>
-              <input id="pi-location1" type="number" step="1" required value="1" placeholder="Ex: 1">
+              <label for="pi-point-name">PI Point destino *</label>
+              <input id="pi-point-name" required maxlength="255" placeholder="Ex: DIAMETRO_CALC_BOBIN" disabled>
             </div>
             <div>
               <label for="pi-interval">Velocidade de publicação (ms) *</label>
-              <input id="pi-interval" type="number" min="1000" max="60000" step="1" value="5000" required>
+              <input id="pi-interval" type="number" min="1000" max="60000" step="1" value="5000" required disabled>
             </div>
             <div style="display: flex; flex-direction: column; justify-content: flex-end; padding-bottom: 8px;">
               <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
-                <input type="checkbox" id="pi-mapping-enabled" checked>
+                <input type="checkbox" id="pi-mapping-enabled" checked disabled>
                 <span>Ativo</span>
               </label>
             </div>
@@ -282,7 +308,7 @@
           <div id="pi-form-error" class="banner danger" hidden></div>
 
           <div class="actions" style="margin-top: 14px;">
-            <button type="submit" id="btn-save-mapping" class="primary">Salvar mapeamento</button>
+            <button type="submit" id="btn-save-mapping" class="primary" disabled>Salvar mapeamento</button>
             <button type="button" id="btn-cancel-mapping" hidden>Cancelar edição</button>
           </div>
         </form>
