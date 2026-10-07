@@ -455,3 +455,48 @@ tr.row-error td {
     grid-template-columns: 1fr;
   }
 }
+
+/* Modal Overlay & Dialog */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.6);
+  backdrop-filter: blur(2px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.modal-dialog {
+  width: 90%;
+  max-width: 580px;
+  max-height: 85vh;
+  overflow-y: auto;
+  background: var(--bg-card);
+  border-radius: 8px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
+  padding: 24px;
+  margin: 0;
+}
+
+.badge.active-status {
+  background: var(--status-green-bg);
+  color: var(--status-green);
+}
+
+.badge.inactive-status {
+  background: #f1f3f5;
+  color: var(--muted);
+}
+
+.badge.simulated {
+  background: #e8f0fe;
+  color: var(--brand-blue);
+  border: 1px solid #aecbfa;
+}
+
+.badge.unconfigured {
+  background: #f1f3f5;
+  color: var(--muted);
+}

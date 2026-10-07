@@ -16,6 +16,11 @@
   let livePolling = null;
   let autoRefreshTimer = null;
   let generation = 0;
+  let selectedPiEquipment = null;
+  let selectedPiConfig = null;
+  let piMappings = [];
+  let editingMappingId = null;
+  let deletingMappingId = null;
 
   const errors = {
     unauthorized: "Acesso não autorizado ou sessão expirada no proxy.",
@@ -33,7 +38,13 @@
     inspection_failed: "Não foi possível confirmar o servidor ou as tags OPC.",
     read_only_runtime: "Este runtime permite somente consulta.",
     inspection_timeout: "A inspeção excedeu o prazo.",
-    timeout: "A inspeção excedeu o prazo."
+    timeout: "A inspeção excedeu o prazo.",
+    interval_faster_than_opc: "A velocidade de publicação não pode ser menor que o intervalo de coleta OPC da configuração de origem.",
+    mapping_disabled: "O mapeamento está desativado e não pode ser publicado no PI.",
+    mapping_conflict: "Já existe um mapeamento cadastrado para esta tag nesta configuração.",
+    tag_not_in_config: "A tag informada não pertence à configuração OPC selecionada.",
+    invalid_pi_point_name: "Informe um nome válido para o PI Point (1 a 255 caracteres).",
+    invalid_publish_interval_bounds: "A velocidade de publicação deve ser um inteiro entre 1000 e 60000 ms."
   };
 
   function message(text, type = "info") {
@@ -102,24 +113,32 @@
   function switchTab(tab) {
     currentTab = tab;
     stopLive();
+    const tabs = ["equipments", "opc", "pi"];
+    tabs.forEach(t => {
+      const btn = el(`tab-${t}`);
+      const panel = el(`panel-${t}`);
+      if (btn && panel) {
+        const isActive = t === tab;
+        btn.classList.toggle("active", isActive);
+        btn.setAttribute("aria-selected", isActive ? "true" : "false");
+        panel.hidden = !isActive;
+      }
+    });
+
     if (tab === "equipments") {
-      el("tab-equipments").classList.add("active");
-      el("tab-equipments").setAttribute("aria-selected", "true");
-      el("tab-opc").classList.remove("active");
-      el("tab-opc").setAttribute("aria-selected", "false");
-      el("panel-equipments").hidden = false;
-      el("panel-opc").hidden = true;
       loadEquipments().catch(e => message(e.message, "error"));
-    } else {
-      el("tab-opc").classList.add("active");
-      el("tab-opc").setAttribute("aria-selected", "true");
-      el("tab-equipments").classList.remove("active");
-      el("tab-equipments").setAttribute("aria-selected", "false");
-      el("panel-opc").hidden = false;
-      el("panel-equipments").hidden = true;
+    } else if (tab === "opc") {
       populateEquipmentDropdown();
       if (el("opc-equipment-select").value) {
         onEquipmentSelected().catch(e => message(e.message, "error"));
+      }
+    } else if (tab === "pi") {
+      populatePiEquipmentDropdown();
+      if (selectedEquipment && selectedEquipment.equipment_id) {
+        el("pi-equipment-select").value = selectedEquipment.equipment_id;
+      }
+      if (el("pi-equipment-select").value) {
+        onPiEquipmentSelected().catch(e => message(e.message, "error"));
       }
     }
   }
@@ -134,6 +153,7 @@
       equipments = data.equipments || [];
       renderEquipmentsTable();
       populateEquipmentDropdown();
+      populatePiEquipmentDropdown();
     } catch (err) {
       message(err.message, "error");
     }
@@ -985,6 +1005,554 @@
   }
 
   // ==========================================
+  // MODULE 3: INTEGRAÇÃO PI
+  // ==========================================
+
+  function populatePiEquipmentDropdown() {
+    const sel = el("pi-equipment-select");
+    if (!sel) return;
+    const currentVal = sel.value;
+    sel.replaceChildren();
+
+    const optDefault = document.createElement("option");
+    optDefault.value = "";
+    optDefault.textContent = "Selecione um equipamento...";
+    sel.appendChild(optDefault);
+
+    equipments.forEach(eq => {
+      const opt = document.createElement("option");
+      opt.value = eq.equipment_id;
+      opt.textContent = `${eq.name} (${eq.ip_address || "sem IP"})`;
+      sel.appendChild(opt);
+    });
+
+    if (currentVal && equipments.some(e => e.equipment_id === currentVal)) {
+      sel.value = currentVal;
+    }
+  }
+
+  async function onPiEquipmentSelected() {
+    const eqSelect = el("pi-equipment-select");
+    const cfgSelect = el("pi-config-select");
+    const tagSelect = el("pi-tag-select");
+    const cfgInfo = el("pi-config-info");
+    const eqId = eqSelect ? eqSelect.value : "";
+
+    selectedPiEquipment = equipments.find(e => e.equipment_id === eqId) || null;
+    selectedPiConfig = null;
+    editingMappingId = null;
+    piMappings = [];
+
+    // Reset config dropdown
+    if (cfgSelect) {
+      cfgSelect.replaceChildren();
+      const optDef = document.createElement("option");
+      optDef.value = "";
+      optDef.textContent = "Selecione a configuração OPC...";
+      cfgSelect.appendChild(optDef);
+      cfgSelect.disabled = true;
+    }
+
+    // Reset tag dropdown & form
+    if (tagSelect) {
+      tagSelect.replaceChildren();
+      const optDef = document.createElement("option");
+      optDef.value = "";
+      optDef.textContent = "Selecione a tag OPC...";
+      tagSelect.appendChild(optDef);
+      tagSelect.disabled = true;
+    }
+
+    if (cfgInfo) cfgInfo.hidden = true;
+    cancelEditMapping();
+    renderPiMappingsTable();
+
+    if (!selectedPiEquipment) return;
+
+    try {
+      const data = await api(`/api/v1/opc-configs?equipment_id=${encodeURIComponent(eqId)}`);
+      const configs = data.configs || [];
+
+      if (cfgSelect) {
+        configs.forEach(cfg => {
+          const opt = document.createElement("option");
+          opt.value = cfg.config_id;
+          opt.textContent = `${cfg.name} (${cfg.opc_prog_id}) [${cfg.update_rate_ms || cfg.interval_ms} ms]`;
+          cfgSelect.appendChild(opt);
+        });
+        cfgSelect.disabled = configs.length === 0;
+
+        if (configs.length > 0) {
+          cfgSelect.value = configs[0].config_id;
+          await onPiConfigSelected();
+        }
+      }
+    } catch (err) {
+      message(err.message, "error");
+    }
+  }
+
+  async function onPiConfigSelected() {
+    const cfgSelect = el("pi-config-select");
+    const cfgId = cfgSelect ? cfgSelect.value : "";
+    const cfgInfo = el("pi-config-info");
+    const tagSelect = el("pi-tag-select");
+    const saveBtn = el("btn-save-mapping");
+
+    if (!cfgId) {
+      selectedPiConfig = null;
+      if (cfgInfo) cfgInfo.hidden = true;
+      if (tagSelect) {
+        tagSelect.replaceChildren();
+        const optDef = document.createElement("option");
+        optDef.value = "";
+        optDef.textContent = "Selecione a tag OPC...";
+        tagSelect.appendChild(optDef);
+        tagSelect.disabled = true;
+      }
+      if (saveBtn) saveBtn.disabled = true;
+      piMappings = [];
+      renderPiMappingsTable();
+      return;
+    }
+
+    try {
+      const cfg = await api(`/api/v1/opc-configs/${encodeURIComponent(cfgId)}`);
+      selectedPiConfig = cfg;
+
+      // Update meta info
+      if (cfgInfo) {
+        el("pi-meta-agent-id").textContent = cfg.agent_id || selectedPiEquipment?.agent_id || "—";
+        el("pi-meta-prog-id").textContent = cfg.opc_prog_id || "—";
+        const opcInterval = cfg.update_rate_ms || cfg.interval_ms || 5000;
+        el("pi-meta-interval").textContent = `${opcInterval} ms`;
+        const tags = cfg.tags || [];
+        el("pi-meta-tags-count").textContent = `${tags.length} tag(s)`;
+        cfgInfo.hidden = false;
+      }
+
+      // Populate tag select
+      if (tagSelect) {
+        tagSelect.replaceChildren();
+        const optDef = document.createElement("option");
+        optDef.value = "";
+        optDef.textContent = "Selecione a tag OPC...";
+        tagSelect.appendChild(optDef);
+
+        const tags = cfg.tags || [];
+        tags.forEach(t => {
+          const opt = document.createElement("option");
+          opt.value = t;
+          opt.textContent = t;
+          tagSelect.appendChild(opt);
+        });
+        tagSelect.disabled = tags.length === 0;
+      }
+
+      // Sync form interval default if adding new
+      if (!editingMappingId) {
+        const opcInterval = cfg.update_rate_ms || cfg.interval_ms || 5000;
+        el("pi-interval").value = Math.max(opcInterval, 1000);
+      }
+
+      validatePiInterval();
+      await loadPiMappings();
+      await loadPiAudit();
+    } catch (err) {
+      message(err.message, "error");
+    }
+  }
+
+  function validatePiInterval() {
+    const intervalInput = el("pi-interval");
+    const warning = el("pi-interval-warning");
+    const saveBtn = el("btn-save-mapping");
+    if (!intervalInput || !warning) return false;
+
+    const val = parseInt(intervalInput.value, 10);
+    const opcInterval = selectedPiConfig ? (selectedPiConfig.update_rate_ms || selectedPiConfig.interval_ms || 1000) : 1000;
+
+    if (isNaN(val) || val < 1000 || val > 60000) {
+      warning.textContent = "A velocidade de publicação deve ser um número inteiro entre 1000 e 60000 ms.";
+      warning.hidden = false;
+      if (saveBtn) saveBtn.disabled = true;
+      return false;
+    }
+
+    if (selectedPiConfig && val < opcInterval) {
+      warning.textContent = `A velocidade de publicação (${val} ms) não pode ser menor que o intervalo de coleta OPC (${opcInterval} ms) da configuração de origem.`;
+      warning.hidden = false;
+      if (saveBtn) saveBtn.disabled = true;
+      return false;
+    }
+
+    warning.hidden = true;
+    warning.textContent = "";
+    if (saveBtn && selectedPiConfig && el("pi-tag-select") && el("pi-tag-select").value) {
+      saveBtn.disabled = false;
+    }
+    return true;
+  }
+
+  async function loadPiMappings() {
+    if (!selectedPiConfig) return;
+    try {
+      const data = await api(`/api/v1/pi-mappings?opc_config_id=${encodeURIComponent(selectedPiConfig.config_id)}`);
+      piMappings = data.mappings || [];
+      renderPiMappingsTable();
+    } catch (err) {
+      message(err.message, "error");
+    }
+  }
+
+  function renderPiMappingsTable() {
+    const tbody = el("pi-mappings-body");
+    const badge = el("pi-mapping-count-badge");
+    if (!tbody) return;
+
+    if (badge) {
+      badge.textContent = `${piMappings.length} mapeamento(s)`;
+    }
+
+    tbody.replaceChildren();
+
+    if (!selectedPiConfig) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = '<td colspan="11" class="muted">Selecione um equipamento e uma configuração OPC para visualizar os mapeamentos.</td>';
+      tbody.appendChild(tr);
+      return;
+    }
+
+    if (piMappings.length === 0) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = '<td colspan="11" class="muted">Nenhum mapeamento PI cadastrado para esta configuração. Adicione um acima.</td>';
+      tbody.appendChild(tr);
+      return;
+    }
+
+    piMappings.forEach(m => {
+      const tr = document.createElement("tr");
+      tr.id = `pi-mapping-row-${m.mapping_id}`;
+
+      // 1. Tag OPC
+      const tdTag = document.createElement("td");
+      const codeTag = document.createElement("code");
+      codeTag.textContent = m.opc_item_path;
+      tdTag.appendChild(codeTag);
+      tr.appendChild(tdTag);
+
+      // 2. Último valor OPC
+      const tdVal = document.createElement("td");
+      tdVal.className = "col-val";
+      tdVal.textContent = m.current_value !== null && m.current_value !== undefined ? String(m.current_value) : "—";
+      tr.appendChild(tdVal);
+
+      // 3. Qualidade
+      const tdQual = document.createElement("td");
+      tdQual.className = "col-qual";
+      if (m.quality === null || m.quality === undefined) {
+        tdQual.textContent = "—";
+      } else if (m.quality >= 192) {
+        tdQual.innerHTML = '<span class="badge good">Good</span>';
+      } else {
+        tdQual.innerHTML = `<span class="badge error">Bad (${m.quality})</span>`;
+      }
+      tr.appendChild(tdQual);
+
+      // 4. Último timestamp OPC
+      const tdTs = document.createElement("td");
+      tdTs.className = "col-ts";
+      tdTs.textContent = formatOpcTimestamp(m.opc_timestamp);
+      tr.appendChild(tdTs);
+
+      // 5. PI Point
+      const tdPoint = document.createElement("td");
+      const strongPoint = document.createElement("strong");
+      strongPoint.textContent = m.pi_point_name;
+      tdPoint.appendChild(strongPoint);
+      tr.appendChild(tdPoint);
+
+      // 6. Point Source
+      const tdPs = document.createElement("td");
+      tdPs.textContent = m.point_source || "OPC";
+      tr.appendChild(tdPs);
+
+      // 7. Location1
+      const tdLoc = document.createElement("td");
+      tdLoc.textContent = m.location1 !== null && m.location1 !== undefined ? String(m.location1) : "—";
+      tr.appendChild(tdLoc);
+
+      // 8. Velocidade
+      const tdSpeed = document.createElement("td");
+      tdSpeed.textContent = `${m.publish_interval_ms} ms`;
+      tr.appendChild(tdSpeed);
+
+      // 9. Estado
+      const tdState = document.createElement("td");
+      tdState.innerHTML = m.enabled
+        ? '<span class="badge active-status">Ativo</span>'
+        : '<span class="badge inactive-status">Inativo</span>';
+      tr.appendChild(tdState);
+
+      // 10. Último resultado
+      const tdRes = document.createElement("td");
+      if (m.last_publish_status === "simulated") {
+        const tsFormatted = formatOpcTimestamp(m.last_publish_at);
+        tdRes.innerHTML = `<span class="badge simulated" title="Publicado: ${m.last_published_value}">Simulado (${tsFormatted})</span>`;
+      } else {
+        tdRes.innerHTML = '<span class="badge unconfigured">Não configurado</span>';
+      }
+      tr.appendChild(tdRes);
+
+      // 11. Ações
+      const tdAct = document.createElement("td");
+      tdAct.className = "actions";
+
+      // Botão Simular
+      const btnSim = document.createElement("button");
+      btnSim.type = "button";
+      btnSim.className = "btn-sm";
+      btnSim.textContent = "Simular";
+      btnSim.title = "Simular publicação no PI usando o valor atual do cache OPC";
+      btnSim.disabled = !m.enabled;
+      btnSim.addEventListener("click", () => simulatePiMapping(m.mapping_id));
+      tdAct.appendChild(btnSim);
+
+      // Botão Ativar / Desativar
+      const btnToggle = document.createElement("button");
+      btnToggle.type = "button";
+      btnToggle.className = "btn-sm";
+      btnToggle.textContent = m.enabled ? "Desativar" : "Ativar";
+      btnToggle.addEventListener("click", () => togglePiMapping(m.mapping_id, m.enabled));
+      tdAct.appendChild(btnToggle);
+
+      // Botão Editar
+      const btnEdit = document.createElement("button");
+      btnEdit.type = "button";
+      btnEdit.className = "btn-sm";
+      btnEdit.textContent = "Editar";
+      btnEdit.addEventListener("click", () => editPiMapping(m));
+      tdAct.appendChild(btnEdit);
+
+      // Botão Excluir
+      const btnDel = document.createElement("button");
+      btnDel.type = "button";
+      btnDel.className = "btn-sm danger";
+      btnDel.textContent = "Excluir";
+      btnDel.addEventListener("click", () => confirmDeleteMapping(m));
+      tdAct.appendChild(btnDel);
+
+      tr.appendChild(tdAct);
+      tbody.appendChild(tr);
+    });
+  }
+
+  async function savePiMapping() {
+    if (!selectedPiEquipment || !selectedPiConfig) {
+      message("Selecione um equipamento e uma configuração OPC antes de salvar.", "error");
+      return;
+    }
+
+    const tagSelect = el("pi-tag-select");
+    const pointInput = el("pi-point-name");
+    const sourceInput = el("pi-point-source");
+    const locInput = el("pi-location1");
+    const intervalInput = el("pi-interval");
+    const enabledInput = el("pi-mapping-enabled");
+    const formId = el("mapping-form-id").value;
+
+    const opcTag = tagSelect ? tagSelect.value : "";
+    const piPointName = pointInput ? pointInput.value.trim() : "";
+    const pointSource = sourceInput ? (sourceInput.value.trim() || "OPC") : "OPC";
+    const location1 = locInput ? parseInt(locInput.value, 10) : 1;
+    const publishIntervalMs = intervalInput ? parseInt(intervalInput.value, 10) : 5000;
+    const enabled = enabledInput ? enabledInput.checked : true;
+
+    if (!opcTag) {
+      message("Selecione a tag OPC de origem.", "error");
+      return;
+    }
+    if (!piPointName) {
+      message("Informe o nome do PI Point de destino.", "error");
+      return;
+    }
+    if (!validatePiInterval()) return;
+
+    const payload = {
+      equipment_id: selectedPiEquipment.equipment_id,
+      opc_config_id: selectedPiConfig.config_id,
+      opc_item_path: opcTag,
+      pi_point_name: piPointName,
+      point_source: pointSource,
+      location1: isNaN(location1) ? 1 : location1,
+      publish_interval_ms: publishIntervalMs,
+      enabled: enabled
+    };
+
+    try {
+      if (formId) {
+        await api(`/api/v1/pi-mappings/${encodeURIComponent(formId)}`, payload, "PUT");
+        message("Mapeamento PI atualizado com sucesso.", "success");
+      } else {
+        await api("/api/v1/pi-mappings", payload, "POST");
+        message("Mapeamento PI cadastrado com sucesso.", "success");
+      }
+      cancelEditMapping();
+      await loadPiMappings();
+      await loadPiAudit();
+    } catch (err) {
+      message(err.message, "error");
+    }
+  }
+
+  function editPiMapping(m) {
+    editingMappingId = m.mapping_id;
+    el("mapping-form-id").value = m.mapping_id;
+    el("mapping-form-title").textContent = "Editar Mapeamento PI";
+    if (el("pi-tag-select")) el("pi-tag-select").value = m.opc_item_path;
+    if (el("pi-point-name")) el("pi-point-name").value = m.pi_point_name;
+    if (el("pi-point-source")) el("pi-point-source").value = m.point_source || "OPC";
+    if (el("pi-location1")) el("pi-location1").value = m.location1 !== null && m.location1 !== undefined ? m.location1 : 1;
+    if (el("pi-interval")) el("pi-interval").value = m.publish_interval_ms;
+    if (el("pi-mapping-enabled")) el("pi-mapping-enabled").checked = !!m.enabled;
+
+    el("btn-save-mapping").textContent = "Salvar alterações";
+    el("btn-save-mapping").disabled = false;
+    el("btn-cancel-mapping").hidden = false;
+    validatePiInterval();
+    el("pi-mapping-form").scrollIntoView({ behavior: "smooth" });
+  }
+
+  function cancelEditMapping() {
+    editingMappingId = null;
+    el("mapping-form-id").value = "";
+    el("mapping-form-title").textContent = "Adicionar Mapeamento PI";
+    if (el("pi-point-name")) el("pi-point-name").value = "";
+    if (el("pi-point-source")) el("pi-point-source").value = "OPC";
+    if (el("pi-location1")) el("pi-location1").value = "1";
+    if (selectedPiConfig && el("pi-interval")) {
+      el("pi-interval").value = selectedPiConfig.update_rate_ms || selectedPiConfig.interval_ms || 5000;
+    }
+    if (el("pi-mapping-enabled")) el("pi-mapping-enabled").checked = true;
+    el("btn-save-mapping").textContent = "Salvar mapeamento";
+    el("btn-cancel-mapping").hidden = true;
+    validatePiInterval();
+  }
+
+  async function togglePiMapping(mappingId, currentEnabled) {
+    try {
+      await api(`/api/v1/pi-mappings/${encodeURIComponent(mappingId)}/toggle`, { enabled: !currentEnabled }, "POST");
+      message(`Mapeamento ${!currentEnabled ? "ativado" : "desativado"} com sucesso.`, "success");
+      await loadPiMappings();
+      await loadPiAudit();
+    } catch (err) {
+      message(err.message, "error");
+    }
+  }
+
+  function confirmDeleteMapping(m) {
+    deletingMappingId = m.mapping_id;
+    el("delete-mapping-point-name").textContent = m.pi_point_name;
+    el("modal-delete-mapping-confirm").hidden = false;
+  }
+
+  async function executeDeleteMapping() {
+    if (!deletingMappingId) return;
+    try {
+      await api(`/api/v1/pi-mappings/${encodeURIComponent(deletingMappingId)}`, undefined, "DELETE");
+      message("Mapeamento excluído com sucesso.", "success");
+      el("modal-delete-mapping-confirm").hidden = true;
+      if (editingMappingId === deletingMappingId) {
+        cancelEditMapping();
+      }
+      deletingMappingId = null;
+      await loadPiMappings();
+      await loadPiAudit();
+    } catch (err) {
+      message(err.message, "error");
+    }
+  }
+
+  async function simulatePiMapping(mappingId) {
+    try {
+      const res = await api(`/api/v1/pi-mappings/${encodeURIComponent(mappingId)}/simulate`, {}, "POST");
+      message(`Simulação PI realizada com sucesso: PI Point "${res.pi_point_name}" recebeu valor "${res.value_written}" (Status: ${res.publish_status}).`, "success");
+      await loadPiMappings();
+      await loadPiAudit();
+    } catch (err) {
+      message(err.message, "error");
+    }
+  }
+
+  async function loadPiAudit() {
+    const tbody = el("pi-audit-body");
+    if (!tbody) return;
+    try {
+      const data = await api("/api/v1/pi-mappings/audit");
+      const events = data.events || [];
+      tbody.replaceChildren();
+
+      if (events.length === 0) {
+        const tr = document.createElement("tr");
+        tr.innerHTML = '<td colspan="7" class="muted">Nenhum evento registrado.</td>';
+        tbody.appendChild(tr);
+        return;
+      }
+
+      events.forEach(ev => {
+        const tr = document.createElement("tr");
+
+        // 1. Data/Hora
+        const tdTs = document.createElement("td");
+        tdTs.textContent = formatOpcTimestamp(ev.timestamp);
+        tr.appendChild(tdTs);
+
+        // 2. Evento
+        const tdEv = document.createElement("td");
+        tdEv.textContent = ev.event_type;
+        tr.appendChild(tdEv);
+
+        // 3. PI Point
+        const tdPoint = document.createElement("td");
+        tdPoint.textContent = ev.pi_point_name || "—";
+        tr.appendChild(tdPoint);
+
+        // 4. Tag OPC
+        const tdTag = document.createElement("td");
+        tdTag.textContent = ev.opc_item_path || "—";
+        tr.appendChild(tdTag);
+
+        // 5. Valor simulado
+        const tdVal = document.createElement("td");
+        tdVal.textContent = ev.details && ev.details.value !== undefined ? String(ev.details.value) : "—";
+        tr.appendChild(tdVal);
+
+        // 6. Operador
+        const tdUser = document.createElement("td");
+        tdUser.textContent = ev.user || "admin";
+        tr.appendChild(tdUser);
+
+        // 7. Situação
+        const tdSit = document.createElement("td");
+        if (ev.event_type === "pi_simulation_success") {
+          tdSit.innerHTML = '<span class="badge simulated">Simulado</span>';
+        } else if (ev.event_type === "pi_mapping_created" || ev.event_type === "pi_mapping_enabled") {
+          tdSit.innerHTML = '<span class="badge active-status">Ativo</span>';
+        } else if (ev.event_type === "pi_mapping_disabled" || ev.event_type === "pi_mapping_deleted") {
+          tdSit.innerHTML = '<span class="badge inactive-status">Inativo</span>';
+        } else {
+          tdSit.innerHTML = '<span class="badge info">OK</span>';
+        }
+        tr.appendChild(tdSit);
+
+        tbody.appendChild(tr);
+      });
+    } catch (err) {
+      // Background audit fetch non-fatal
+    }
+  }
+
+  // ==========================================
   // INITIALIZATION & EVENT LISTENERS
   // ==========================================
 
@@ -1001,6 +1569,7 @@
       // Event listeners - Navigation Tabs
       el("tab-equipments").addEventListener("click", () => switchTab("equipments"));
       el("tab-opc").addEventListener("click", () => switchTab("opc"));
+      el("tab-pi").addEventListener("click", () => switchTab("pi"));
 
       // Equipments Module events
       el("btn-refresh-equipments").addEventListener("click", () => loadEquipments());
@@ -1047,6 +1616,28 @@
         updateButtons();
       });
 
+      // PI Integration Module events
+      el("btn-refresh-pi").addEventListener("click", () => onPiEquipmentSelected());
+      el("pi-equipment-select").addEventListener("change", onPiEquipmentSelected);
+      el("pi-config-select").addEventListener("change", onPiConfigSelected);
+      el("pi-tag-select").addEventListener("change", () => {
+        if (el("btn-save-mapping") && selectedPiConfig && el("pi-tag-select").value) {
+          validatePiInterval();
+        }
+      });
+      el("pi-interval").addEventListener("input", validatePiInterval);
+      el("pi-mapping-form").addEventListener("submit", e => {
+        e.preventDefault();
+        savePiMapping();
+      });
+      el("btn-cancel-mapping").addEventListener("click", cancelEditMapping);
+      el("btn-refresh-pi-audit").addEventListener("click", loadPiAudit);
+      el("btn-cancel-delete-modal").addEventListener("click", () => {
+        deletingMappingId = null;
+        el("modal-delete-mapping-confirm").hidden = true;
+      });
+      el("btn-confirm-delete-mapping").addEventListener("click", executeDeleteMapping);
+
       // Window / Page lifecycle events: Auto-stop live monitoring
       document.addEventListener("visibilitychange", () => {
         if (document.hidden) stopLive();
@@ -1067,6 +1658,8 @@
           if (selectedEquipment.agent_id) {
             loadAgentActiveConfigAndHistory(selectedEquipment.agent_id).catch(() => {});
           }
+        } else if (currentTab === "pi" && selectedPiConfig) {
+          loadPiMappings().catch(() => {});
         }
       }, 5000);
     } catch (err) {

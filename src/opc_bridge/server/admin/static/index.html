@@ -18,6 +18,7 @@
   <nav class="nav-tabs" role="tablist" aria-label="Módulos Administrativos">
     <button id="tab-equipments" class="tab-btn active" role="tab" aria-selected="true" aria-controls="panel-equipments">Equipamentos</button>
     <button id="tab-opc" class="tab-btn" role="tab" aria-selected="false" aria-controls="panel-opc">OPC</button>
+    <button id="tab-pi" class="tab-btn" role="tab" aria-selected="false" aria-controls="panel-pi">Integração PI</button>
   </nav>
 </header>
 
@@ -215,6 +216,171 @@
         </div>
         <div id="active-config" class="code-box">Nenhuma configuração ativa registrada.</div>
       </section>
+    </div>
+
+    <!-- MÓDULO 3: INTEGRAÇÃO PI -->
+    <div id="panel-pi" class="tab-panel" role="tabpanel" aria-labelledby="tab-pi" hidden>
+      <!-- Seção: Contexto Operacional (Equipamento e Configuração OPC) -->
+      <section class="card">
+        <div class="section-title">
+          <h2>Equipamento e Configuração OPC de Origem</h2>
+          <div class="actions">
+            <button id="btn-refresh-pi" type="button">Atualizar</button>
+          </div>
+        </div>
+        <div class="banner info">
+          <strong>Arquitetura da Integração:</strong> <code>tag OPC ativa → valor coletado → PI Point</code>.<br>
+          A origem é estritamente somente leitura OPC; o destino é o PI Point (camada de saída simulada). Nenhuma escrita é efetuada no servidor OPC. Somente tags com mapeamento ativo são publicadas.
+        </div>
+
+        <div class="form-grid" style="margin-top: 14px;">
+          <div>
+            <label for="pi-equipment-select">Selecione o equipamento cadastrado *</label>
+            <select id="pi-equipment-select">
+              <option value="">Selecione um equipamento...</option>
+            </select>
+          </div>
+          <div>
+            <label for="pi-config-select">Configuração OPC do equipamento *</label>
+            <select id="pi-config-select" disabled>
+              <option value="">Selecione a configuração OPC...</option>
+            </select>
+          </div>
+        </div>
+
+        <div id="pi-config-info" class="meta-grid" hidden>
+          <div class="meta-item"><dt>Agente associado</dt><dd id="pi-meta-agent-id">—</dd></div>
+          <div class="meta-item"><dt>ProgID OPC</dt><dd id="pi-meta-prog-id">—</dd></div>
+          <div class="meta-item"><dt>Taxa de coleta OPC</dt><dd id="pi-meta-interval">—</dd></div>
+          <div class="meta-item"><dt>Tags cadastradas</dt><dd id="pi-meta-tags-count">—</dd></div>
+        </div>
+      </section>
+
+      <!-- Formulário: Novo Mapeamento / Editar Mapeamento -->
+      <section class="card">
+        <div class="section-title">
+          <h2 id="mapping-form-title">Adicionar Mapeamento PI</h2>
+          <span class="badge">Origem Leitura OPC → Destino PI Point</span>
+        </div>
+        <form id="pi-mapping-form" onsubmit="return false;">
+          <input type="hidden" id="mapping-form-id">
+          <div class="form-grid">
+            <div>
+              <label for="pi-tag-select">Tag OPC de origem *</label>
+              <select id="pi-tag-select" required disabled>
+                <option value="">Selecione a tag OPC...</option>
+              </select>
+            </div>
+            <div>
+              <label for="pi-point-name">Nome do PI Point de destino *</label>
+              <input id="pi-point-name" required maxlength="255" placeholder="Ex: DIAMETRO_CALC_BOBIN">
+            </div>
+            <div>
+              <label for="pi-point-source">Point Source do PI Point</label>
+              <input id="pi-point-source" maxlength="64" placeholder="Ex: OPC ou L" value="OPC">
+            </div>
+            <div>
+              <label for="pi-location1">Location1 do PI Point</label>
+              <input id="pi-location1" type="number" step="1" value="1" placeholder="Ex: 1">
+            </div>
+            <div>
+              <label for="pi-interval">Velocidade de publicação (ms) *</label>
+              <input id="pi-interval" type="number" min="1000" max="60000" step="1" value="5000" required>
+            </div>
+            <div style="display: flex; flex-direction: column; justify-content: flex-end; padding-bottom: 8px;">
+              <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                <input type="checkbox" id="pi-mapping-enabled" checked>
+                <span>Mapeamento ativo</span>
+              </label>
+            </div>
+          </div>
+
+          <div id="pi-interval-warning" class="banner danger" hidden></div>
+
+          <div class="actions" style="margin-top: 14px;">
+            <button type="submit" id="btn-save-mapping" class="primary" disabled>Salvar mapeamento</button>
+            <button type="button" id="btn-cancel-mapping" hidden>Cancelar edição</button>
+          </div>
+        </form>
+      </section>
+
+      <!-- Seção: Tabela de Mapeamentos Salvos -->
+      <section class="card">
+        <div class="section-title">
+          <h2>Mapeamentos PI Cadastrados</h2>
+          <span id="pi-mapping-count-badge" class="badge">0 mapeamento(s)</span>
+        </div>
+        <p class="muted">
+          Somente tags com mapeamento ativo são elegíveis para publicação no PI. A velocidade não pode ser menor que o intervalo de coleta OPC.
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th style="min-width: 200px;">Tag OPC (Origem)</th>
+                <th style="min-width: 110px;">Último valor OPC</th>
+                <th style="width: 80px;">Qualidade</th>
+                <th style="width: 160px;">Último timestamp OPC</th>
+                <th style="min-width: 170px;">PI Point (Destino)</th>
+                <th style="width: 90px;">Point Source</th>
+                <th style="width: 80px;">Location1</th>
+                <th style="width: 110px;">Velocidade</th>
+                <th style="width: 90px;">Estado</th>
+                <th style="min-width: 130px;">Último resultado</th>
+                <th style="min-width: 180px;">Ações</th>
+              </tr>
+            </thead>
+            <tbody id="pi-mappings-body">
+              <tr>
+                <td colspan="11" class="muted">Selecione um equipamento e uma configuração OPC para visualizar os mapeamentos.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Seção: Histórico de Simulação e Auditoria -->
+      <section class="card">
+        <div class="section-title">
+          <h2>Histórico de Auditoria e Simulações PI</h2>
+          <button id="btn-refresh-pi-audit" type="button">Atualizar histórico</button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Data / Hora (UTC)</th>
+                <th>Evento</th>
+                <th>PI Point</th>
+                <th>Tag OPC</th>
+                <th>Valor simulado</th>
+                <th>Operador</th>
+                <th>Situação</th>
+              </tr>
+            </thead>
+            <tbody id="pi-audit-body">
+              <tr>
+                <td colspan="7" class="muted">Nenhum evento registrado.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <!-- Modal de Confirmação de Exclusão de Mapeamento -->
+  <div id="modal-delete-mapping-confirm" class="modal-overlay" hidden>
+    <div class="modal-dialog card" role="dialog" aria-modal="true" aria-labelledby="modal-delete-title">
+      <div class="section-title">
+        <h2 id="modal-delete-title">Confirmar Exclusão de Mapeamento</h2>
+      </div>
+      <p>Tem certeza de que deseja excluir o mapeamento para o PI Point <strong id="delete-mapping-point-name">—</strong>?</p>
+      <p class="muted">A tag OPC permanecerá cadastrada na configuração OPC, porém não terá mais destino PI associado.</p>
+      <div class="actions" style="margin-top: 18px; justify-content: flex-end;">
+        <button id="btn-cancel-delete-modal" type="button">Cancelar</button>
+        <button id="btn-confirm-delete-mapping" class="danger primary" type="button">Excluir mapeamento</button>
+      </div>
     </div>
   </div>
 </main>

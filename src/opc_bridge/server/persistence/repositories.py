@@ -14,6 +14,7 @@ from .models import (
     ConfigSnapshot,
     Equipment,
     NamedOpcConfig,
+    PiMapping,
 )
 
 
@@ -667,3 +668,136 @@ class PersistenceRepository:
             (equipment_id,),
         )
         return self._dicts(cursor)
+
+    def list_pi_mappings(
+        self, equipment_id: Optional[str] = None, opc_config_id: Optional[str] = None
+    ) -> List[dict[str, Any]]:
+        query = (
+            "SELECT m.mapping_id, m.mapping_id AS id, m.equipment_id, m.opc_config_id, "
+            "m.opc_item_path, m.item_id, m.pi_point_name, m.point_source, m.location1, "
+            "m.publish_interval_ms, m.enabled, m.last_publish_status, m.last_published_at, "
+            "m.last_published_value, m.created_at, m.updated_at, "
+            "e.name AS equipment_name, e.agent_id, c.name AS config_name, c.interval_ms AS opc_interval_ms, "
+            "c.opc_prog_id "
+            "FROM pi_mappings m "
+            "JOIN equipments e ON e.equipment_id = m.equipment_id "
+            "JOIN named_opc_configs c ON c.config_id = m.opc_config_id "
+        )
+        params: list[Any] = []
+        clauses: list[str] = []
+        if equipment_id:
+            clauses.append("m.equipment_id = ?")
+            params.append(equipment_id)
+        if opc_config_id:
+            clauses.append("m.opc_config_id = ?")
+            params.append(opc_config_id)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY m.pi_point_name, m.mapping_id"
+        return self._dicts(self._execute(query, tuple(params)))
+
+    def get_pi_mapping(self, mapping_id: str) -> Optional[dict[str, Any]]:
+        query = (
+            "SELECT m.mapping_id, m.mapping_id AS id, m.equipment_id, m.opc_config_id, "
+            "m.opc_item_path, m.item_id, m.pi_point_name, m.point_source, m.location1, "
+            "m.publish_interval_ms, m.enabled, m.last_publish_status, m.last_published_at, "
+            "m.last_published_value, m.created_at, m.updated_at, "
+            "e.name AS equipment_name, e.agent_id, c.name AS config_name, c.interval_ms AS opc_interval_ms, "
+            "c.opc_prog_id "
+            "FROM pi_mappings m "
+            "JOIN equipments e ON e.equipment_id = m.equipment_id "
+            "JOIN named_opc_configs c ON c.config_id = m.opc_config_id "
+            "WHERE m.mapping_id = ?"
+        )
+        rows = self._dicts(self._execute(query, (mapping_id,)))
+        return rows[0] if rows else None
+
+    def add_pi_mapping(
+        self,
+        mapping_id: str,
+        equipment_id: str,
+        opc_config_id: str,
+        opc_item_path: str,
+        item_id: int,
+        pi_point_name: str,
+        point_source: str,
+        location1: int,
+        publish_interval_ms: int,
+        enabled: bool = True,
+    ) -> PiMapping:
+        self._execute(
+            "INSERT INTO pi_mappings (mapping_id, equipment_id, opc_config_id, opc_item_path, "
+            "item_id, pi_point_name, point_source, location1, publish_interval_ms, enabled) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                mapping_id,
+                equipment_id,
+                opc_config_id,
+                opc_item_path,
+                item_id,
+                pi_point_name,
+                point_source,
+                location1,
+                publish_interval_ms,
+                1 if enabled else 0,
+            ),
+        )
+        return PiMapping(
+            mapping_id=mapping_id,
+            equipment_id=equipment_id,
+            opc_config_id=opc_config_id,
+            opc_item_path=opc_item_path,
+            item_id=item_id,
+            pi_point_name=pi_point_name,
+            point_source=point_source,
+            location1=location1,
+            publish_interval_ms=publish_interval_ms,
+            enabled=enabled,
+        )
+
+    def update_pi_mapping(
+        self,
+        mapping_id: str,
+        pi_point_name: str,
+        point_source: str,
+        location1: int,
+        publish_interval_ms: int,
+        enabled: bool,
+    ) -> Optional[dict[str, Any]]:
+        cursor = self._execute(
+            "UPDATE pi_mappings SET pi_point_name = ?, point_source = ?, location1 = ?, "
+            "publish_interval_ms = ?, enabled = ?, updated_at = CURRENT_TIMESTAMP "
+            "WHERE mapping_id = ?",
+            (
+                pi_point_name,
+                point_source,
+                location1,
+                publish_interval_ms,
+                1 if enabled else 0,
+                mapping_id,
+            ),
+        )
+        if cursor.rowcount == 0:
+            return None
+        return self.get_pi_mapping(mapping_id)
+
+    def set_pi_mapping_enabled(self, mapping_id: str, enabled: bool) -> bool:
+        cursor = self._execute(
+            "UPDATE pi_mappings SET enabled = ?, updated_at = CURRENT_TIMESTAMP WHERE mapping_id = ?",
+            (1 if enabled else 0, mapping_id),
+        )
+        return cursor.rowcount > 0
+
+    def update_pi_mapping_status(
+        self, mapping_id: str, status: str, published_value: Optional[str] = None
+    ) -> bool:
+        cursor = self._execute(
+            "UPDATE pi_mappings SET last_publish_status = ?, last_published_at = CURRENT_TIMESTAMP, "
+            "last_published_value = ?, updated_at = CURRENT_TIMESTAMP WHERE mapping_id = ?",
+            (status, published_value, mapping_id),
+        )
+        return cursor.rowcount > 0
+
+    def delete_pi_mapping(self, mapping_id: str) -> bool:
+        cursor = self._execute("DELETE FROM pi_mappings WHERE mapping_id = ?", (mapping_id,))
+        return cursor.rowcount > 0

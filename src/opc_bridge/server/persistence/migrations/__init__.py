@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from typing import Any, List
 
-REVISION = "0004_equipment_and_opc_configs"
+REVISION = "0005_pi_mappings"
+_EQUIPMENT_REVISION = "0004_equipment_and_opc_configs"
 _RETENTION_REVISION = "0003_retention_policy"
 _BRIDGE_STATE_REVISION = "0002_bridge_server_state"
 _INITIAL_REVISION = "0001_initial"
@@ -179,6 +180,36 @@ def _apply_equipment_and_opc_configs(cursor: Any, database: Any, marker: str, ti
         cursor.execute(statement)
     cursor.execute(
         "INSERT INTO schema_migrations(revision) VALUES (" + marker + ")",
+        (_EQUIPMENT_REVISION,),
+    )
+
+
+def _apply_pi_mappings(cursor: Any, database: Any, marker: str, timestamp_type: str) -> None:
+    statements = [
+        """CREATE TABLE pi_mappings (
+            mapping_id VARCHAR(128) PRIMARY KEY,
+            equipment_id VARCHAR(128) NOT NULL REFERENCES equipments(equipment_id) ON DELETE CASCADE,
+            opc_config_id VARCHAR(128) NOT NULL REFERENCES named_opc_configs(config_id) ON DELETE CASCADE,
+            opc_item_path VARCHAR(512) NOT NULL,
+            item_id INTEGER NOT NULL DEFAULT 0,
+            pi_point_name VARCHAR(255) NOT NULL,
+            point_source VARCHAR(64) NOT NULL DEFAULT '',
+            location1 INTEGER NOT NULL DEFAULT 0,
+            publish_interval_ms INTEGER NOT NULL CHECK (publish_interval_ms >= 1000 AND publish_interval_ms <= 60000),
+            enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+            last_publish_status VARCHAR(64) NOT NULL DEFAULT 'Não configurado',
+            last_published_at __TIMESTAMP__,
+            last_published_value TEXT,
+            created_at __TIMESTAMP__ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at __TIMESTAMP__ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (opc_config_id, opc_item_path)
+        )""",
+    ]
+    for statement in statements:
+        statement = statement.replace("__TIMESTAMP__", timestamp_type)
+        cursor.execute(statement)
+    cursor.execute(
+        "INSERT INTO schema_migrations(revision) VALUES (" + marker + ")",
         (REVISION,),
     )
 
@@ -206,8 +237,10 @@ def upgrade_database(database: Any) -> None:
             _apply_bridge_state(cursor, database, marker, timestamp_type)
         if _RETENTION_REVISION not in applied:
             _apply_retention_policy(cursor, database, marker)
-        if REVISION not in applied:
+        if _EQUIPMENT_REVISION not in applied:
             _apply_equipment_and_opc_configs(cursor, database, marker, timestamp_type)
+        if REVISION not in applied:
+            _apply_pi_mappings(cursor, database, marker, timestamp_type)
         connection.commit()
     except Exception:
         connection.rollback()

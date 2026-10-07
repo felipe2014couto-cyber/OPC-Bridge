@@ -96,3 +96,22 @@ class NamedOpcConfig:
     agent_id: Optional[str] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class PiMapping:
+    mapping_id: str
+    equipment_id: str
+    opc_config_id: str
+    opc_item_path: str
+    item_id: int
+    pi_point_name: str
+    point_source: str
+    location1: int
+    publish_interval_ms: int
+    enabled: bool = True
+    last_publish_status: str = "Não configurado"
+    last_published_at: Optional[str] = None
+    last_published_value: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
