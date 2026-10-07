@@ -344,10 +344,172 @@ def test_ui_contains_pi_integration_tab_and_elements(pi_mapping_runtime):
     html = b"".join(app(environ, start_response)).decode("utf-8")
 
     assert captured["status"].startswith("200")
+
+    # 1. Top level tabs (Equipamentos | OPC | Integração PI)
+    assert "tab-equipments" in html
+    assert "tab-opc" in html
     assert "tab-pi" in html
+    assert "panel-equipments" in html
+    assert "panel-opc" in html
     assert "panel-pi" in html
+    assert "Equipamentos" in html
+    assert "OPC" in html
+    assert "Integração PI" in html
+
+    # 2. Fixed banner at top of tab
+    assert "pi-simulation-banner" in html
+    assert "Saída PI: Simulação — nenhuma escrita real habilitada." in html
+
+    # 3. Form elements in superior card
+    assert "Mapeamentos OPC → PI" in html
     assert "pi-equipment-select" in html
     assert "pi-config-select" in html
-    assert "pi-mappings-body" in html
+    assert "pi-tag-select" in html
+    assert "pi-point-name" in html
+    assert "pi-point-source" in html
+    assert "pi-location1" in html
+    assert "pi-interval" in html
+    assert "pi-mapping-enabled" in html
+    assert "pi-form-error" in html
+    assert "btn-save-mapping" in html
+    assert "btn-cancel-mapping" in html
+
+    # 4. Table columns
+    expected_cols = [
+        "Tag OPC origem",
+        "Último valor OPC",
+        "Qualidade",
+        "Último timestamp OPC",
+        "PI Point destino",
+        "Point Source",
+        "Location1",
+        "Velocidade",
+        "Estado",
+        "Último resultado",
+        "Ações",
+    ]
+    for col in expected_cols:
+        assert col in html
+
+    # 5. Security: NO PI URL, credentials, token or certificate fields in the UI
+    assert 'id="pi-url"' not in html
+    assert 'id="pi-token"' not in html
+    assert 'id="pi-secret"' not in html
+    assert 'id="pi-cert"' not in html
+    assert "web-api" not in html.lower()
+
+    # 6. Delete confirmation modal
     assert "modal-delete-mapping-confirm" in html
-    assert "Integração PI" in html
+
+
+def test_cascade_endpoint_data(pi_mapping_runtime):
+    app, _, _, _, _ = pi_mapping_runtime
+
+    # 1. Fetch configs for eq-100 -> returns cfg-100
+    status, _, data = request(app, "/api/v1/opc-configs?equipment_id=eq-100", method="GET")
+    assert status.startswith("200")
+    configs = data.get("configs", [])
+    assert len(configs) == 1
+    assert configs[0]["config_id"] == "cfg-100"
+
+    # 2. Fetch config cfg-100 details -> returns tags
+    status_cfg, _, data_cfg = request(app, "/api/v1/opc-configs/cfg-100", method="GET")
+    assert status_cfg.startswith("200")
+    cfg_obj = data_cfg.get("config", data_cfg)
+    tags = cfg_obj.get("tags", [])
+    assert "Pims_A40:gUsw.ToPims.DIAMETRO_CALC_BOBIN" in tags
+    assert "Pims_A40:gUsw.ToPims.PESO_CALC_BOBINADEIRA" in tags
+
+
+def test_crud_edit_mapping_lifecycle(pi_mapping_runtime):
+    app, _, _, _, _ = pi_mapping_runtime
+
+    # 1. Create mapping
+    _, _, data = request(app, "/api/v1/pi-mappings", method="POST", payload={
+        "equipment_id": "eq-100",
+        "opc_config_id": "cfg-100",
+        "opc_item_path": "Pims_A40:gUsw.ToPims.DIAMETRO_CALC_BOBIN",
+        "pi_point_name": "INITIAL_PI_POINT",
+        "point_source": "OPC",
+        "location1": 1,
+        "publish_interval_ms": 5000,
+        "enabled": True,
+    })
+    mapping_id = data["mapping"]["mapping_id"]
+
+    # 2. Edit mapping (PUT)
+    status_put, _, put_data = request(app, f"/api/v1/pi-mappings/{mapping_id}", method="PUT", payload={
+        "pi_point_name": "UPDATED_PI_POINT",
+        "point_source": "L",
+        "location1": 42,
+        "publish_interval_ms": 10000,
+        "enabled": False,
+    })
+    assert status_put.startswith("200")
+    updated = put_data["mapping"]
+    assert updated["pi_point_name"] == "UPDATED_PI_POINT"
+    assert updated["point_source"] == "L"
+    assert updated["location1"] == 42
+    assert updated["publish_interval_ms"] == 10000
+    assert bool(updated["enabled"]) is False
+
+    # 3. Verify audit event for update
+    status_audit, _, audit_data = request(app, "/api/v1/pi-mappings/audit?equipment_id=eq-100", method="GET")
+    assert status_audit.startswith("200")
+    events = audit_data["audit_events"]
+    assert any(e["event_type"] == "pi_mapping.updated" for e in events)
+
+
+def test_all_mapping_actions_never_trigger_opc_write_or_config_push(pi_mapping_runtime, monkeypatch):
+    app, bridge, _, _, _ = pi_mapping_runtime
+
+    mock_opc_write = MagicMock()
+    mock_config_push = MagicMock()
+    monkeypatch.setattr(bridge, "write_agent_threadsafe", mock_opc_write, raising=False)
+    monkeypatch.setattr(bridge, "dispatch_admin_config_operation_threadsafe", mock_config_push, raising=False)
+    monkeypatch.setattr(bridge, "get_live_values", lambda agent_id: {
+        "items": [{"opc_item_path": "Pims_A40:gUsw.ToPims.EBA_PERDA_MAGNETICA", "value": 99.9, "quality": 192}]
+    })
+
+    # Action 1: Create
+    _, _, data = request(app, "/api/v1/pi-mappings", method="POST", payload={
+        "equipment_id": "eq-100",
+        "opc_config_id": "cfg-100",
+        "opc_item_path": "Pims_A40:gUsw.ToPims.EBA_PERDA_MAGNETICA",
+        "pi_point_name": "PERDA_MAGNETICA",
+        "publish_interval_ms": 5000,
+        "enabled": True,
+    })
+    mapping_id = data["mapping"]["mapping_id"]
+
+    # Action 2: Update
+    request(app, f"/api/v1/pi-mappings/{mapping_id}", method="PUT", payload={
+        "pi_point_name": "PERDA_MAGNETICA_EDITED",
+        "publish_interval_ms": 6000,
+    })
+
+    # Action 3: Toggle
+    request(app, f"/api/v1/pi-mappings/{mapping_id}/toggle", method="POST")
+    request(app, f"/api/v1/pi-mappings/{mapping_id}/toggle", method="POST")
+
+    # Action 4: Simulate
+    request(app, f"/api/v1/pi-mappings/{mapping_id}/simulate", method="POST")
+
+    # Action 5: Delete
+    request(app, f"/api/v1/pi-mappings/{mapping_id}", method="DELETE")
+
+    # Zero writes to OPC, zero CONFIG_PUSH
+    mock_opc_write.assert_not_called()
+    mock_config_push.assert_not_called()
+
+
+def test_app_js_auto_refresh_timer_isolated_to_pi_tab(pi_mapping_runtime):
+    # Verify app.js content: autoRefreshTimer only refreshes when currentTab === "pi"
+    import pathlib
+    js_path = pathlib.Path("src/opc_bridge/server/admin/static/app.js")
+    js_content = js_path.read_text(encoding="utf-8")
+
+    assert 'if (currentTab === "pi" && selectedPiEquipment)' in js_content
+    # Confirm no auto-refresh on equipments or opc tabs
+    assert 'if (currentTab === "equipments")' not in js_content
+    assert 'if (currentTab === "opc"' not in js_content

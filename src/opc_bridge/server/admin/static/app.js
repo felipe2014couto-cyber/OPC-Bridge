@@ -1035,7 +1035,6 @@
     const eqSelect = el("pi-equipment-select");
     const cfgSelect = el("pi-config-select");
     const tagSelect = el("pi-tag-select");
-    const cfgInfo = el("pi-config-info");
     const eqId = eqSelect ? eqSelect.value : "";
 
     selectedPiEquipment = equipments.find(e => e.equipment_id === eqId) || null;
@@ -1053,7 +1052,7 @@
       cfgSelect.disabled = true;
     }
 
-    // Reset tag dropdown & form
+    // Reset tag dropdown & dependent form fields
     if (tagSelect) {
       tagSelect.replaceChildren();
       const optDef = document.createElement("option");
@@ -1063,7 +1062,6 @@
       tagSelect.disabled = true;
     }
 
-    if (cfgInfo) cfgInfo.hidden = true;
     cancelEditMapping();
     renderPiMappingsTable();
 
@@ -1081,12 +1079,10 @@
           cfgSelect.appendChild(opt);
         });
         cfgSelect.disabled = configs.length === 0;
-
-        if (configs.length > 0) {
-          cfgSelect.value = configs[0].config_id;
-          await onPiConfigSelected();
-        }
       }
+
+      await loadPiMappings();
+      await loadPiAudit();
     } catch (err) {
       message(err.message, "error");
     }
@@ -1095,43 +1091,35 @@
   async function onPiConfigSelected() {
     const cfgSelect = el("pi-config-select");
     const cfgId = cfgSelect ? cfgSelect.value : "";
-    const cfgInfo = el("pi-config-info");
     const tagSelect = el("pi-tag-select");
-    const saveBtn = el("btn-save-mapping");
+
+    // Limpar seleções dependentes ao trocar configuração
+    if (tagSelect) {
+      tagSelect.replaceChildren();
+      const optDef = document.createElement("option");
+      optDef.value = "";
+      optDef.textContent = "Selecione a tag OPC...";
+      tagSelect.appendChild(optDef);
+      tagSelect.disabled = true;
+    }
+
+    if (!editingMappingId && el("pi-point-name")) {
+      el("pi-point-name").value = "";
+    }
 
     if (!cfgId) {
       selectedPiConfig = null;
-      if (cfgInfo) cfgInfo.hidden = true;
-      if (tagSelect) {
-        tagSelect.replaceChildren();
-        const optDef = document.createElement("option");
-        optDef.value = "";
-        optDef.textContent = "Selecione a tag OPC...";
-        tagSelect.appendChild(optDef);
-        tagSelect.disabled = true;
-      }
-      if (saveBtn) saveBtn.disabled = true;
-      piMappings = [];
-      renderPiMappingsTable();
+      validatePiForm(false);
+      await loadPiMappings();
       return;
     }
 
     try {
-      const cfg = await api(`/api/v1/opc-configs/${encodeURIComponent(cfgId)}`);
+      const res = await api(`/api/v1/opc-configs/${encodeURIComponent(cfgId)}`);
+      const cfg = res.config || res;
       selectedPiConfig = cfg;
 
-      // Update meta info
-      if (cfgInfo) {
-        el("pi-meta-agent-id").textContent = cfg.agent_id || selectedPiEquipment?.agent_id || "—";
-        el("pi-meta-prog-id").textContent = cfg.opc_prog_id || "—";
-        const opcInterval = cfg.update_rate_ms || cfg.interval_ms || 5000;
-        el("pi-meta-interval").textContent = `${opcInterval} ms`;
-        const tags = cfg.tags || [];
-        el("pi-meta-tags-count").textContent = `${tags.length} tag(s)`;
-        cfgInfo.hidden = false;
-      }
-
-      // Populate tag select
+      // Popular tags da configuração selecionada
       if (tagSelect) {
         tagSelect.replaceChildren();
         const optDef = document.createElement("option");
@@ -1149,55 +1137,73 @@
         tagSelect.disabled = tags.length === 0;
       }
 
-      // Sync form interval default if adding new
+      // Sincronizar velocidade padrão com o intervalo OPC
       if (!editingMappingId) {
         const opcInterval = cfg.update_rate_ms || cfg.interval_ms || 5000;
         el("pi-interval").value = Math.max(opcInterval, 1000);
       }
 
-      validatePiInterval();
+      validatePiForm(false);
       await loadPiMappings();
-      await loadPiAudit();
     } catch (err) {
       message(err.message, "error");
     }
   }
 
-  function validatePiInterval() {
+  function validatePiForm(showMissingFields = false) {
+    const errorBox = el("pi-form-error");
     const intervalInput = el("pi-interval");
-    const warning = el("pi-interval-warning");
-    const saveBtn = el("btn-save-mapping");
-    if (!intervalInput || !warning) return false;
+    const eqVal = el("pi-equipment-select") ? el("pi-equipment-select").value : "";
+    const cfgVal = el("pi-config-select") ? el("pi-config-select").value : "";
+    const tagVal = el("pi-tag-select") ? el("pi-tag-select").value : "";
+    const pointVal = el("pi-point-name") ? el("pi-point-name").value.trim() : "";
+    const sourceVal = el("pi-point-source") ? el("pi-point-source").value.trim() : "";
+    const loc1Val = el("pi-location1") ? el("pi-location1").value.trim() : "";
+    const intervalVal = intervalInput ? parseInt(intervalInput.value, 10) : NaN;
 
-    const val = parseInt(intervalInput.value, 10);
-    const opcInterval = selectedPiConfig ? (selectedPiConfig.update_rate_ms || selectedPiConfig.interval_ms || 1000) : 1000;
+    if (!errorBox) return false;
 
-    if (isNaN(val) || val < 1000 || val > 60000) {
-      warning.textContent = "A velocidade de publicação deve ser um número inteiro entre 1000 e 60000 ms.";
-      warning.hidden = false;
-      if (saveBtn) saveBtn.disabled = true;
+    // 1. Validar intervalo entre 1000 e 60000 ms
+    if (isNaN(intervalVal) || intervalVal < 1000 || intervalVal > 60000) {
+      errorBox.textContent = "A velocidade de publicação deve ser um número inteiro entre 1000 e 60000 ms.";
+      errorBox.hidden = false;
       return false;
     }
 
-    if (selectedPiConfig && val < opcInterval) {
-      warning.textContent = `A velocidade de publicação (${val} ms) não pode ser menor que o intervalo de coleta OPC (${opcInterval} ms) da configuração de origem.`;
-      warning.hidden = false;
-      if (saveBtn) saveBtn.disabled = true;
+    // 2. Validar velocidade maior ou igual ao update_rate_ms da configuração OPC escolhida
+    const opcRate = selectedPiConfig ? (selectedPiConfig.update_rate_ms || selectedPiConfig.interval_ms || 1000) : 1000;
+    if (selectedPiConfig && intervalVal < opcRate) {
+      errorBox.textContent = `A velocidade de publicação (${intervalVal} ms) não pode ser menor que o intervalo de coleta OPC (${opcRate} ms) da configuração de origem.`;
+      errorBox.hidden = false;
       return false;
     }
 
-    warning.hidden = true;
-    warning.textContent = "";
-    if (saveBtn && selectedPiConfig && el("pi-tag-select") && el("pi-tag-select").value) {
-      saveBtn.disabled = false;
+    // 3. Validar preenchimento dos campos obrigatórios
+    if (showMissingFields) {
+      if (!eqVal || !cfgVal || !tagVal || !pointVal || !sourceVal || loc1Val === "") {
+        errorBox.textContent = "Preencha todos os campos obrigatórios: Equipamento, Configuração, Tag OPC, PI Point, Point Source e Location1.";
+        errorBox.hidden = false;
+        return false;
+      }
     }
+
+    errorBox.textContent = "";
+    errorBox.hidden = true;
     return true;
   }
 
   async function loadPiMappings() {
-    if (!selectedPiConfig) return;
+    if (!selectedPiEquipment) {
+      piMappings = [];
+      renderPiMappingsTable();
+      return;
+    }
     try {
-      const data = await api(`/api/v1/pi-mappings?opc_config_id=${encodeURIComponent(selectedPiConfig.config_id)}`);
+      let url = `/api/v1/pi-mappings?equipment_id=${encodeURIComponent(selectedPiEquipment.equipment_id)}`;
+      if (selectedPiConfig && selectedPiConfig.config_id) {
+        url += `&opc_config_id=${encodeURIComponent(selectedPiConfig.config_id)}`;
+      }
+      const data = await api(url);
       piMappings = data.mappings || [];
       renderPiMappingsTable();
     } catch (err) {
@@ -1216,16 +1222,16 @@
 
     tbody.replaceChildren();
 
-    if (!selectedPiConfig) {
+    if (!selectedPiEquipment) {
       const tr = document.createElement("tr");
-      tr.innerHTML = '<td colspan="11" class="muted">Selecione um equipamento e uma configuração OPC para visualizar os mapeamentos.</td>';
+      tr.innerHTML = '<td colspan="11" class="muted">Selecione um equipamento para visualizar os mapeamentos.</td>';
       tbody.appendChild(tr);
       return;
     }
 
     if (piMappings.length === 0) {
       const tr = document.createElement("tr");
-      tr.innerHTML = '<td colspan="11" class="muted">Nenhum mapeamento PI cadastrado para esta configuração. Adicione um acima.</td>';
+      tr.innerHTML = '<td colspan="11" class="muted">Nenhum mapeamento PI cadastrado para este equipamento. Adicione um acima.</td>';
       tbody.appendChild(tr);
       return;
     }
@@ -1234,7 +1240,7 @@
       const tr = document.createElement("tr");
       tr.id = `pi-mapping-row-${m.mapping_id}`;
 
-      // 1. Tag OPC
+      // 1. Tag OPC origem
       const tdTag = document.createElement("td");
       const codeTag = document.createElement("code");
       codeTag.textContent = m.opc_item_path;
@@ -1265,7 +1271,7 @@
       tdTs.textContent = formatOpcTimestamp(m.opc_timestamp);
       tr.appendChild(tdTs);
 
-      // 5. PI Point
+      // 5. PI Point destino
       const tdPoint = document.createElement("td");
       const strongPoint = document.createElement("strong");
       strongPoint.textContent = m.pi_point_name;
@@ -1313,7 +1319,7 @@
       btnSim.type = "button";
       btnSim.className = "btn-sm";
       btnSim.textContent = "Simular";
-      btnSim.title = "Simular publicação no PI usando o valor atual do cache OPC";
+      btnSim.title = "Simular publicação no PI usando exclusivamente o valor em cache";
       btnSim.disabled = !m.enabled;
       btnSim.addEventListener("click", () => simulatePiMapping(m.mapping_id));
       tdAct.appendChild(btnSim);
@@ -1348,11 +1354,10 @@
   }
 
   async function savePiMapping() {
-    if (!selectedPiEquipment || !selectedPiConfig) {
-      message("Selecione um equipamento e uma configuração OPC antes de salvar.", "error");
-      return;
-    }
+    if (!validatePiForm(true)) return;
 
+    const eqSelect = el("pi-equipment-select");
+    const cfgSelect = el("pi-config-select");
     const tagSelect = el("pi-tag-select");
     const pointInput = el("pi-point-name");
     const sourceInput = el("pi-point-source");
@@ -1361,6 +1366,8 @@
     const enabledInput = el("pi-mapping-enabled");
     const formId = el("mapping-form-id").value;
 
+    const eqId = eqSelect ? eqSelect.value : "";
+    const cfgId = cfgSelect ? cfgSelect.value : "";
     const opcTag = tagSelect ? tagSelect.value : "";
     const piPointName = pointInput ? pointInput.value.trim() : "";
     const pointSource = sourceInput ? (sourceInput.value.trim() || "OPC") : "OPC";
@@ -1368,19 +1375,9 @@
     const publishIntervalMs = intervalInput ? parseInt(intervalInput.value, 10) : 5000;
     const enabled = enabledInput ? enabledInput.checked : true;
 
-    if (!opcTag) {
-      message("Selecione a tag OPC de origem.", "error");
-      return;
-    }
-    if (!piPointName) {
-      message("Informe o nome do PI Point de destino.", "error");
-      return;
-    }
-    if (!validatePiInterval()) return;
-
     const payload = {
-      equipment_id: selectedPiEquipment.equipment_id,
-      opc_config_id: selectedPiConfig.config_id,
+      equipment_id: eqId,
+      opc_config_id: cfgId,
       opc_item_path: opcTag,
       pi_point_name: piPointName,
       point_source: pointSource,
@@ -1395,7 +1392,7 @@
         message("Mapeamento PI atualizado com sucesso.", "success");
       } else {
         await api("/api/v1/pi-mappings", payload, "POST");
-        message("Mapeamento PI cadastrado com sucesso.", "success");
+        message("Mapeamento PI salvo com sucesso.", "success");
       }
       cancelEditMapping();
       await loadPiMappings();
@@ -1405,38 +1402,91 @@
     }
   }
 
-  function editPiMapping(m) {
+  async function editPiMapping(m) {
     editingMappingId = m.mapping_id;
     el("mapping-form-id").value = m.mapping_id;
-    el("mapping-form-title").textContent = "Editar Mapeamento PI";
-    if (el("pi-tag-select")) el("pi-tag-select").value = m.opc_item_path;
+    el("mapping-card-title").textContent = "Mapeamentos OPC → PI";
+    el("mapping-form-badge").textContent = "Editar mapeamento";
+    el("btn-save-mapping").textContent = "Salvar alterações";
+    el("btn-cancel-mapping").hidden = false;
+
+    // Equipamento em cascata
+    el("pi-equipment-select").value = m.equipment_id;
+    selectedPiEquipment = equipments.find(e => e.equipment_id === m.equipment_id) || null;
+
+    try {
+      // Carregar configurações do equipamento
+      const data = await api(`/api/v1/opc-configs?equipment_id=${encodeURIComponent(m.equipment_id)}`);
+      const configs = data.configs || [];
+      const cfgSelect = el("pi-config-select");
+      cfgSelect.replaceChildren();
+      const optDef = document.createElement("option");
+      optDef.value = "";
+      optDef.textContent = "Selecione a configuração OPC...";
+      cfgSelect.appendChild(optDef);
+      configs.forEach(cfg => {
+        const opt = document.createElement("option");
+        opt.value = cfg.config_id;
+        opt.textContent = `${cfg.name} (${cfg.opc_prog_id}) [${cfg.update_rate_ms || cfg.interval_ms} ms]`;
+        cfgSelect.appendChild(opt);
+      });
+      cfgSelect.disabled = false;
+      cfgSelect.value = m.opc_config_id;
+
+      // Carregar tags da configuração
+      const res = await api(`/api/v1/opc-configs/${encodeURIComponent(m.opc_config_id)}`);
+      const cfg = res.config || res;
+      selectedPiConfig = cfg;
+      const tagSelect = el("pi-tag-select");
+      tagSelect.replaceChildren();
+      const optDefTag = document.createElement("option");
+      optDefTag.value = "";
+      optDefTag.textContent = "Selecione a tag OPC...";
+      tagSelect.appendChild(optDefTag);
+      const tags = cfg.tags || [];
+      tags.forEach(t => {
+        const opt = document.createElement("option");
+        opt.value = t;
+        opt.textContent = t;
+        tagSelect.appendChild(opt);
+      });
+      tagSelect.disabled = false;
+      tagSelect.value = m.opc_item_path;
+    } catch (err) {
+      message(err.message, "error");
+    }
+
     if (el("pi-point-name")) el("pi-point-name").value = m.pi_point_name;
     if (el("pi-point-source")) el("pi-point-source").value = m.point_source || "OPC";
     if (el("pi-location1")) el("pi-location1").value = m.location1 !== null && m.location1 !== undefined ? m.location1 : 1;
     if (el("pi-interval")) el("pi-interval").value = m.publish_interval_ms;
     if (el("pi-mapping-enabled")) el("pi-mapping-enabled").checked = !!m.enabled;
 
-    el("btn-save-mapping").textContent = "Salvar alterações";
-    el("btn-save-mapping").disabled = false;
-    el("btn-cancel-mapping").hidden = false;
-    validatePiInterval();
+    validatePiForm(false);
     el("pi-mapping-form").scrollIntoView({ behavior: "smooth" });
   }
 
   function cancelEditMapping() {
     editingMappingId = null;
     el("mapping-form-id").value = "";
-    el("mapping-form-title").textContent = "Adicionar Mapeamento PI";
+    el("mapping-card-title").textContent = "Mapeamentos OPC → PI";
+    el("mapping-form-badge").textContent = "Criar mapeamento";
+    el("btn-save-mapping").textContent = "Salvar mapeamento";
+    el("btn-cancel-mapping").hidden = true;
     if (el("pi-point-name")) el("pi-point-name").value = "";
     if (el("pi-point-source")) el("pi-point-source").value = "OPC";
     if (el("pi-location1")) el("pi-location1").value = "1";
     if (selectedPiConfig && el("pi-interval")) {
-      el("pi-interval").value = selectedPiConfig.update_rate_ms || selectedPiConfig.interval_ms || 5000;
+      el("pi-interval").value = Math.max(selectedPiConfig.update_rate_ms || selectedPiConfig.interval_ms || 1000, 1000);
+    } else if (el("pi-interval")) {
+      el("pi-interval").value = 5000;
     }
     if (el("pi-mapping-enabled")) el("pi-mapping-enabled").checked = true;
-    el("btn-save-mapping").textContent = "Salvar mapeamento";
-    el("btn-cancel-mapping").hidden = true;
-    validatePiInterval();
+    const errorBox = el("pi-form-error");
+    if (errorBox) {
+      errorBox.textContent = "";
+      errorBox.hidden = true;
+    }
   }
 
   async function togglePiMapping(mappingId, currentEnabled) {
@@ -1489,7 +1539,7 @@
     if (!tbody) return;
     try {
       const data = await api("/api/v1/pi-mappings/audit");
-      const events = data.events || [];
+      const events = data.audit_events || data.events || [];
       tbody.replaceChildren();
 
       if (events.length === 0) {
@@ -1504,7 +1554,7 @@
 
         // 1. Data/Hora
         const tdTs = document.createElement("td");
-        tdTs.textContent = formatOpcTimestamp(ev.timestamp);
+        tdTs.textContent = formatOpcTimestamp(ev.occurred_at || ev.timestamp);
         tr.appendChild(tdTs);
 
         // 2. Evento
@@ -1513,32 +1563,33 @@
         tr.appendChild(tdEv);
 
         // 3. PI Point
+        const det = ev.detail || ev.details || {};
         const tdPoint = document.createElement("td");
-        tdPoint.textContent = ev.pi_point_name || "—";
+        tdPoint.textContent = det.pi_point_name || ev.pi_point_name || "—";
         tr.appendChild(tdPoint);
 
         // 4. Tag OPC
         const tdTag = document.createElement("td");
-        tdTag.textContent = ev.opc_item_path || "—";
+        tdTag.textContent = det.opc_item_path || ev.opc_item_path || "—";
         tr.appendChild(tdTag);
 
         // 5. Valor simulado
         const tdVal = document.createElement("td");
-        tdVal.textContent = ev.details && ev.details.value !== undefined ? String(ev.details.value) : "—";
+        tdVal.textContent = det.value !== undefined && det.value !== null ? String(det.value) : "—";
         tr.appendChild(tdVal);
 
         // 6. Operador
         const tdUser = document.createElement("td");
-        tdUser.textContent = ev.user || "admin";
+        tdUser.textContent = det.user || ev.user || "admin";
         tr.appendChild(tdUser);
 
         // 7. Situação
         const tdSit = document.createElement("td");
-        if (ev.event_type === "pi_simulation_success") {
+        if (ev.event_type === "pi_mapping.simulation" || ev.event_type === "pi_simulation_success") {
           tdSit.innerHTML = '<span class="badge simulated">Simulado</span>';
-        } else if (ev.event_type === "pi_mapping_created" || ev.event_type === "pi_mapping_enabled") {
+        } else if (ev.event_type === "pi_mapping.created" || ev.event_type === "pi_mapping.enabled") {
           tdSit.innerHTML = '<span class="badge active-status">Ativo</span>';
-        } else if (ev.event_type === "pi_mapping_disabled" || ev.event_type === "pi_mapping_deleted") {
+        } else if (ev.event_type === "pi_mapping.disabled" || ev.event_type === "pi_mapping.deleted") {
           tdSit.innerHTML = '<span class="badge inactive-status">Inativo</span>';
         } else {
           tdSit.innerHTML = '<span class="badge info">OK</span>';
@@ -1617,15 +1668,13 @@
       });
 
       // PI Integration Module events
-      el("btn-refresh-pi").addEventListener("click", () => onPiEquipmentSelected());
       el("pi-equipment-select").addEventListener("change", onPiEquipmentSelected);
       el("pi-config-select").addEventListener("change", onPiConfigSelected);
-      el("pi-tag-select").addEventListener("change", () => {
-        if (el("btn-save-mapping") && selectedPiConfig && el("pi-tag-select").value) {
-          validatePiInterval();
-        }
-      });
-      el("pi-interval").addEventListener("input", validatePiInterval);
+      el("pi-tag-select").addEventListener("change", () => validatePiForm(false));
+      el("pi-point-name").addEventListener("input", () => validatePiForm(false));
+      el("pi-point-source").addEventListener("input", () => validatePiForm(false));
+      el("pi-location1").addEventListener("input", () => validatePiForm(false));
+      el("pi-interval").addEventListener("input", () => validatePiForm(false));
       el("pi-mapping-form").addEventListener("submit", e => {
         e.preventDefault();
         savePiMapping();
@@ -1650,16 +1699,11 @@
       addTag();
       switchTab("equipments");
 
-      // Auto-refresh operational states every 5s
+      // Auto-refresh operational states: only while on "pi" tab; no auto-refresh on Equipamentos and OPC
       autoRefreshTimer = setInterval(() => {
-        if (currentTab === "equipments") {
-          loadEquipments().catch(() => {});
-        } else if (currentTab === "opc" && selectedEquipment) {
-          if (selectedEquipment.agent_id) {
-            loadAgentActiveConfigAndHistory(selectedEquipment.agent_id).catch(() => {});
-          }
-        } else if (currentTab === "pi" && selectedPiConfig) {
+        if (currentTab === "pi" && selectedPiEquipment) {
           loadPiMappings().catch(() => {});
+          loadPiAudit().catch(() => {});
         }
       }, 5000);
     } catch (err) {

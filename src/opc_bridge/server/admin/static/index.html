@@ -220,68 +220,49 @@
 
     <!-- MÓDULO 3: INTEGRAÇÃO PI -->
     <div id="panel-pi" class="tab-panel" role="tabpanel" aria-labelledby="tab-pi" hidden>
-      <!-- Seção: Contexto Operacional (Equipamento e Configuração OPC) -->
-      <section class="card">
+      <!-- Banner fixo no topo da aba -->
+      <div id="pi-simulation-banner" class="banner info" style="font-weight: 500;">
+        Saída PI: Simulação — nenhuma escrita real habilitada.
+      </div>
+
+      <!-- Card superior para criar/editar um mapeamento -->
+      <section class="card" id="pi-mapping-form-card">
         <div class="section-title">
-          <h2>Equipamento e Configuração OPC de Origem</h2>
-          <div class="actions">
-            <button id="btn-refresh-pi" type="button">Atualizar</button>
-          </div>
-        </div>
-        <div class="banner info">
-          <strong>Arquitetura da Integração:</strong> <code>tag OPC ativa → valor coletado → PI Point</code>.<br>
-          A origem é estritamente somente leitura OPC; o destino é o PI Point (camada de saída simulada). Nenhuma escrita é efetuada no servidor OPC. Somente tags com mapeamento ativo são publicadas.
-        </div>
-
-        <div class="form-grid" style="margin-top: 14px;">
-          <div>
-            <label for="pi-equipment-select">Selecione o equipamento cadastrado *</label>
-            <select id="pi-equipment-select">
-              <option value="">Selecione um equipamento...</option>
-            </select>
-          </div>
-          <div>
-            <label for="pi-config-select">Configuração OPC do equipamento *</label>
-            <select id="pi-config-select" disabled>
-              <option value="">Selecione a configuração OPC...</option>
-            </select>
-          </div>
-        </div>
-
-        <div id="pi-config-info" class="meta-grid" hidden>
-          <div class="meta-item"><dt>Agente associado</dt><dd id="pi-meta-agent-id">—</dd></div>
-          <div class="meta-item"><dt>ProgID OPC</dt><dd id="pi-meta-prog-id">—</dd></div>
-          <div class="meta-item"><dt>Taxa de coleta OPC</dt><dd id="pi-meta-interval">—</dd></div>
-          <div class="meta-item"><dt>Tags cadastradas</dt><dd id="pi-meta-tags-count">—</dd></div>
-        </div>
-      </section>
-
-      <!-- Formulário: Novo Mapeamento / Editar Mapeamento -->
-      <section class="card">
-        <div class="section-title">
-          <h2 id="mapping-form-title">Adicionar Mapeamento PI</h2>
-          <span class="badge">Origem Leitura OPC → Destino PI Point</span>
+          <h2 id="mapping-card-title">Mapeamentos OPC → PI</h2>
+          <span id="mapping-form-badge" class="badge">Criar mapeamento</span>
         </div>
         <form id="pi-mapping-form" onsubmit="return false;">
           <input type="hidden" id="mapping-form-id">
           <div class="form-grid">
             <div>
-              <label for="pi-tag-select">Tag OPC de origem *</label>
+              <label for="pi-equipment-select">Equipamento *</label>
+              <select id="pi-equipment-select" required>
+                <option value="">Selecione um equipamento...</option>
+              </select>
+            </div>
+            <div>
+              <label for="pi-config-select">Configuração OPC existente *</label>
+              <select id="pi-config-select" required disabled>
+                <option value="">Selecione a configuração OPC...</option>
+              </select>
+            </div>
+            <div>
+              <label for="pi-tag-select">Tag OPC cadastrada *</label>
               <select id="pi-tag-select" required disabled>
                 <option value="">Selecione a tag OPC...</option>
               </select>
             </div>
             <div>
-              <label for="pi-point-name">Nome do PI Point de destino *</label>
+              <label for="pi-point-name">PI Point *</label>
               <input id="pi-point-name" required maxlength="255" placeholder="Ex: DIAMETRO_CALC_BOBIN">
             </div>
             <div>
-              <label for="pi-point-source">Point Source do PI Point</label>
-              <input id="pi-point-source" maxlength="64" placeholder="Ex: OPC ou L" value="OPC">
+              <label for="pi-point-source">Point Source *</label>
+              <input id="pi-point-source" required maxlength="64" placeholder="Ex: OPC ou L" value="OPC">
             </div>
             <div>
-              <label for="pi-location1">Location1 do PI Point</label>
-              <input id="pi-location1" type="number" step="1" value="1" placeholder="Ex: 1">
+              <label for="pi-location1">Location1 *</label>
+              <input id="pi-location1" type="number" step="1" required value="1" placeholder="Ex: 1">
             </div>
             <div>
               <label for="pi-interval">Velocidade de publicação (ms) *</label>
@@ -290,49 +271,46 @@
             <div style="display: flex; flex-direction: column; justify-content: flex-end; padding-bottom: 8px;">
               <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
                 <input type="checkbox" id="pi-mapping-enabled" checked>
-                <span>Mapeamento ativo</span>
+                <span>Ativo</span>
               </label>
             </div>
           </div>
 
-          <div id="pi-interval-warning" class="banner danger" hidden></div>
+          <div id="pi-form-error" class="banner danger" hidden></div>
 
           <div class="actions" style="margin-top: 14px;">
-            <button type="submit" id="btn-save-mapping" class="primary" disabled>Salvar mapeamento</button>
+            <button type="submit" id="btn-save-mapping" class="primary">Salvar mapeamento</button>
             <button type="button" id="btn-cancel-mapping" hidden>Cancelar edição</button>
           </div>
         </form>
       </section>
 
-      <!-- Seção: Tabela de Mapeamentos Salvos -->
-      <section class="card">
+      <!-- Tabela de mapeamentos do equipamento selecionado -->
+      <section class="card" id="pi-mappings-table-card">
         <div class="section-title">
-          <h2>Mapeamentos PI Cadastrados</h2>
+          <h2>Mapeamentos do equipamento selecionado</h2>
           <span id="pi-mapping-count-badge" class="badge">0 mapeamento(s)</span>
         </div>
-        <p class="muted">
-          Somente tags com mapeamento ativo são elegíveis para publicação no PI. A velocidade não pode ser menor que o intervalo de coleta OPC.
-        </p>
         <div class="table-wrap">
           <table>
             <thead>
               <tr>
-                <th style="min-width: 200px;">Tag OPC (Origem)</th>
-                <th style="min-width: 110px;">Último valor OPC</th>
-                <th style="width: 80px;">Qualidade</th>
-                <th style="width: 160px;">Último timestamp OPC</th>
-                <th style="min-width: 170px;">PI Point (Destino)</th>
-                <th style="width: 90px;">Point Source</th>
-                <th style="width: 80px;">Location1</th>
-                <th style="width: 110px;">Velocidade</th>
-                <th style="width: 90px;">Estado</th>
-                <th style="min-width: 130px;">Último resultado</th>
-                <th style="min-width: 180px;">Ações</th>
+                <th>Tag OPC origem</th>
+                <th>Último valor OPC</th>
+                <th>Qualidade</th>
+                <th>Último timestamp OPC</th>
+                <th>PI Point destino</th>
+                <th>Point Source</th>
+                <th>Location1</th>
+                <th>Velocidade</th>
+                <th>Estado</th>
+                <th>Último resultado</th>
+                <th>Ações</th>
               </tr>
             </thead>
             <tbody id="pi-mappings-body">
               <tr>
-                <td colspan="11" class="muted">Selecione um equipamento e uma configuração OPC para visualizar os mapeamentos.</td>
+                <td colspan="11" class="muted">Selecione um equipamento para visualizar os mapeamentos.</td>
               </tr>
             </tbody>
           </table>
@@ -340,7 +318,7 @@
       </section>
 
       <!-- Seção: Histórico de Simulação e Auditoria -->
-      <section class="card">
+      <section class="card" id="pi-audit-card">
         <div class="section-title">
           <h2>Histórico de Auditoria e Simulações PI</h2>
           <button id="btn-refresh-pi-audit" type="button">Atualizar histórico</button>
