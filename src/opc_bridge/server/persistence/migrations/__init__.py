@@ -3,7 +3,9 @@ from __future__ import annotations
 
 from typing import Any, List
 
-REVISION = "0005_pi_mappings"
+REVISION = "0006_pi_publication_tracking"
+_PI_TRACKING_REVISION = "0006_pi_publication_tracking"
+_PI_MAPPINGS_REVISION = "0005_pi_mappings"
 _EQUIPMENT_REVISION = "0004_equipment_and_opc_configs"
 _RETENTION_REVISION = "0003_retention_policy"
 _BRIDGE_STATE_REVISION = "0002_bridge_server_state"
@@ -210,7 +212,24 @@ def _apply_pi_mappings(cursor: Any, database: Any, marker: str, timestamp_type: 
         cursor.execute(statement)
     cursor.execute(
         "INSERT INTO schema_migrations(revision) VALUES (" + marker + ")",
-        (REVISION,),
+        (_PI_MAPPINGS_REVISION,),
+    )
+
+
+def _apply_pi_publication_tracking(
+    cursor: Any, database: Any, marker: str, timestamp_type: str
+) -> None:
+    statements = [
+        "ALTER TABLE pi_mappings ADD COLUMN next_publish_due_at __TIMESTAMP__",
+        "ALTER TABLE pi_mappings ADD COLUMN last_publish_error TEXT",
+        "ALTER TABLE pi_mappings ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0",
+    ]
+    for statement in statements:
+        statement = statement.replace("__TIMESTAMP__", timestamp_type)
+        cursor.execute(statement)
+    cursor.execute(
+        "INSERT INTO schema_migrations(revision) VALUES (" + marker + ")",
+        (_PI_TRACKING_REVISION,),
     )
 
 
@@ -239,8 +258,10 @@ def upgrade_database(database: Any) -> None:
             _apply_retention_policy(cursor, database, marker)
         if _EQUIPMENT_REVISION not in applied:
             _apply_equipment_and_opc_configs(cursor, database, marker, timestamp_type)
-        if REVISION not in applied:
+        if _PI_MAPPINGS_REVISION not in applied:
             _apply_pi_mappings(cursor, database, marker, timestamp_type)
+        if _PI_TRACKING_REVISION not in applied:
+            _apply_pi_publication_tracking(cursor, database, marker, timestamp_type)
         connection.commit()
     except Exception:
         connection.rollback()

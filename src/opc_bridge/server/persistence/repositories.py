@@ -676,7 +676,8 @@ class PersistenceRepository:
             "SELECT m.mapping_id, m.mapping_id AS id, m.equipment_id, m.opc_config_id, "
             "m.opc_item_path, m.item_id, m.pi_point_name, m.point_source, m.location1, "
             "m.publish_interval_ms, m.enabled, m.last_publish_status, m.last_published_at, "
-            "m.last_published_value, m.created_at, m.updated_at, "
+            "m.last_published_value, m.next_publish_due_at, m.last_publish_error, m.failure_count, "
+            "m.created_at, m.updated_at, "
             "e.name AS equipment_name, e.agent_id, c.name AS config_name, c.interval_ms AS opc_interval_ms, "
             "c.opc_prog_id "
             "FROM pi_mappings m "
@@ -701,7 +702,8 @@ class PersistenceRepository:
             "SELECT m.mapping_id, m.mapping_id AS id, m.equipment_id, m.opc_config_id, "
             "m.opc_item_path, m.item_id, m.pi_point_name, m.point_source, m.location1, "
             "m.publish_interval_ms, m.enabled, m.last_publish_status, m.last_published_at, "
-            "m.last_published_value, m.created_at, m.updated_at, "
+            "m.last_published_value, m.next_publish_due_at, m.last_publish_error, m.failure_count, "
+            "m.created_at, m.updated_at, "
             "e.name AS equipment_name, e.agent_id, c.name AS config_name, c.interval_ms AS opc_interval_ms, "
             "c.opc_prog_id "
             "FROM pi_mappings m "
@@ -795,6 +797,23 @@ class PersistenceRepository:
             "UPDATE pi_mappings SET last_publish_status = ?, last_published_at = CURRENT_TIMESTAMP, "
             "last_published_value = ?, updated_at = CURRENT_TIMESTAMP WHERE mapping_id = ?",
             (status, published_value, mapping_id),
+        )
+        return cursor.rowcount > 0
+
+    def update_pi_mapping_publication(
+        self,
+        mapping_id: str,
+        status: str,
+        published_value: Optional[str] = None,
+        next_publish_due_at: Optional[str] = None,
+        error: Optional[str] = None,
+        failure_count: Optional[int] = None,
+    ) -> bool:
+        cursor = self._execute(
+            "UPDATE pi_mappings SET last_publish_status = ?, last_published_at = CURRENT_TIMESTAMP, "
+            "last_published_value = ?, next_publish_due_at = ?, last_publish_error = ?, "
+            "failure_count = COALESCE(?, failure_count), updated_at = CURRENT_TIMESTAMP WHERE mapping_id = ?",
+            (status, published_value, next_publish_due_at, error, failure_count, mapping_id),
         )
         return cursor.rowcount > 0
 

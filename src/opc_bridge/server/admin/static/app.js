@@ -21,6 +21,7 @@
   let piMappings = [];
   let editingMappingId = null;
   let deletingMappingId = null;
+  let publishingOnceMapping = null;
 
   const errors = {
     unauthorized: "Acesso não autorizado ou sessão expirada no proxy.",
@@ -133,6 +134,7 @@
         onEquipmentSelected().catch(e => message(e.message, "error"));
       }
     } else if (tab === "pi") {
+      loadPiIntegrationStatus().catch(() => {});
       populatePiEquipmentDropdown();
       if (selectedEquipment && selectedEquipment.equipment_id) {
         el("pi-equipment-select").value = selectedEquipment.equipment_id;
@@ -1224,14 +1226,14 @@
 
     if (!selectedPiEquipment) {
       const tr = document.createElement("tr");
-      tr.innerHTML = '<td colspan="11" class="muted">Selecione um equipamento para visualizar os mapeamentos.</td>';
+      tr.innerHTML = '<td colspan="14" class="muted">Selecione um equipamento para visualizar os mapeamentos.</td>';
       tbody.appendChild(tr);
       return;
     }
 
     if (piMappings.length === 0) {
       const tr = document.createElement("tr");
-      tr.innerHTML = '<td colspan="11" class="muted">Nenhum mapeamento PI cadastrado para este equipamento. Adicione um acima.</td>';
+      tr.innerHTML = '<td colspan="14" class="muted">Nenhum mapeamento PI cadastrado para este equipamento. Adicione um acima.</td>';
       tbody.appendChild(tr);
       return;
     }
@@ -1302,17 +1304,60 @@
 
       // 10. Último resultado
       const tdRes = document.createElement("td");
-      if (m.last_publish_status === "simulated") {
-        const tsFormatted = formatOpcTimestamp(m.last_publish_at);
-        tdRes.innerHTML = `<span class="badge simulated" title="Publicado: ${m.last_published_value}">Simulado (${tsFormatted})</span>`;
+      const st = String(m.last_publish_status || "").toLowerCase();
+      if (st === "simulado" || st === "simulated") {
+        const tsFormatted = formatOpcTimestamp(m.last_published_at);
+        tdRes.innerHTML = `<span class="badge simulated" title="Valor: ${m.last_published_value || ''}">Simulado (${tsFormatted})</span>`;
+      } else if (st === "publicado" || st === "published") {
+        const tsFormatted = formatOpcTimestamp(m.last_published_at);
+        tdRes.innerHTML = `<span class="badge good" title="Valor: ${m.last_published_value || ''}">Publicado (${tsFormatted})</span>`;
+      } else if (st === "erro" || st === "error") {
+        tdRes.innerHTML = `<span class="badge error" title="${m.last_publish_error || ''}">Erro</span>`;
+      } else if (st === "desabilitado" || st === "disabled") {
+        tdRes.innerHTML = '<span class="badge muted">Desabilitado</span>';
       } else {
         tdRes.innerHTML = '<span class="badge unconfigured">Não configurado</span>';
       }
       tr.appendChild(tdRes);
 
-      // 11. Ações
+      // 11. Último envio
+      const tdLastPub = document.createElement("td");
+      tdLastPub.className = "col-ts";
+      tdLastPub.textContent = m.last_published_at ? formatOpcTimestamp(m.last_published_at) : "—";
+      tr.appendChild(tdLastPub);
+
+      // 12. Próximo envio
+      const tdNextPub = document.createElement("td");
+      tdNextPub.className = "col-ts";
+      tdNextPub.textContent = m.next_publish_due_at ? formatOpcTimestamp(m.next_publish_due_at) : "—";
+      tr.appendChild(tdNextPub);
+
+      // 13. Erro
+      const tdErr = document.createElement("td");
+      if (m.last_publish_error) {
+        const spanErr = document.createElement("span");
+        spanErr.className = "badge error";
+        spanErr.title = m.last_publish_error;
+        spanErr.textContent = m.last_publish_error.length > 25 ? m.last_publish_error.slice(0, 22) + "..." : m.last_publish_error;
+        tdErr.appendChild(spanErr);
+      } else {
+        tdErr.textContent = "—";
+      }
+      tr.appendChild(tdErr);
+
+      // 14. Ações
       const tdAct = document.createElement("td");
       tdAct.className = "actions";
+
+      // Botão Publicar uma vez
+      const btnPubOnce = document.createElement("button");
+      btnPubOnce.type = "button";
+      btnPubOnce.className = "btn-sm primary";
+      btnPubOnce.textContent = "Publicar uma vez";
+      btnPubOnce.title = "Publicar a leitura atual em cache no PI Point de destino";
+      btnPubOnce.disabled = !m.enabled;
+      btnPubOnce.addEventListener("click", () => openPublishOnceModal(m));
+      tdAct.appendChild(btnPubOnce);
 
       // Botão Simular
       const btnSim = document.createElement("button");
@@ -1534,6 +1579,108 @@
     }
   }
 
+  async function loadPiIntegrationStatus() {
+    try {
+      const data = await api("/api/v1/pi-integration/status");
+      const banner = el("pi-simulation-banner");
+      if (banner) {
+        if (data.output_enabled) {
+          banner.className = "banner success";
+          banner.textContent = data.banner_text || "Saída PI habilitada";
+        } else {
+          banner.className = "banner info";
+          banner.textContent = data.banner_text || "Saída PI: Simulação — nenhuma escrita real habilitada.";
+        }
+      }
+    } catch (e) {
+      // Ignore if unavailable
+    }
+  }
+
+  async function testPiConnection() {
+    const btn = el("btn-test-pi-connection");
+    if (btn) btn.disabled = true;
+    try {
+      const res = await api("/api/v1/pi-integration/test-connection", {}, "POST");
+      if (res.connected) {
+        message(res.message || "Conexão PI verificada com sucesso.", "success");
+      } else {
+        message(res.message || "Falha na conexão com PI.", "warning");
+      }
+    } catch (err) {
+      message(err.message || "Erro ao testar conexão PI.", "error");
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  function openPublishOnceModal(m) {
+    publishingOnceMapping = m;
+    const modal = el("modal-publish-once-confirm");
+    if (!modal) return;
+
+    if (el("publish-once-point")) el("publish-once-point").textContent = m.pi_point_name || "—";
+    if (el("publish-once-tag")) el("publish-once-tag").textContent = m.opc_item_path || "—";
+    if (el("publish-once-value")) el("publish-once-value").textContent = m.current_value !== null && m.current_value !== undefined ? String(m.current_value) : "—";
+    if (el("publish-once-quality")) el("publish-once-quality").textContent = m.quality_text || (m.quality !== null && m.quality !== undefined ? String(m.quality) : "—");
+    if (el("publish-once-timestamp")) el("publish-once-timestamp").textContent = formatOpcTimestamp(m.opc_timestamp);
+
+    const warnBox = el("publish-once-warning");
+    const confirmBtn = el("btn-confirm-publish-once");
+
+    let blockReason = null;
+    if (m.current_value === null || m.current_value === undefined) {
+      blockReason = "Publicação bloqueada: nenhum valor OPC coletado em cache para esta tag.";
+    } else if (m.quality !== null && m.quality !== undefined && m.quality < 192) {
+      blockReason = `Publicação bloqueada: qualidade OPC não é confiável (Bad: ${m.quality}).`;
+    } else if (m.stale) {
+      blockReason = "Publicação bloqueada: leitura OPC está desatualizada (stale).";
+    }
+
+    if (warnBox) {
+      if (blockReason) {
+        warnBox.textContent = blockReason;
+        warnBox.hidden = false;
+      } else {
+        warnBox.hidden = true;
+      }
+    }
+    if (confirmBtn) {
+      confirmBtn.disabled = Boolean(blockReason);
+    }
+
+    modal.hidden = false;
+  }
+
+  function closePublishOnceModal() {
+    publishingOnceMapping = null;
+    const modal = el("modal-publish-once-confirm");
+    if (modal) modal.hidden = true;
+  }
+
+  async function confirmPublishOnce() {
+    if (!publishingOnceMapping) return;
+    const btn = el("btn-confirm-publish-once");
+    if (btn) btn.disabled = true;
+    try {
+      const res = await api(`/api/v1/pi-mappings/${encodeURIComponent(publishingOnceMapping.mapping_id)}/publish-once`, {}, "POST");
+      closePublishOnceModal();
+      const st = res.result ? res.result.status : "Publicado";
+      const val = res.result ? res.result.value : publishingOnceMapping.current_value;
+      if (st === "Erro") {
+        message(`Publicação no PI retornou erro: ${res.result.error || 'Falha de comunicação'}`, "error");
+      } else {
+        message(`Publicação no PI concluída com sucesso: "${publishingOnceMapping.pi_point_name}" = ${val} (${st}).`, "success");
+      }
+      await loadPiMappings();
+      await loadPiAudit();
+    } catch (err) {
+      message(err.message, "error");
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
   async function loadPiAudit() {
     const tbody = el("pi-audit-body");
     if (!tbody) return;
@@ -1686,6 +1833,15 @@
         el("modal-delete-mapping-confirm").hidden = true;
       });
       el("btn-confirm-delete-mapping").addEventListener("click", executeDeleteMapping);
+      if (el("btn-test-pi-connection")) {
+        el("btn-test-pi-connection").addEventListener("click", testPiConnection);
+      }
+      if (el("btn-cancel-publish-once-modal")) {
+        el("btn-cancel-publish-once-modal").addEventListener("click", closePublishOnceModal);
+      }
+      if (el("btn-confirm-publish-once")) {
+        el("btn-confirm-publish-once").addEventListener("click", confirmPublishOnce);
+      }
 
       // Window / Page lifecycle events: Auto-stop live monitoring
       document.addEventListener("visibilitychange", () => {

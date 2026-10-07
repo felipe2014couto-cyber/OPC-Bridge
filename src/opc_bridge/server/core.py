@@ -133,6 +133,7 @@ class BridgeServer:
         # Strictly volatile in memory; never written to persistence or logs.
         self._live_values: dict[str, dict[int, dict[str, Any]]] = {}
         self._live_lock = threading.Lock()
+        self._pi_publisher: Any = None
         if self.config.persistence is not None:
             self._recover_persisted_state()
 
@@ -291,6 +292,7 @@ class BridgeServer:
         )
         try:
             self._start_admin_api()
+            self._start_pi_publisher()
         except Exception:
             self._server.close()
             await self._server.wait_closed()
@@ -332,9 +334,30 @@ class BridgeServer:
         self._admin_thread.start()
         logger.info("Admin API listening on 127.0.0.1:%d", self._admin_httpd.server_port)
 
+    def _start_pi_publisher(self) -> None:
+        """Start background PI publisher service if persistence is available."""
+        if self.config.persistence is None:
+            return
+        try:
+            from opc_bridge.server.pi_publisher import PiPublisherService
+
+            self._pi_publisher = PiPublisherService(
+                bridge_server=self,
+                database=self.config.persistence,
+            )
+            self._pi_publisher.start()
+        except Exception as exc:
+            logger.warning("Could not start background PI publisher: %s", exc)
+
     async def stop(self) -> None:
         """Stop the server and close all sessions."""
         self._running = False
+        if self._pi_publisher is not None:
+            try:
+                self._pi_publisher.stop()
+            except Exception as exc:
+                logger.debug("Error stopping PI publisher: %s", exc)
+            self._pi_publisher = None
         if self._admin_httpd is not None:
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, self._admin_httpd.shutdown)
@@ -575,9 +598,9 @@ class BridgeServer:
                         "error": None,
                     })
                 else:
-                    age_ms = int((now_mono - cached["received_at_mono"]) * 1000)
-                    is_stale = age_ms > ttl_ms
-                    has_error = bool(cached["error"])
+                    age_ms = int((now_mono - cached.get("received_at_mono", now_mono)) * 1000)
+                    is_stale = (age_ms > ttl_ms) or bool(cached.get("stale"))
+                    has_error = bool(cached.get("error"))
                     if is_stale:
                         status = "stale"
                     elif has_error:
@@ -589,15 +612,15 @@ class BridgeServer:
                         "opc_item_path": item.opc_item_path,
                         "available": True,
                         "status": status,
-                        "value": cached["value"],
-                        "value_type": cached["value_type"],
-                        "quality": cached["quality"],
-                        "quality_text": cached["quality_text"],
-                        "opc_timestamp": cached["opc_timestamp"],
-                        "received_at": cached["received_at"],
+                        "value": cached.get("value"),
+                        "value_type": cached.get("value_type", "Double"),
+                        "quality": cached.get("quality"),
+                        "quality_text": cached.get("quality_text"),
+                        "opc_timestamp": cached.get("opc_timestamp"),
+                        "received_at": cached.get("received_at"),
                         "age_ms": age_ms,
                         "stale": is_stale,
-                        "error": cached["error"],
+                        "error": cached.get("error"),
                     })
 
         return {

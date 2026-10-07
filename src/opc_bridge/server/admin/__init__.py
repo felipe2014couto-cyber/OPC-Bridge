@@ -136,6 +136,9 @@ class AdminApplication(TagAdministration, PiIntegrationAdministration):
     def _read_request(
         self, method: str, path: str, query: str, environ: dict[str, Any], start_response: Callable[..., Any]
     ) -> list[bytes]:
+        pi_integ_resp = self.pi_integration_route(method, path, query, environ, start_response)
+        if pi_integ_resp is not None:
+            return pi_integ_resp
         pi_resp = self.pi_mapping_route(method, path, query, environ, start_response)
         if pi_resp is not None:
             return pi_resp

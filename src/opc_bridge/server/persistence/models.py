@@ -113,5 +113,8 @@ class PiMapping:
     last_publish_status: str = "Não configurado"
     last_published_at: Optional[str] = None
     last_published_value: Optional[str] = None
+    next_publish_due_at: Optional[str] = None
+    last_publish_error: Optional[str] = None
+    failure_count: int = 0
     created_at: Optional[str] = None
     updated_at: Optional[str] = None

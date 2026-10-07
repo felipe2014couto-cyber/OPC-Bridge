@@ -8,7 +8,14 @@ from typing import Any, Optional
 from urllib.parse import parse_qs
 
 from opc_bridge.server.admin.tags import read_json
-from opc_bridge.server.pi_output import SimulatedPiOutputChannel
+from opc_bridge.server.pi_output import (
+    PiOutputChannel,
+    PiOutputConfig,
+    SimulatedPiOutputChannel,
+    create_pi_output_channel,
+    evaluate_mapping_publication,
+    sanitize_error_message,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,16 +67,68 @@ def validate_pi_mapping_input(data: dict[str, Any], config: dict[str, Any]) -> d
 
 
 class PiIntegrationAdministration:
-    """Mixin for managing PI Point mappings and executing simulated PI output."""
+    """Mixin for managing PI Point mappings and executing simulated or real PI output."""
 
-    def _get_pi_output_channel(self) -> SimulatedPiOutputChannel:
-        if not hasattr(self, "_pi_output_channel") or self._pi_output_channel is None:
-            self._pi_output_channel = SimulatedPiOutputChannel()
-        return self._pi_output_channel
+    def _get_pi_output_config(self) -> PiOutputConfig:
+        if getattr(self, "_pi_output_config", None) is not None:
+            return self._pi_output_config
+        return PiOutputConfig.load_from_env()
+
+    def _get_pi_output_channel(self) -> PiOutputChannel:
+        if getattr(self, "_pi_output_channel", None) is not None:
+            return self._pi_output_channel
+        pub = getattr(self._bridge_server, "_pi_publisher", None) if getattr(self, "_bridge_server", None) else None
+        if pub is not None and getattr(pub, "channel", None) is not None:
+            return pub.channel
+        cfg = self._get_pi_output_config()
+        return create_pi_output_channel(cfg)
+
+    def pi_integration_route(
+        self, method: str, path: str, query: str, environ: dict[str, Any], start_response
+    ):
+        prefix = "/api/v1/pi-integration"
+        if path != prefix and not path.startswith(prefix + "/"):
+            return None
+
+        subpath = path[len(prefix):]
+        parts = [p for p in subpath.split("/") if p]
+
+        # 1. GET /api/v1/pi-integration/status
+        if len(parts) == 1 and parts[0] == "status":
+            if method != "GET":
+                return self._json_response(start_response, "405 Method Not Allowed", {"error": "method_not_allowed"})
+            cfg = self._get_pi_output_config()
+            banner_text = "Saída PI habilitada" if cfg.enabled else "Saída PI: Simulação — nenhuma escrita real habilitada."
+            return self._json_response(
+                start_response,
+                "200 OK",
+                {
+                    "output_enabled": cfg.enabled,
+                    "output_mode": cfg.mode,
+                    "banner_text": banner_text,
+                },
+            )
+
+        # 2. POST /api/v1/pi-integration/test-connection
+        if len(parts) == 1 and parts[0] == "test-connection":
+            if method != "POST":
+                return self._json_response(start_response, "405 Method Not Allowed", {"error": "method_not_allowed"})
+            channel = self._get_pi_output_channel()
+            test_result = channel.test_connection()
+            return self._json_response(
+                start_response,
+                "200 OK",
+                test_result,
+            )
+
+        return self._json_response(start_response, "404 Not Found", {"error": "not_found"})
 
     def pi_mapping_route(
         self, method: str, path: str, query: str, environ: dict[str, Any], start_response
     ):
+        if path.startswith("/api/v1/pi-integration"):
+            return self.pi_integration_route(method, path, query, environ, start_response)
+
         prefix = "/api/v1/pi-mappings"
         if path != prefix and not path.startswith(prefix + "/"):
             return None
@@ -110,12 +169,14 @@ class PiIntegrationAdministration:
                         m_copy["quality_text"] = live_it.get("quality_text")
                         m_copy["opc_timestamp"] = live_it.get("opc_timestamp") or live_it.get("received_at")
                         m_copy["age_ms"] = live_it.get("age_ms")
+                        m_copy["stale"] = bool(live_it.get("stale") or live_it.get("status") == "stale")
                     else:
                         m_copy["current_value"] = None
                         m_copy["quality"] = None
                         m_copy["quality_text"] = None
                         m_copy["opc_timestamp"] = None
                         m_copy["age_ms"] = None
+                        m_copy["stale"] = False
                     augmented.append(m_copy)
 
                 return self._json_response(start_response, "200 OK", {"mappings": augmented})
@@ -352,6 +413,94 @@ class PiIntegrationAdministration:
                 start_response,
                 "200 OK",
                 {"result": sim_res.to_dict(), "mapping": updated},
+            )
+
+        # Single real/simulated publication: POST /api/v1/pi-mappings/<id>/publish-once
+        if len(parts) == 2 and parts[1] == "publish-once":
+            if method != "POST":
+                return self._json_response(start_response, "405 Method Not Allowed", {"error": "method_not_allowed"})
+
+            with self._database.session() as repo:
+                mapping = repo.get_pi_mapping(mapping_id)
+                if mapping is None:
+                    return self._json_response(start_response, "404 Not Found", {"error": "mapping_not_found"})
+
+                if not mapping.get("enabled"):
+                    return self._json_response(
+                        start_response,
+                        "409 Conflict",
+                        {"error": "mapping_disabled", "message": "O mapeamento está desativado e não pode ser publicado no PI."},
+                    )
+
+                agent_id = mapping.get("agent_id")
+                opc_path = mapping.get("opc_item_path")
+
+                # Retrieve last reading already available from active cache (strictly read-only)
+                live_item = None
+                if agent_id and self._bridge_server is not None:
+                    live_data = self._bridge_server.get_live_values(agent_id)
+                    for it in live_data.get("items", []):
+                        if it.get("opc_item_path") == opc_path:
+                            live_item = it
+                            break
+
+                channel = self._get_pi_output_channel()
+                config = self._get_pi_output_config()
+
+                eval_res = evaluate_mapping_publication(
+                    mapping=mapping,
+                    live_item=live_item,
+                    channel=channel,
+                    config=config,
+                    force=True,
+                )
+
+                if eval_res.get("action") == "skipped":
+                    reason = eval_res.get("reason")
+                    msg = eval_res.get("message", "Publicação bloqueada.")
+                    return self._json_response(
+                        start_response,
+                        "400 Bad Request",
+                        {"error": reason, "message": msg},
+                    )
+
+                res = eval_res["result"]
+                repo.update_pi_mapping_publication(
+                    mapping_id=mapping_id,
+                    status=eval_res["new_status"],
+                    published_value=str(eval_res["value"]),
+                    next_publish_due_at=eval_res.get("next_publish_due_at"),
+                    error=eval_res.get("error"),
+                    failure_count=eval_res.get("failure_count"),
+                )
+
+                if agent_id:
+                    repo.add_audit_event(
+                        agent_id,
+                        str(uuid.uuid4()),
+                        "pi_mapping.publish_once",
+                        json.dumps({
+                            "mapping_id": mapping_id,
+                            "opc_item_path": opc_path,
+                            "pi_point_name": mapping["pi_point_name"],
+                            "point_source": mapping.get("point_source", ""),
+                            "location1": mapping.get("location1", 0),
+                            "value": eval_res["value"],
+                            "quality": eval_res["quality"],
+                            "opc_timestamp": eval_res["timestamp"],
+                            "status": eval_res["new_status"],
+                            "mode": config.mode,
+                            "error": eval_res.get("error"),
+                            "user": user,
+                        }),
+                    )
+
+                updated = repo.get_pi_mapping(mapping_id)
+
+            return self._json_response(
+                start_response,
+                "200 OK",
+                {"result": res.to_dict(), "mapping": updated},
             )
 
         # Toggle enabled: POST or PATCH /api/v1/pi-mappings/<id>/toggle

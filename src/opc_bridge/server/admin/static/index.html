@@ -221,8 +221,11 @@
     <!-- MÓDULO 3: INTEGRAÇÃO PI -->
     <div id="panel-pi" class="tab-panel" role="tabpanel" aria-labelledby="tab-pi" hidden>
       <!-- Banner fixo no topo da aba -->
-      <div id="pi-simulation-banner" class="banner info" style="font-weight: 500;">
-        Saída PI: Simulação — nenhuma escrita real habilitada.
+      <div style="display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px;">
+        <div id="pi-simulation-banner" class="banner info" style="margin-bottom: 0; flex: 1; font-weight: 500;">
+          Saída PI: Simulação — nenhuma escrita real habilitada.
+        </div>
+        <button id="btn-test-pi-connection" type="button" style="white-space: nowrap;">Testar conexão PI</button>
       </div>
 
       <!-- Card superior para criar/editar um mapeamento -->
@@ -305,12 +308,15 @@
                 <th>Velocidade</th>
                 <th>Estado</th>
                 <th>Último resultado</th>
+                <th>Último envio</th>
+                <th>Próximo envio</th>
+                <th>Erro</th>
                 <th>Ações</th>
               </tr>
             </thead>
             <tbody id="pi-mappings-body">
               <tr>
-                <td colspan="11" class="muted">Selecione um equipamento para visualizar os mapeamentos.</td>
+                <td colspan="14" class="muted">Selecione um equipamento para visualizar os mapeamentos.</td>
               </tr>
             </tbody>
           </table>
@@ -358,6 +364,28 @@
       <div class="actions" style="margin-top: 18px; justify-content: flex-end;">
         <button id="btn-cancel-delete-modal" type="button">Cancelar</button>
         <button id="btn-confirm-delete-mapping" class="danger primary" type="button">Excluir mapeamento</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal de Confirmação de Publicação Única -->
+  <div id="modal-publish-once-confirm" class="modal-overlay" hidden>
+    <div class="modal-dialog card" role="dialog" aria-modal="true" aria-labelledby="modal-publish-title">
+      <div class="section-title">
+        <h2 id="modal-publish-title">Publicar uma vez no PI</h2>
+      </div>
+      <p>Confirme a publicação imediata da leitura atual em cache para o PI:</p>
+      <div style="background: var(--surface-bg, #f8f9fa); padding: 12px; border-radius: 6px; margin: 12px 0;">
+        <p><strong>PI Point:</strong> <span id="publish-once-point">—</span></p>
+        <p><strong>Tag OPC:</strong> <span id="publish-once-tag">—</span></p>
+        <p><strong>Valor:</strong> <span id="publish-once-value">—</span></p>
+        <p><strong>Qualidade:</strong> <span id="publish-once-quality">—</span></p>
+        <p><strong>Timestamp:</strong> <span id="publish-once-timestamp">—</span></p>
+      </div>
+      <div id="publish-once-warning" class="banner danger" hidden></div>
+      <div class="actions" style="margin-top: 18px; justify-content: flex-end;">
+        <button id="btn-cancel-publish-once-modal" type="button">Cancelar</button>
+        <button id="btn-confirm-publish-once" class="primary" type="button">Publicar</button>
       </div>
     </div>
   </div>
