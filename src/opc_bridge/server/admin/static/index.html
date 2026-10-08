@@ -223,9 +223,9 @@
       <!-- Banner fixo no topo da aba -->
       <div style="display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px;">
         <div id="pi-simulation-banner" class="banner info" style="margin-bottom: 0; flex: 1; font-weight: 500;">
-          Saída PI desabilitada
+          Saída PI: desabilitada — nenhuma escrita real habilitada.
         </div>
-        <button id="btn-test-pi-connection" type="button" style="white-space: nowrap;">Testar conexão PI</button>
+        <button id="btn-test-pi-connection" type="button" disabled title="Saída PI desabilitada. Habilitação depende de configuração administrativa externa." style="white-space: nowrap;">Testar conexão PI</button>
       </div>
 
       <!-- Card: Seleção de Contexto & Perfil PI (Equipamento + Servidor OPC) -->
@@ -306,7 +306,7 @@
               <tr>
                 <th style="min-width: 240px;">Endereço OPC *</th>
                 <th style="min-width: 200px;">PI Point *</th>
-                <th style="width: 140px;">Velocidade (ms) *</th>
+                <th style="width: 160px;">Velocidade de publicação (ms) *</th>
                 <th style="width: 70px; text-align: center;">Ativo</th>
                 <th style="min-width: 120px;">Último valor</th>
                 <th style="min-width: 100px;">Qualidade</th>

@@ -133,7 +133,7 @@ class PiIntegrationAdministration:
             if method != "GET":
                 return self._json_response(start_response, "405 Method Not Allowed", {"error": "method_not_allowed"})
             cfg = self._get_pi_output_config()
-            banner_text = "Saída PI habilitada" if cfg.enabled else "Saída PI desabilitada"
+            banner_text = "Saída PI habilitada" if cfg.enabled else "Saída PI: desabilitada — nenhuma escrita real habilitada."
             return self._json_response(
                 start_response,
                 "200 OK",
@@ -148,6 +148,18 @@ class PiIntegrationAdministration:
         if len(parts) == 1 and parts[0] == "test-connection":
             if method != "POST":
                 return self._json_response(start_response, "405 Method Not Allowed", {"error": "method_not_allowed"})
+            cfg = self._get_pi_output_config()
+            if not cfg.enabled and cfg.mode == "web_api":
+                return self._json_response(
+                    start_response,
+                    "200 OK",
+                    {
+                        "connected": False,
+                        "output_enabled": False,
+                        "error": "output_disabled",
+                        "message": "Saída PI: desabilitada — nenhuma escrita real habilitada. Teste de conexão bloqueado.",
+                    },
+                )
             channel = self._get_pi_output_channel()
             test_result = channel.test_connection()
             return self._json_response(
@@ -666,7 +678,7 @@ class PiIntegrationAdministration:
                             )
 
                     mapping_id = str(uuid.uuid4())
-                    created = repo.add_pi_mapping(
+                    repo.add_pi_mapping(
                         mapping_id=mapping_id,
                         equipment_id=equipment_id,
                         opc_prog_id=opc_prog_id,

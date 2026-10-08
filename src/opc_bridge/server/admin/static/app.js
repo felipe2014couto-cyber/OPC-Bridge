@@ -22,6 +22,7 @@
   let piMappings = [];
   let deletingMappingId = null;
   let publishingOnceMapping = null;
+  let piOutputEnabled = false;
 
   const errors = {
     unauthorized: "Acesso não autorizado ou sessão expirada no proxy.",
@@ -1533,11 +1534,16 @@
 
       const btnPubOnce = document.createElement("button");
       btnPubOnce.type = "button";
-      btnPubOnce.className = "btn-sm primary";
+      btnPubOnce.className = "btn-sm primary btn-publish-once";
       btnPubOnce.textContent = "Publicar uma vez";
-      btnPubOnce.title = "Publicar a leitura atual em cache no PI Point de destino";
-      btnPubOnce.disabled = !m.enabled;
-      btnPubOnce.addEventListener("click", () => openPublishOnceModal(tr, m));
+      if (!piOutputEnabled) {
+        btnPubOnce.disabled = true;
+        btnPubOnce.title = "Publicação desabilitada: saída PI desabilitada externamente (OPC_BRIDGE_PI_OUTPUT_ENABLED=true).";
+      } else {
+        btnPubOnce.disabled = !m.enabled;
+        btnPubOnce.title = "Publicar a leitura atual em cache no PI Point de destino";
+        btnPubOnce.addEventListener("click", () => openPublishOnceModal(tr, m));
+      }
       tdAct.appendChild(btnPubOnce);
 
       const btnSim = document.createElement("button");
@@ -1551,15 +1557,17 @@
 
       const btnDel = document.createElement("button");
       btnDel.type = "button";
-      btnDel.className = "btn-sm danger";
-      btnDel.textContent = "Excluir";
+      btnDel.className = "btn-sm danger btn-delete-row";
+      btnDel.textContent = "Excluir linha";
+      btnDel.title = "Excluir esta linha de mapeamento";
       btnDel.addEventListener("click", () => confirmDeleteRow(tr, m));
       tdAct.appendChild(btnDel);
     } else {
       const btnDel = document.createElement("button");
       btnDel.type = "button";
-      btnDel.className = "btn-sm danger";
-      btnDel.textContent = "Excluir";
+      btnDel.className = "btn-sm danger btn-delete-row";
+      btnDel.textContent = "Excluir linha";
+      btnDel.title = "Remover esta linha da planilha";
       btnDel.addEventListener("click", () => {
         tr.remove();
         updateRowCountBadge();
@@ -1840,15 +1848,36 @@
   async function loadPiIntegrationStatus() {
     try {
       const data = await api("/api/v1/pi-integration/status");
+      piOutputEnabled = Boolean(data.output_enabled);
       const banner = el("pi-simulation-banner");
+      const btnTest = el("btn-test-pi-connection");
       if (banner) {
         if (data.output_enabled) {
           banner.className = "banner success";
           banner.textContent = data.banner_text || "Saída PI habilitada";
         } else {
           banner.className = "banner info";
-          banner.textContent = data.banner_text || "Saída PI: Simulação — nenhuma escrita real habilitada.";
+          banner.textContent = data.banner_text || "Saída PI: desabilitada — nenhuma escrita real habilitada.";
         }
+      }
+      if (btnTest) {
+        if (data.output_enabled) {
+          btnTest.disabled = false;
+          btnTest.title = "Testar conectividade com PI Web API";
+        } else {
+          btnTest.disabled = true;
+          btnTest.title = "Saída PI desabilitada. Habilitação depende de configuração administrativa externa.";
+        }
+      }
+      // Update any rendered row publication buttons
+      const tbody = el("pi-spreadsheet-body");
+      if (tbody) {
+        tbody.querySelectorAll(".btn-publish-once").forEach(btn => {
+          if (!piOutputEnabled) {
+            btn.disabled = true;
+            btn.title = "Publicação desabilitada: saída PI desabilitada externamente (OPC_BRIDGE_PI_OUTPUT_ENABLED=true).";
+          }
+        });
       }
     } catch (e) {
       // Ignore if unavailable
@@ -1856,6 +1885,10 @@
   }
 
   async function testPiConnection() {
+    if (!piOutputEnabled) {
+      message("Saída PI desabilitada: teste de conexão bloqueado externamente.", "warning");
+      return;
+    }
     const btn = el("btn-test-pi-connection");
     if (btn) btn.disabled = true;
     try {
@@ -1915,7 +1948,9 @@
     const confirmBtn = el("btn-confirm-publish-once");
 
     let blockReason = null;
-    if (currentVal === null || currentVal === undefined || currentVal === "—") {
+    if (!piOutputEnabled) {
+      blockReason = "Publicação bloqueada: saída PI desabilitada externamente (kill switch desligado).";
+    } else if (currentVal === null || currentVal === undefined || currentVal === "—") {
       blockReason = "Publicação bloqueada: nenhum valor OPC coletado em cache para esta tag. Execute '⚡ Ler agora' antes.";
     } else if (m.quality !== null && m.quality !== undefined && m.quality < 192) {
       blockReason = `Publicação bloqueada: qualidade OPC não é confiável (Bad: ${m.quality}).`;

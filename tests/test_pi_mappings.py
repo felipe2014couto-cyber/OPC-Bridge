@@ -9,7 +9,6 @@
 from __future__ import annotations
 
 import json
-import uuid
 from unittest.mock import MagicMock
 
 import pytest
@@ -648,3 +647,187 @@ def test_read_now_isolated_opc_inspection(pi_mapping_runtime, monkeypatch):
     # Zero write, zero CONFIG_PUSH
     mock_opc_write.assert_not_called()
     mock_config_push.assert_not_called()
+
+
+def test_pi_profile_uniqueness_and_attribute_inheritance(pi_mapping_runtime):
+    """Verify profile uniqueness per (equipment_id, opc_prog_id) and mandatory inherited attributes."""
+    app, _, database, _, _ = pi_mapping_runtime
+
+    # 1. POST /api/v1/pi-profiles with same equipment and prog_id updates existing profile
+    st_post, _, post_data = request(app, "/api/v1/pi-profiles", method="POST", payload={
+        "equipment_id": "eq-100",
+        "opc_prog_id": "ABB.AfwOpcDaSurrogate.1",
+        "point_source": "OPC_MODIFIED",
+        "location1": 42,
+        "enabled": True,
+    })
+    assert st_post.startswith("200")
+    assert post_data["profile"]["point_source"] == "OPC_MODIFIED"
+    assert post_data["profile"]["location1"] == 42
+
+    # Verify database has only 1 profile for this equipment and prog_id
+    with database.session() as repo:
+        profiles = repo.list_pi_profiles("eq-100")
+        matching = [p for p in profiles if p["opc_prog_id"] == "ABB.AfwOpcDaSurrogate.1"]
+        assert len(matching) == 1
+        assert matching[0]["point_source"] == "OPC_MODIFIED"
+        assert matching[0]["location1"] == 42
+
+
+def test_pi_integration_total_independence_from_opc_test_tab(pi_mapping_runtime):
+    """Verify PI Integration is completely decoupled from named_opc_configs on OPC tab."""
+    app, _, database, _, _ = pi_mapping_runtime
+
+    # 1. Create a config in the OPC test tab
+    with database.session() as repo:
+        repo.add_named_config(
+            config_id="opc-test-cfg-1",
+            name="Config Teste OPC",
+            equipment_id="eq-100",
+            opc_prog_id="Kepware.KEPServerEX.V6",
+            interval_ms=1000,
+            tags_json=json.dumps(["TEST.OPC.TAG1"]),
+            agent_id="agent-pi",
+        )
+
+    # 2. PI profiles and mappings for eq-100 do not depend on opc-test-cfg-1
+    st_prof, _, prof_data = request(
+        app,
+        "/api/v1/pi-profiles?equipment_id=eq-100&opc_prog_id=ABB.AfwOpcDaSurrogate.1",
+        method="GET",
+    )
+    assert st_prof.startswith("200")
+    profile = prof_data["profile"]
+    assert profile is not None
+    assert "opc_config_id" not in profile
+
+    # 3. Save a batch in PI spreadsheet
+    st_batch, _, batch_data = request(app, "/api/v1/pi-mappings/batch", method="POST", payload={
+        "equipment_id": "eq-100",
+        "opc_prog_id": "ABB.AfwOpcDaSurrogate.1",
+        "rows": [
+            {"opc_item_path": "INDEPENDENT.TAG.1", "pi_point_name": "PI.INDEP.1", "publish_interval_ms": 3000, "enabled": True},
+        ],
+    })
+    assert st_batch.startswith("200")
+    assert batch_data["saved_count"] == 1
+
+    # 4. Deleting or modifying the OPC test tab config has zero effect on PI profile or mapping
+    with database.session() as repo:
+        repo.delete_named_config("opc-test-cfg-1")
+        assert repo.get_named_config("opc-test-cfg-1") is None
+
+        # PI profile and mapping are completely preserved and intact
+        pi_prof = repo.get_pi_profile("eq-100", "ABB.AfwOpcDaSurrogate.1")
+        assert pi_prof is not None
+        maps = repo.list_pi_mappings("eq-100", "ABB.AfwOpcDaSurrogate.1")
+        assert len(maps) == 1
+        assert maps[0]["opc_item_path"] == "INDEPENDENT.TAG.1"
+
+
+def test_read_now_handles_invalid_opc_address(pi_mapping_runtime, monkeypatch):
+    """Verify Ler agora handles invalid OPC addresses gracefully without interrupting batch."""
+    app, bridge, _, _, _ = pi_mapping_runtime
+
+    # Mock inspect returning one valid and one invalid tag
+    mock_inspect = MagicMock()
+    mock_inspect.return_value = InspectionResponse(
+        request_id="insp-invalid-tag",
+        results=[
+            {
+                "opc_item_path": "VALID.TAG.1",
+                "status": "valid",
+                "value": 100.5,
+                "quality": 192,
+                "quality_text": "Good",
+                "opc_timestamp": "2026-10-07T16:00:00.000Z",
+            },
+            {
+                "opc_item_path": "INVALID.NONEXISTENT.TAG",
+                "status": "invalid",
+                "value": None,
+                "quality": None,
+                "quality_text": None,
+                "opc_timestamp": None,
+                "error": "Endereço OPC não encontrado.",
+            },
+        ],
+    )
+    monkeypatch.setattr(bridge, "inspect_agent_threadsafe", mock_inspect)
+
+    st, _, data = request(app, "/api/v1/pi-integration/read-now", method="POST", payload={
+        "equipment_id": "eq-100",
+        "opc_prog_id": "ABB.AfwOpcDaSurrogate.1",
+        "tags": ["VALID.TAG.1", "INVALID.NONEXISTENT.TAG"],
+    })
+    assert st.startswith("200")
+    results = data["results"]
+    assert len(results) == 2
+
+    valid_res = next(r for r in results if r["opc_item_path"] == "VALID.TAG.1")
+    assert valid_res["status"] == "valid"
+    assert valid_res["value"] == 100.5
+
+    invalid_res = next(r for r in results if r["opc_item_path"] == "INVALID.NONEXISTENT.TAG")
+    assert invalid_res["status"] == "invalid"
+    assert invalid_res["value"] is None
+    assert "não encontrado" in invalid_res["error"].lower()
+
+
+def test_pi_attribute_divergence_blocks_publication():
+    """Verify validate_point_attributes blocks publication if PointSource or Location1 differs from profile."""
+    from opc_bridge.server.pi_output import PiOutputConfig, PiWebApiOutputChannel
+
+    config = PiOutputConfig(
+        enabled=True,
+        mode="web_api",
+        base_url="https://piserver.test/piwebapi",
+        data_server="PIMS",
+    )
+    channel = PiWebApiOutputChannel(config=config)
+
+    # Mock WebId resolution
+    channel._web_id_cache["TAG_POINT_TEST"] = "webid-test-123"
+
+    # 1. PointSource mismatch
+    channel._attributes_cache["webid-test-123"] = {
+        "pointsource": "KEPWARE",
+        "location1": 1,
+    }
+    valid_ps, err_ps, _ = channel.validate_point_attributes(
+        "TAG_POINT_TEST",
+        expected_point_source="OPCBRIDGE",
+        expected_location1=1,
+    )
+    assert valid_ps is False
+    assert "pointsource" in err_ps.lower()
+    assert "não corresponde" in err_ps.lower()
+
+    # 2. Location1 mismatch
+    channel._attributes_cache["webid-test-123"] = {
+        "pointsource": "OPCBRIDGE",
+        "location1": 99,
+    }
+    valid_loc, err_loc, _ = channel.validate_point_attributes(
+        "TAG_POINT_TEST",
+        expected_point_source="OPCBRIDGE",
+        expected_location1=1,
+    )
+    assert valid_loc is False
+    assert "location1" in err_loc.lower()
+    assert "não corresponde" in err_loc.lower()
+
+    # 3. Exact match
+    channel._attributes_cache["webid-test-123"] = {
+        "pointsource": "OPCBRIDGE",
+        "location1": 1,
+    }
+    valid_ok, err_ok, details = channel.validate_point_attributes(
+        "TAG_POINT_TEST",
+        expected_point_source="OPCBRIDGE",
+        expected_location1=1,
+    )
+    assert valid_ok is True
+    assert err_ok is None
+    assert details["point_source"] == "OPCBRIDGE"
+    assert details["location1"] == 1
