@@ -63,6 +63,16 @@
     invalid_publish_interval_bounds: "A velocidade de publicação deve ser um inteiro entre 1000 e 60000 ms."
   };
 
+  function escapeHtml(str) {
+    if (str === null || str === undefined) return "";
+    return String(str)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#039;");
+  }
+
   function message(text, type = "info") {
     const box = el("message");
     if (!text) {
@@ -128,7 +138,10 @@
   // Tabs switching
   function switchTab(tab) {
     currentTab = tab;
-    stopLive();
+    try {
+      stopLive();
+    } catch (_) {}
+
     const tabs = ["equipments", "opc", "pi"];
     tabs.forEach(t => {
       const btn = el(`tab-${t}`);
@@ -141,22 +154,28 @@
       }
     });
 
-    if (tab === "equipments") {
-      loadEquipments().catch(e => message(e.message, "error"));
-    } else if (tab === "opc") {
-      populateEquipmentDropdown();
-      if (el("opc-equipment-select").value) {
-        onEquipmentSelected().catch(e => message(e.message, "error"));
+    try {
+      if (tab === "equipments") {
+        loadEquipments().catch(e => message(`Erro ao carregar equipamentos: ${e.message}`, "error"));
+      } else if (tab === "opc") {
+        populateEquipmentDropdown();
+        const sel = el("opc-equipment-select");
+        if (sel && sel.value) {
+          onEquipmentSelected().catch(e => message(`Erro ao carregar configuração OPC: ${e.message}`, "error"));
+        }
+      } else if (tab === "pi") {
+        loadPiIntegrationStatus().catch(() => {});
+        populatePiEquipmentDropdown();
+        const piSel = el("pi-equipment-select");
+        if (selectedEquipment && selectedEquipment.equipment_id && piSel) {
+          piSel.value = selectedEquipment.equipment_id;
+        }
+        if (piSel && piSel.value) {
+          onPiEquipmentSelected().catch(e => message(`Erro na Integração PI: ${e.message}`, "error"));
+        }
       }
-    } else if (tab === "pi") {
-      loadPiIntegrationStatus().catch(() => {});
-      populatePiEquipmentDropdown();
-      if (selectedEquipment && selectedEquipment.equipment_id) {
-        el("pi-equipment-select").value = selectedEquipment.equipment_id;
-      }
-      if (el("pi-equipment-select").value) {
-        onPiEquipmentSelected().catch(e => message(e.message, "error"));
-      }
+    } catch (errTab) {
+      message(`Erro ao alternar para a aba ${tab}: ${errTab.message}`, "error");
     }
   }
 
@@ -2843,6 +2862,84 @@
     }
   }
 
+  async function readNowPiTags() {
+    if (!selectedPiEquipment?.agent_id || busy) return;
+    const btn = el("btn-read-now-pi");
+    const tbody = el("pi-spreadsheet-body");
+    if (!tbody) return;
+    const rows = getTableRows();
+
+    const tags = rows.map(r => r.querySelector(".opc-path")?.value.trim()).filter(Boolean);
+    if (tags.length === 0) {
+      message("Nenhum endereço OPC informado na planilha para leitura.", "warning");
+      return;
+    }
+
+    try {
+      busy = true;
+      if (btn) btn.disabled = true;
+      message("Lendo valores atuais no servidor OPC via agente...", "info");
+
+      const payload = {
+        equipment_id: selectedPiEquipment.equipment_id,
+        opc_prog_id: selectedPiProgId,
+        tags: tags
+      };
+
+      const data = await api("/api/v1/pi-integration/read-now", payload, "POST");
+      const results = data.results || [];
+      const notFoundList = [];
+
+      rows.forEach(r => {
+        const opcInput = r.querySelector(".opc-path");
+        const path = opcInput ? opcInput.value.trim() : "";
+        const res = results.find(resItem => resItem.opc_item_path === path);
+
+        const tdVal = r.querySelector(".col-val");
+        const tdQual = r.querySelector(".col-qual");
+        const tdTs = r.querySelector(".col-ts");
+        const tdRes = r.querySelector(".col-res");
+
+        if (res) {
+          if (res.status === "valid" || (res.value !== null && res.value !== undefined)) {
+            opcInput.classList.remove("is-invalid");
+            if (tdVal) tdVal.textContent = String(res.value);
+            if (tdQual) {
+              const q = res.quality !== null && res.quality !== undefined ? res.quality : 192;
+              if (q >= 192) {
+                tdQual.innerHTML = '<span class="cell-quality good">Good</span>';
+              } else {
+                tdQual.innerHTML = `<span class="cell-quality bad">Bad (${q})</span>`;
+              }
+            }
+            if (tdTs) tdTs.textContent = formatOpcTimestamp(res.opc_timestamp);
+            if (tdRes) tdRes.innerHTML = '<span class="badge info">Lido via OPC</span>';
+          } else {
+            opcInput.classList.add("is-invalid");
+            if (tdVal) tdVal.textContent = "—";
+            if (tdQual) {
+              tdQual.innerHTML = `<span class="cell-quality bad" title="${escapeHtml(res.error || 'Endereço OPC não encontrado')}">Bad</span>`;
+            }
+            if (tdTs) tdTs.textContent = "—";
+            if (tdRes) tdRes.innerHTML = '<span class="badge error">Falha leitura</span>';
+            notFoundList.push(path);
+          }
+        }
+      });
+
+      if (notFoundList.length > 0) {
+        message(`Leitura concluída com ${notFoundList.length} endereço(s) OPC com falha. Verifique os campos destacados em vermelho.`, "warning");
+      } else {
+        message(`Leitura concluída com sucesso para todas as ${tags.length} tags OPC.`, "success");
+      }
+    } catch (err) {
+      message(err.message, "error");
+    } finally {
+      busy = false;
+      updateSpreadsheetToolbar(Boolean(currentPiProfile && currentPiProfile.enabled));
+    }
+  }
+
   async function simulatePiMapping(mappingId) {
     try {
       const res = await api(`/api/v1/pi-mappings/${encodeURIComponent(mappingId)}/simulate`, {}, "POST");
@@ -3089,8 +3186,250 @@
   // INITIALIZATION & EVENT LISTENERS
   // ==========================================
 
+  function initTabs() {
+    const tabEq = el("tab-equipments");
+    const tabOpc = el("tab-opc");
+    const tabPi = el("tab-pi");
+    if (tabEq) tabEq.addEventListener("click", () => switchTab("equipments"));
+    if (tabOpc) tabOpc.addEventListener("click", () => switchTab("opc"));
+    if (tabPi) tabPi.addEventListener("click", () => switchTab("pi"));
+  }
+
+  function initEquipmentsModule() {
+    const btnRef = el("btn-refresh-equipments");
+    const btnShow = el("btn-show-add-equipment");
+    const btnCancel = el("btn-cancel-equipment");
+    const form = el("equipment-form");
+
+    if (btnRef) btnRef.addEventListener("click", () => loadEquipments());
+    if (btnShow) btnShow.addEventListener("click", showAddEquipmentForm);
+    if (btnCancel) btnCancel.addEventListener("click", hideEquipmentForm);
+    if (form) {
+      form.addEventListener("submit", e => {
+        e.preventDefault();
+        saveEquipment();
+      });
+    }
+  }
+
+  function initOpcModule() {
+    const btnRef = el("btn-refresh-opc");
+    const selectEq = el("opc-equipment-select");
+    const btnFind = el("find-servers");
+    const servers = el("servers");
+    const progId = el("prog-id");
+    const interval = el("interval");
+    const btnAddTag = el("add-tag");
+    const btnValAll = el("validate-all");
+    const btnSaveCfg = el("btn-save-config");
+    const btnToggle = el("toggle-live");
+    const btnApply = el("apply");
+    const btnLoadAct = el("btn-load-active");
+
+    if (btnRef) btnRef.addEventListener("click", () => onEquipmentSelected());
+    if (selectEq) selectEq.addEventListener("change", onEquipmentSelected);
+    if (btnFind) btnFind.addEventListener("click", findOpcServers);
+    if (servers) {
+      servers.addEventListener("change", () => {
+        const val = servers.value;
+        if (val && progId) progId.value = val;
+        stopLive();
+        invalidateApproval();
+      });
+    }
+    if (progId) {
+      progId.addEventListener("input", () => {
+        stopLive();
+        invalidateApproval();
+      });
+    }
+    if (interval) {
+      interval.addEventListener("input", () => {
+        stopLive();
+        invalidateApproval();
+      });
+    }
+    if (btnAddTag) btnAddTag.addEventListener("click", () => addTag());
+    if (btnValAll) btnValAll.addEventListener("click", () => validateTagList());
+    if (btnSaveCfg) btnSaveCfg.addEventListener("click", saveConfig);
+    if (btnToggle) btnToggle.addEventListener("click", toggleLive);
+    if (btnApply) btnApply.addEventListener("click", applyToAgent);
+    if (btnLoadAct) {
+      btnLoadAct.addEventListener("click", () => {
+        if (!activeAgentConfig) return;
+        stopLive();
+        invalidateApproval();
+        const cfgName = el("config-name");
+        if (cfgName) cfgName.value = `Ativa - v${activeAgentConfig.version}`;
+        if (progId) progId.value = activeAgentConfig.opc_prog_id;
+        if (interval) interval.value = activeAgentConfig.update_rate_ms;
+        const tagsContainer = el("tags");
+        if (tagsContainer) {
+          tagsContainer.replaceChildren();
+          activeAgentConfig.tags.forEach(t => addTag(t));
+        }
+        updateTagCountBadge();
+        updateButtons();
+      });
+    }
+  }
+
+  function initPiModule() {
+    if (el("pi-equipment-select")) {
+      el("pi-equipment-select").addEventListener("change", onPiEquipmentSelected);
+    }
+    if (el("btn-discover-pi-servers")) {
+      el("btn-discover-pi-servers").addEventListener("click", discoverPiServers);
+    }
+    if (el("pi-prog-id")) {
+      el("pi-prog-id").addEventListener("change", onPiProgIdChanged);
+      el("pi-prog-id").addEventListener("blur", onPiProgIdChanged);
+      el("pi-prog-id").addEventListener("keydown", e => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          onPiProgIdChanged();
+        }
+      });
+    }
+    if (el("btn-save-pi-profile")) {
+      el("btn-save-pi-profile").addEventListener("click", savePiProfile);
+    }
+    if (el("pi-point-source")) {
+      el("pi-point-source").addEventListener("input", clearProfileError);
+    }
+    if (el("pi-location1")) {
+      el("pi-location1").addEventListener("input", clearProfileError);
+    }
+
+    if (el("btn-add-pi-row")) {
+      el("btn-add-pi-row").addEventListener("click", addPiRow);
+    }
+    if (el("btn-delete-pi-row")) {
+      el("btn-delete-pi-row").addEventListener("click", deleteSelectedRow);
+    }
+    if (el("btn-save-pi-sheet")) {
+      el("btn-save-pi-sheet").addEventListener("click", savePiSheetChanges);
+    }
+    if (el("btn-read-now-pi")) {
+      el("btn-read-now-pi").addEventListener("click", readNowPiTags);
+    }
+    const sheetTable = el("pi-spreadsheet-table");
+    if (sheetTable) {
+      sheetTable.tabIndex = 0;
+      sheetTable.addEventListener("paste", handleTabularPaste);
+      sheetTable.addEventListener("copy", e => {
+        if (!piIsEditing && piSelectionRange) {
+          e.preventDefault();
+          copySelectionToClipboard();
+        }
+      });
+      sheetTable.addEventListener("cut", e => {
+        if (!piIsEditing && piSelectionRange) {
+          e.preventDefault();
+          cutSelection();
+        }
+      });
+    }
+
+    if (el("btn-refresh-pi-audit")) {
+      el("btn-refresh-pi-audit").addEventListener("click", loadPiAudit);
+    }
+    if (el("btn-cancel-delete-modal")) {
+      el("btn-cancel-delete-modal").addEventListener("click", () => {
+        deletingMappingId = null;
+        el("modal-delete-mapping-confirm").hidden = true;
+      });
+    }
+    if (el("btn-confirm-delete-mapping")) {
+      el("btn-confirm-delete-mapping").addEventListener("click", executeDeleteMapping);
+    }
+    if (el("btn-test-pi-connection")) {
+      el("btn-test-pi-connection").addEventListener("click", testPiConnection);
+    }
+    if (el("btn-cancel-publish-once-modal")) {
+      el("btn-cancel-publish-once-modal").addEventListener("click", closePublishOnceModal);
+    }
+    if (el("btn-confirm-publish-once")) {
+      el("btn-confirm-publish-once").addEventListener("click", confirmPublishOnce);
+    }
+  }
+
+  function initGlobalListeners() {
+    const sheetTable = el("pi-spreadsheet-table");
+
+    // Global mouseup and mousemove for selection dragging and fill handle dragging
+    document.addEventListener("mouseup", () => {
+      if (piIsDraggingHandle) {
+        finishFillHandleDrag();
+      }
+      piIsMouseDown = false;
+      piDragAnchor = null;
+      piMouseDownPos = null;
+      piIsDraggingSelection = false;
+    });
+
+    document.addEventListener("mousemove", e => {
+      if (piIsDraggingHandle && piDragHandleSourceRange) {
+        const domRows = getTableRows();
+        if (domRows.length > 0) {
+          const lastRow = domRows[domRows.length - 1];
+          const rect = lastRow.getBoundingClientRect();
+          if (e.clientY > rect.bottom) {
+            const rowHeight = rect.height || 30;
+            const extra = Math.min(50, Math.max(1, Math.floor((e.clientY - rect.bottom) / rowHeight) + 1));
+            const targetR = (domRows.length - 1) + extra;
+            while (getTableRows().length <= targetR) {
+              addPiRowSilently();
+            }
+            updateRowIndices();
+            updateRowCountBadge();
+            onFillHandleHoverRow(targetR);
+          }
+        }
+      }
+    });
+
+    // Global keyboard handler when spreadsheet or active cell is focused
+    document.addEventListener("keydown", e => {
+      if (currentTab !== "pi") return;
+      if (!piActiveCell) return;
+      const activeEl = document.activeElement;
+      const isTableDescendant = activeEl && (activeEl.closest && activeEl.closest("#pi-spreadsheet-table"));
+      const isBodyOrTable = !activeEl || activeEl === document.body || activeEl === sheetTable;
+      if (isTableDescendant || isBodyOrTable) {
+        handleCellKeyDown(e, piActiveCell.rIdx, piActiveCell.cIdx);
+      }
+    });
+
+    // Window / Page lifecycle events: Auto-stop live monitoring
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) stopLive();
+    });
+    window.addEventListener("pagehide", stopLive);
+    window.addEventListener("beforeunload", stopLive);
+  }
+
   async function init() {
     try {
+      // Step 1: Initialize tab navigation
+      initTabs();
+
+      // Step 2: Initialize Equipments & OPC modules
+      initEquipmentsModule();
+      initOpcModule();
+
+      // Step 3: Initialize PI Integration module with isolation
+      try {
+        initPiModule();
+      } catch (errPi) {
+        console.error("Falha ao inicializar listeners do módulo PI:", errPi);
+        message(`Aviso na inicialização do módulo PI: ${errPi.message}`, "warning");
+      }
+
+      // Step 4: Initialize global input & lifecycle listeners
+      initGlobalListeners();
+
+      // Step 5: Core server health & capabilities
       await api("/health");
       const [agentsData, capsData] = await Promise.all([
         api("/api/v1/agents"),
@@ -3099,187 +3438,7 @@
       availableAgents = agentsData.agents || [];
       dispatch = capsData.dispatch_available;
 
-      // Event listeners - Navigation Tabs
-      el("tab-equipments").addEventListener("click", () => switchTab("equipments"));
-      el("tab-opc").addEventListener("click", () => switchTab("opc"));
-      el("tab-pi").addEventListener("click", () => switchTab("pi"));
-
-      // Equipments Module events
-      el("btn-refresh-equipments").addEventListener("click", () => loadEquipments());
-      el("btn-show-add-equipment").addEventListener("click", showAddEquipmentForm);
-      el("btn-cancel-equipment").addEventListener("click", hideEquipmentForm);
-      el("equipment-form").addEventListener("submit", e => {
-        e.preventDefault();
-        saveEquipment();
-      });
-
-      // OPC Module events
-      el("btn-refresh-opc").addEventListener("click", () => onEquipmentSelected());
-      el("opc-equipment-select").addEventListener("change", onEquipmentSelected);
-      el("find-servers").addEventListener("click", findOpcServers);
-      el("servers").addEventListener("change", () => {
-        const val = el("servers").value;
-        if (val) el("prog-id").value = val;
-        stopLive();
-        invalidateApproval();
-      });
-      el("prog-id").addEventListener("input", () => {
-        stopLive();
-        invalidateApproval();
-      });
-      el("interval").addEventListener("input", () => {
-        stopLive();
-        invalidateApproval();
-      });
-      el("add-tag").addEventListener("click", () => addTag());
-      el("validate-all").addEventListener("click", () => validateTagList());
-      el("btn-save-config").addEventListener("click", saveConfig);
-      el("toggle-live").addEventListener("click", toggleLive);
-      el("apply").addEventListener("click", applyToAgent);
-      el("btn-load-active").addEventListener("click", () => {
-        if (!activeAgentConfig) return;
-        stopLive();
-        invalidateApproval();
-        el("config-name").value = `Ativa - v${activeAgentConfig.version}`;
-        el("prog-id").value = activeAgentConfig.opc_prog_id;
-        el("interval").value = activeAgentConfig.update_rate_ms;
-        el("tags").replaceChildren();
-        activeAgentConfig.tags.forEach(t => addTag(t));
-        updateTagCountBadge();
-        updateButtons();
-      });
-
-      // PI Integration Module events
-      if (el("pi-equipment-select")) {
-        el("pi-equipment-select").addEventListener("change", onPiEquipmentSelected);
-      }
-      if (el("btn-discover-pi-servers")) {
-        el("btn-discover-pi-servers").addEventListener("click", discoverPiServers);
-      }
-      if (el("pi-prog-id")) {
-        el("pi-prog-id").addEventListener("change", onPiProgIdChanged);
-        el("pi-prog-id").addEventListener("blur", onPiProgIdChanged);
-        el("pi-prog-id").addEventListener("keydown", e => {
-          if (e.key === "Enter") {
-            e.preventDefault();
-            onPiProgIdChanged();
-          }
-        });
-      }
-      if (el("btn-save-pi-profile")) {
-        el("btn-save-pi-profile").addEventListener("click", savePiProfile);
-      }
-      if (el("pi-point-source")) {
-        el("pi-point-source").addEventListener("input", clearProfileError);
-      }
-      if (el("pi-location1")) {
-        el("pi-location1").addEventListener("input", clearProfileError);
-      }
-
-      if (el("btn-add-pi-row")) {
-        el("btn-add-pi-row").addEventListener("click", addPiRow);
-      }
-      if (el("btn-delete-pi-row")) {
-        el("btn-delete-pi-row").addEventListener("click", deleteSelectedRow);
-      }
-      if (el("btn-save-pi-sheet")) {
-        el("btn-save-pi-sheet").addEventListener("click", savePiSheetChanges);
-      }
-      if (el("btn-read-now-pi")) {
-        el("btn-read-now-pi").addEventListener("click", readNowPiTags);
-      }
-      const sheetTable = el("pi-spreadsheet-table");
-      if (sheetTable) {
-        sheetTable.tabIndex = 0;
-        sheetTable.addEventListener("paste", handleTabularPaste);
-        sheetTable.addEventListener("copy", e => {
-          if (!piIsEditing && piSelectionRange) {
-            e.preventDefault();
-            copySelectionToClipboard();
-          }
-        });
-        sheetTable.addEventListener("cut", e => {
-          if (!piIsEditing && piSelectionRange) {
-            e.preventDefault();
-            cutSelection();
-          }
-        });
-      }
-
-      // Global mouseup and mousemove for selection dragging and fill handle dragging
-      document.addEventListener("mouseup", () => {
-        if (piIsDraggingHandle) {
-          finishFillHandleDrag();
-        }
-        piIsMouseDown = false;
-        piDragAnchor = null;
-        piMouseDownPos = null;
-        piIsDraggingSelection = false;
-      });
-
-      document.addEventListener("mousemove", e => {
-        if (piIsDraggingHandle && piDragHandleSourceRange) {
-          const domRows = getTableRows();
-          if (domRows.length > 0) {
-            const lastRow = domRows[domRows.length - 1];
-            const rect = lastRow.getBoundingClientRect();
-            if (e.clientY > rect.bottom) {
-              const rowHeight = rect.height || 30;
-              const extra = Math.min(50, Math.max(1, Math.floor((e.clientY - rect.bottom) / rowHeight) + 1));
-              const targetR = (domRows.length - 1) + extra;
-              while (getTableRows().length <= targetR) {
-                addPiRowSilently();
-              }
-              updateRowIndices();
-              updateRowCountBadge();
-              onFillHandleHoverRow(targetR);
-            }
-          }
-        }
-      });
-
-      // Global keyboard handler when spreadsheet or active cell is focused
-      document.addEventListener("keydown", e => {
-        if (currentTab !== "pi") return;
-        if (!piActiveCell) return;
-        const activeEl = document.activeElement;
-        const isTableDescendant = activeEl && (activeEl.closest && activeEl.closest("#pi-spreadsheet-table"));
-        const isBodyOrTable = !activeEl || activeEl === document.body || activeEl === sheetTable;
-        if (isTableDescendant || isBodyOrTable) {
-          handleCellKeyDown(e, piActiveCell.rIdx, piActiveCell.cIdx);
-        }
-      });
-
-      if (el("btn-refresh-pi-audit")) {
-        el("btn-refresh-pi-audit").addEventListener("click", loadPiAudit);
-      }
-      if (el("btn-cancel-delete-modal")) {
-        el("btn-cancel-delete-modal").addEventListener("click", () => {
-          deletingMappingId = null;
-          el("modal-delete-mapping-confirm").hidden = true;
-        });
-      }
-      if (el("btn-confirm-delete-mapping")) {
-        el("btn-confirm-delete-mapping").addEventListener("click", executeDeleteMapping);
-      }
-      if (el("btn-test-pi-connection")) {
-        el("btn-test-pi-connection").addEventListener("click", testPiConnection);
-      }
-      if (el("btn-cancel-publish-once-modal")) {
-        el("btn-cancel-publish-once-modal").addEventListener("click", closePublishOnceModal);
-      }
-      if (el("btn-confirm-publish-once")) {
-        el("btn-confirm-publish-once").addEventListener("click", confirmPublishOnce);
-      }
-
-      // Window / Page lifecycle events: Auto-stop live monitoring
-      document.addEventListener("visibilitychange", () => {
-        if (document.hidden) stopLive();
-      });
-      window.addEventListener("pagehide", stopLive);
-      window.addEventListener("beforeunload", stopLive);
-
-      // Load initial equipment list
+      // Step 6: Initial data load and initial tab display
       await loadEquipments();
       addTag();
       switchTab("equipments");
@@ -3296,7 +3455,11 @@
         }
       }, 5000);
     } catch (err) {
-      message(err.message, "error");
+      console.error("Erro na inicialização da interface:", err);
+      message(`Erro na inicialização da interface: ${err.message}`, "error");
+      try {
+        switchTab("equipments");
+      } catch (_) {}
     }
   }
 

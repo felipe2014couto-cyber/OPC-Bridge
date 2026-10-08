@@ -1528,3 +1528,164 @@ def test_spreadsheet_sticky_actions_column_and_clean_aesthetics():
     # Subtle yellow tint for modified cells
     assert "#pi-spreadsheet-table td.cell-modified" in css_content
     assert "background-color: #fefce8 !important;" in css_content
+
+
+def test_ui_app_js_read_now_pi_tags_defined_and_resilient_init():
+    """Verify readNowPiTags is defined, all event listeners point to declared functions,
+    and initialization executes cleanly without ReferenceError.
+    """
+    import re
+    import subprocess
+    from pathlib import Path
+
+    static_dir = Path(__file__).resolve().parent.parent / "src" / "opc_bridge" / "server" / "admin" / "static"
+    js_content = (static_dir / "app.js").read_text(encoding="utf-8")
+
+    # 1. readNowPiTags must be explicitly defined
+    assert "async function readNowPiTags()" in js_content
+    assert 'el("btn-read-now-pi").addEventListener("click", readNowPiTags);' in js_content
+
+    # 2. escapeHtml helper must be defined
+    assert "function escapeHtml(str)" in js_content
+
+    # 3. Modular resilient init functions must exist
+    assert "function initTabs()" in js_content
+    assert "function initEquipmentsModule()" in js_content
+    assert "function initOpcModule()" in js_content
+    assert "function initPiModule()" in js_content
+    assert "function initGlobalListeners()" in js_content
+
+    # 4. Check all direct event listeners point to declared identifiers
+    matches = re.findall(r'addEventListener\(\s*[\"\'\`]([a-zA-Z0-9_\-]+)[\"\'\`]\s*,\s*([a-zA-Z0-9_$]+)\s*\)', js_content)
+    for event, handler in matches:
+        pattern = rf'(function\s+{handler}\b|(?:let|const|var)\s+{handler}\b|async\s+function\s+{handler}\b)'
+        assert re.search(pattern, js_content), f"Event handler '{handler}' for '{event}' is not defined in app.js!"
+
+    # 5. Run headless Node.js mock test if node is available
+    node_script = """
+const fs = require("fs");
+const vm = require("vm");
+
+let messages = [];
+
+const code = fs.readFileSync(process.argv[1], "utf8");
+
+const mockElement = (id) => ({
+  id,
+  value: "",
+  textContent: "",
+  innerHTML: "",
+  classList: { add: () => {}, remove: () => {}, toggle: () => {}, contains: () => false },
+  setAttribute: () => {},
+  getAttribute: () => null,
+  addEventListener: (ev, fn) => {
+    if (typeof fn !== "function") throw new Error("Handler for " + ev + " on #" + id + " is not a function: " + fn);
+  },
+  removeEventListener: () => {},
+  querySelector: () => null,
+  querySelectorAll: () => [],
+  closest: () => null,
+  replaceChildren: () => {},
+  appendChild: () => {},
+  append: () => {},
+  children: [],
+  remove: () => {},
+  focus: () => {},
+  select: () => {},
+  hidden: false,
+  disabled: false,
+  checked: false,
+  style: {},
+  dataset: {}
+});
+
+const sandbox = {
+  document: {
+    getElementById: (id) => {
+      const el = mockElement(id);
+      if (id === "message") {
+        return {
+          ...el,
+          set textContent(v) { if (v) messages.push(v); }
+        };
+      }
+      return el;
+    },
+    createElement: (tag) => mockElement(tag),
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    querySelector: () => null,
+    querySelectorAll: () => [],
+    body: mockElement("body"),
+    activeElement: null,
+    readyState: "complete"
+  },
+  window: {
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    location: { href: "" }
+  },
+  navigator: { clipboard: { writeText: () => Promise.resolve(), readText: () => Promise.resolve("") } },
+  Option: function(text, value) { this.text = text; this.value = value; },
+  fetch: (url) => {
+    if (url === "/health") return Promise.resolve({ ok: true, json: () => Promise.resolve({ status: "healthy" }) });
+    if (url === "/api/v1/agents") return Promise.resolve({ ok: true, json: () => Promise.resolve({ agents: [] }) });
+    if (url === "/api/v1/ui-capabilities") return Promise.resolve({ ok: true, json: () => Promise.resolve({ dispatch_available: true }) });
+    if (url === "/api/v1/equipments") return Promise.resolve({ ok: true, json: () => Promise.resolve({ equipments: [] }) });
+    return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
+  },
+  setInterval: () => 1,
+  clearInterval: () => {},
+  setTimeout: () => 1,
+  clearTimeout: () => {},
+  console: console,
+  Promise: Promise,
+  Math: Math,
+  Date: Date,
+  parseInt: parseInt,
+  parseFloat: parseFloat,
+  isNaN: isNaN,
+  String: String,
+  Boolean: Boolean,
+  Array: Array,
+  Map: Map,
+  Set: Set,
+  Error: Error,
+  TypeError: TypeError,
+  encodeURIComponent: encodeURIComponent,
+  decodeURIComponent: decodeURIComponent
+};
+
+vm.runInNewContext(code, sandbox);
+setTimeout(() => {
+  if (messages.length > 0) {
+    console.error("FAIL: Recorded errors:", messages);
+    process.exit(1);
+  }
+  process.exit(0);
+}, 100);
+"""
+    result = subprocess.run(
+        ["node", "-e", node_script, str(static_dir / "app.js")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, f"Node verification failed: {result.stderr or result.stdout}"
+
+
+def test_ui_tab_switching_three_tabs_resilience():
+    """Verify switching between Equipamentos, OPC, and Integração PI tabs executes cleanly
+    and isolates errors so no tab crashes the interface.
+    """
+    from pathlib import Path
+
+    static_dir = Path(__file__).resolve().parent.parent / "src" / "opc_bridge" / "server" / "admin" / "static"
+    js_content = (static_dir / "app.js").read_text(encoding="utf-8")
+
+    assert 'function switchTab(tab) {' in js_content
+    assert 'const tabs = ["equipments", "opc", "pi"];' in js_content
+    assert 'if (tab === "equipments") {' in js_content
+    assert 'else if (tab === "opc") {' in js_content
+    assert 'else if (tab === "pi") {' in js_content
+    assert 'message(`Erro ao alternar para a aba ${tab}: ${errTab.message}`, "error");' in js_content
