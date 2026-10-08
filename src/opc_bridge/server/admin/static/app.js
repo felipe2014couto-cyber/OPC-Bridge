@@ -23,6 +23,10 @@
   let deletingMappingId = null;
   let publishingOnceMapping = null;
   let piOutputEnabled = false;
+  let piSelectedCell = null;
+  let piHasPendingChanges = false;
+  let piCellErrors = new Map();
+  let piEditingCellVal = null;
 
   const errors = {
     unauthorized: "Acesso não autorizado ou sessão expirada no proxy.",
@@ -1087,11 +1091,11 @@
 
   function updateSpreadsheetToolbar(profileActive) {
     const btnAdd = el("btn-add-pi-row");
-    const btnSave = el("btn-save-pi-sheet");
     const btnRead = el("btn-read-now-pi");
     if (btnAdd) btnAdd.disabled = !profileActive;
-    if (btnSave) btnSave.disabled = !profileActive;
     if (btnRead) btnRead.disabled = !profileActive || !selectedPiEquipment?.agent_id;
+    updateSaveButtonState();
+    updateDeleteButtonState();
   }
 
   function renderPiProfileState() {
@@ -1376,6 +1380,7 @@
   async function loadPiMappings() {
     if (!selectedPiEquipment || !selectedPiProgId) {
       piMappings = [];
+      setPiPendingChanges(false);
       renderPiSpreadsheet();
       return;
     }
@@ -1383,10 +1388,447 @@
       const url = `/api/v1/pi-mappings?equipment_id=${encodeURIComponent(selectedPiEquipment.equipment_id)}&opc_prog_id=${encodeURIComponent(selectedPiProgId)}`;
       const data = await api(url);
       piMappings = data.mappings || [];
+      setPiPendingChanges(false);
       renderPiSpreadsheet();
     } catch (err) {
       message(err.message, "error");
     }
+  }
+
+  function updateRowIndices() {
+    const tbody = el("pi-spreadsheet-body");
+    if (!tbody) return;
+    const rows = [...tbody.querySelectorAll("tr")].filter(r => !r.classList.contains("empty-row"));
+    rows.forEach((tr, idx) => {
+      tr.dataset.rowIndex = String(idx);
+      const colIdx = tr.querySelector(".col-row-idx");
+      if (colIdx) {
+        colIdx.textContent = String(idx + 1);
+        colIdx.title = `Linha ${idx + 1}`;
+      }
+    });
+  }
+
+  function selectCell(rIdx, cIdx, focusInput = false) {
+    const tbody = el("pi-spreadsheet-body");
+    if (!tbody) return;
+    const rows = [...tbody.querySelectorAll("tr")].filter(r => !r.classList.contains("empty-row"));
+    if (rIdx < 0 || rIdx >= rows.length) return;
+    const tr = rows[rIdx];
+    const cells = tr.querySelectorAll("td");
+    if (cIdx < 0 || cIdx >= cells.length) return;
+    const td = cells[cIdx];
+
+    tbody.querySelectorAll(".cell-selected").forEach(c => c.classList.remove("cell-selected"));
+    tbody.querySelectorAll("tr.row-selected").forEach(r => r.classList.remove("row-selected"));
+
+    tr.classList.add("row-selected");
+    td.classList.add("cell-selected");
+    piSelectedCell = { rIdx, cIdx };
+    updateDeleteButtonState();
+
+    const input = td.querySelector("input");
+    if (input) {
+      piEditingCellVal = input.type === "checkbox" ? input.checked : input.value;
+      if (focusInput && document.activeElement !== input) {
+        input.focus();
+        if (input.type === "text" || input.type === "number") {
+          input.select();
+        }
+      }
+    }
+
+    updateGridStatusBar();
+  }
+
+  function updateGridStatusBar() {
+    const bar = el("pi-grid-cell-msg");
+    if (!bar) return;
+
+    const colNames = [
+      "#",
+      "Endereço OPC",
+      "PI Point",
+      "Velocidade (ms)",
+      "Ativo",
+      "Último valor",
+      "Qualidade",
+      "Último timestamp",
+      "Resultado",
+      "Ações"
+    ];
+
+    if (!piSelectedCell) {
+      if (piCellErrors.size > 0) {
+        const firstErr = Array.from(piCellErrors.values())[0];
+        bar.innerHTML = `<span class="status-error">⚠️ ${escapeHtml(firstErr)} (${piCellErrors.size} erro(s) pendente(s))</span>`;
+      } else if (piHasPendingChanges) {
+        bar.innerHTML = `<span style="color: #92400e; font-weight: 500;">● Alterações pendentes de gravação</span>`;
+      } else {
+        bar.textContent = "Pronto";
+      }
+      return;
+    }
+
+    const { rIdx, cIdx } = piSelectedCell;
+    const coord = `Linha ${rIdx + 1}, Coluna: ${colNames[cIdx] || cIdx}`;
+    const cellErrKey = `${rIdx}:${cIdx}`;
+    const cellErr = piCellErrors.get(cellErrKey);
+
+    if (cellErr) {
+      bar.innerHTML = `<span class="status-coord">${coord}</span> &nbsp;|&nbsp; <span class="status-error">⚠️ ${escapeHtml(cellErr)}</span>`;
+    } else if (piCellErrors.size > 0) {
+      bar.innerHTML = `<span class="status-coord">${coord}</span> &nbsp;|&nbsp; <span class="status-error">⚠️ ${piCellErrors.size} célula(s) com erro na planilha</span>`;
+    } else if (piHasPendingChanges) {
+      bar.innerHTML = `<span class="status-coord">${coord}</span> &nbsp;|&nbsp; <span style="color: #92400e; font-weight: 500;">● Alterações pendentes</span>`;
+    } else {
+      bar.innerHTML = `<span class="status-coord">${coord}</span>`;
+    }
+  }
+
+  function validateGrid() {
+    const tbody = el("pi-spreadsheet-body");
+    piCellErrors.clear();
+    if (!tbody) return { isValid: true, errorCount: 0 };
+
+    const rows = [...tbody.querySelectorAll("tr")].filter(r => !r.classList.contains("empty-row"));
+
+    rows.forEach(r => {
+      r.querySelectorAll("td.cell-invalid").forEach(td => td.classList.remove("cell-invalid"));
+      r.querySelectorAll(".is-invalid").forEach(inp => inp.classList.remove("is-invalid"));
+    });
+
+    const seenOpc = new Map();
+    const seenPoints = new Map();
+
+    rows.forEach((r, rIdx) => {
+      const cells = r.querySelectorAll("td");
+      const tdOpc = cells[1];
+      const tdPoint = cells[2];
+      const tdInterval = cells[3];
+
+      const opcInput = tdOpc ? tdOpc.querySelector(".opc-path") : null;
+      const pointInput = tdPoint ? tdPoint.querySelector(".pi-point") : null;
+      const intervalInput = tdInterval ? tdInterval.querySelector(".publish-interval") : null;
+
+      const opcPath = opcInput ? opcInput.value.trim() : "";
+      const pointName = pointInput ? pointInput.value.trim() : "";
+      const intervalVal = intervalInput ? parseInt(intervalInput.value, 10) : NaN;
+
+      if (!opcPath) {
+        if (tdOpc) tdOpc.classList.add("cell-invalid");
+        if (opcInput) opcInput.classList.add("is-invalid");
+        piCellErrors.set(`${rIdx}:1`, `Linha ${rIdx + 1}: Endereço OPC obrigatório.`);
+      } else {
+        if (!seenOpc.has(opcPath)) {
+          seenOpc.set(opcPath, []);
+        }
+        seenOpc.get(opcPath).push({ rIdx, td: tdOpc, inp: opcInput });
+      }
+
+      if (!pointName) {
+        if (tdPoint) tdPoint.classList.add("cell-invalid");
+        if (pointInput) pointInput.classList.add("is-invalid");
+        piCellErrors.set(`${rIdx}:2`, `Linha ${rIdx + 1}: PI Point obrigatório.`);
+      } else {
+        const ptKey = pointName.toUpperCase();
+        if (!seenPoints.has(ptKey)) {
+          seenPoints.set(ptKey, []);
+        }
+        seenPoints.get(ptKey).push({ rIdx, td: tdPoint, inp: pointInput, name: pointName });
+      }
+
+      if (isNaN(intervalVal) || intervalVal < 1000 || intervalVal > 60000) {
+        if (tdInterval) tdInterval.classList.add("cell-invalid");
+        if (intervalInput) intervalInput.classList.add("is-invalid");
+        piCellErrors.set(`${rIdx}:3`, `Linha ${rIdx + 1}: Velocidade de publicação deve ser um número inteiro entre 1000 e 60000 ms.`);
+      }
+    });
+
+    for (const [path, occurrences] of seenOpc.entries()) {
+      if (occurrences.length > 1) {
+        occurrences.forEach(item => {
+          if (item.td) item.td.classList.add("cell-invalid");
+          if (item.inp) item.inp.classList.add("is-invalid");
+          piCellErrors.set(`${item.rIdx}:1`, `Linha ${item.rIdx + 1}: Endereço OPC "${path}" duplicado na planilha.`);
+        });
+      }
+    }
+
+    for (const [ptKey, occurrences] of seenPoints.entries()) {
+      if (occurrences.length > 1) {
+        occurrences.forEach(item => {
+          if (item.td) item.td.classList.add("cell-invalid");
+          if (item.inp) item.inp.classList.add("is-invalid");
+          piCellErrors.set(`${item.rIdx}:2`, `Linha ${item.rIdx + 1}: PI Point "${item.name}" duplicado na planilha.`);
+        });
+      }
+    }
+
+    const isValid = piCellErrors.size === 0;
+    updateSaveButtonState(isValid);
+    updateGridStatusBar();
+
+    return { isValid, errorCount: piCellErrors.size };
+  }
+
+  function setPiPendingChanges(dirty) {
+    piHasPendingChanges = Boolean(dirty);
+    const badge = el("pi-pending-changes-badge");
+    if (badge) {
+      badge.hidden = !piHasPendingChanges;
+    }
+    updateSaveButtonState();
+    updateGridStatusBar();
+  }
+
+  function updateSaveButtonState(isValid) {
+    const btnSave = el("btn-save-pi-sheet");
+    if (!btnSave) return;
+
+    const valid = isValid !== undefined ? isValid : (piCellErrors.size === 0);
+    const tbody = el("pi-spreadsheet-body");
+    const rows = tbody ? [...tbody.querySelectorAll("tr")].filter(r => !r.classList.contains("empty-row")) : [];
+
+    const canSave = Boolean(
+      selectedPiEquipment &&
+      selectedPiProgId &&
+      currentPiProfile &&
+      currentPiProfile.enabled &&
+      piHasPendingChanges &&
+      valid &&
+      rows.length > 0
+    );
+
+    btnSave.disabled = !canSave;
+  }
+
+  function updateDeleteButtonState() {
+    const btnDelete = el("btn-delete-pi-row");
+    if (!btnDelete) return;
+    const tbody = el("pi-spreadsheet-body");
+    const rows = tbody ? [...tbody.querySelectorAll("tr")].filter(r => !r.classList.contains("empty-row")) : [];
+    const hasSelectedRow = piSelectedCell !== null && piSelectedCell.rIdx >= 0 && piSelectedCell.rIdx < rows.length;
+    btnDelete.disabled = !hasSelectedRow;
+  }
+
+  function normalizeBoolean(raw) {
+    if (typeof raw === "boolean") return raw;
+    const s = String(raw || "").trim().toLowerCase();
+    if (["true", "1", "sim", "s", "yes", "y", "t", "verdadeiro", "v", "ativo", "habilitado"].includes(s)) {
+      return true;
+    }
+    if (["false", "0", "não", "nao", "n", "no", "f", "falso", "inativo", "desabilitado"].includes(s)) {
+      return false;
+    }
+    return true;
+  }
+
+  function handleCellKeyDown(e, rIdx, cIdx) {
+    const tbody = el("pi-spreadsheet-body");
+    const rows = tbody ? [...tbody.querySelectorAll("tr")].filter(r => !r.classList.contains("empty-row")) : [];
+    const totalRows = rows.length;
+
+    if (e.key === "Tab") {
+      e.preventDefault();
+      if (e.shiftKey) {
+        if (cIdx === 1) {
+          if (rIdx > 0) {
+            selectCell(rIdx - 1, 4, true);
+          }
+        } else if (cIdx === 2) {
+          selectCell(rIdx, 1, true);
+        } else if (cIdx === 3) {
+          selectCell(rIdx, 2, true);
+        } else if (cIdx === 4) {
+          selectCell(rIdx, 3, true);
+        }
+      } else {
+        if (cIdx === 1) {
+          selectCell(rIdx, 2, true);
+        } else if (cIdx === 2) {
+          selectCell(rIdx, 3, true);
+        } else if (cIdx === 3) {
+          selectCell(rIdx, 4, true);
+        } else if (cIdx === 4) {
+          if (rIdx < totalRows - 1) {
+            selectCell(rIdx + 1, 1, true);
+          }
+        }
+      }
+      return;
+    }
+
+    if (e.key === "Enter") {
+      e.preventDefault();
+      if (e.shiftKey) {
+        if (rIdx > 0) {
+          selectCell(rIdx - 1, cIdx, true);
+        }
+      } else {
+        if (rIdx < totalRows - 1) {
+          selectCell(rIdx + 1, cIdx, true);
+        }
+      }
+      return;
+    }
+
+    if (e.key === "Escape") {
+      e.preventDefault();
+      const input = e.target;
+      if (input && piEditingCellVal !== null) {
+        if (input.type === "checkbox") {
+          input.checked = Boolean(piEditingCellVal);
+        } else {
+          input.value = String(piEditingCellVal);
+        }
+        validateGrid();
+      }
+      return;
+    }
+
+    if (e.key === "ArrowUp") {
+      if (rIdx > 0) {
+        e.preventDefault();
+        selectCell(rIdx - 1, cIdx, true);
+      }
+      return;
+    }
+
+    if (e.key === "ArrowDown") {
+      if (rIdx < totalRows - 1) {
+        e.preventDefault();
+        selectCell(rIdx + 1, cIdx, true);
+      }
+      return;
+    }
+
+    if (e.key === "ArrowLeft") {
+      const input = e.target;
+      if (input.type === "checkbox" || (input.selectionStart === 0 && input.selectionEnd === 0)) {
+        if (cIdx > 1) {
+          e.preventDefault();
+          selectCell(rIdx, cIdx - 1, true);
+        }
+      }
+      return;
+    }
+
+    if (e.key === "ArrowRight") {
+      const input = e.target;
+      if (input.type === "checkbox" || (input.selectionStart === input.value.length && input.selectionEnd === input.value.length)) {
+        if (cIdx < 4) {
+          e.preventDefault();
+          selectCell(rIdx, cIdx + 1, true);
+        }
+      }
+      return;
+    }
+  }
+
+  function handleTabularPaste(e) {
+    const clipboardData = e.clipboardData || window.clipboardData;
+    if (!clipboardData) return;
+    const text = clipboardData.getData("text");
+    if (!text) return;
+
+    const hasTab = text.includes("\t");
+    const hasNewline = text.includes("\n") || text.includes("\r");
+    if (!hasTab && !hasNewline) {
+      setTimeout(() => {
+        setPiPendingChanges(true);
+        validateGrid();
+      }, 0);
+      return;
+    }
+
+    e.preventDefault();
+    const lines = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+    if (lines.length > 0 && lines[lines.length - 1] === "") {
+      lines.pop();
+    }
+    if (lines.length === 0) return;
+
+    const matrix = lines.map(line => line.split("\t"));
+    const tbody = el("pi-spreadsheet-body");
+    if (!tbody) return;
+
+    const EDITABLE_COLS = [1, 2, 3, 4];
+    let startRow = piSelectedCell ? piSelectedCell.rIdx : 0;
+    let startCol = piSelectedCell ? piSelectedCell.cIdx : 1;
+
+    let colOffset = EDITABLE_COLS.indexOf(startCol);
+    if (colOffset === -1) {
+      colOffset = 0;
+    }
+
+    const emptyRow = tbody.querySelector(".empty-row");
+    if (emptyRow) emptyRow.remove();
+
+    let domRows = [...tbody.querySelectorAll("tr")].filter(r => !r.classList.contains("empty-row"));
+    const neededRows = startRow + matrix.length;
+
+    while (domRows.length < neededRows) {
+      const newMapping = {
+        mapping_id: "",
+        equipment_id: selectedPiEquipment?.equipment_id || "",
+        opc_prog_id: selectedPiProgId,
+        opc_item_path: "",
+        pi_point_name: "",
+        publish_interval_ms: 5000,
+        enabled: true,
+        current_value: null,
+        quality: null,
+        quality_text: null,
+        opc_timestamp: null,
+        last_publish_status: "unconfigured"
+      };
+      const tr = createSpreadsheetRowElement(newMapping, domRows.length);
+      tbody.appendChild(tr);
+      domRows.push(tr);
+    }
+
+    updateRowIndices();
+    updateRowCountBadge();
+
+    matrix.forEach((rowVals, rIdxOffset) => {
+      const targetRowIdx = startRow + rIdxOffset;
+      const tr = domRows[targetRowIdx];
+      if (!tr) return;
+
+      rowVals.forEach((val, cIdxOffset) => {
+        const targetEditColIdx = colOffset + cIdxOffset;
+        if (targetEditColIdx >= EDITABLE_COLS.length) {
+          return;
+        }
+        const actualColIdx = EDITABLE_COLS[targetEditColIdx];
+        const trimmed = val.trim();
+
+        if (actualColIdx === 1) {
+          const inp = tr.querySelector(".opc-path");
+          if (inp) inp.value = trimmed;
+        } else if (actualColIdx === 2) {
+          const inp = tr.querySelector(".pi-point");
+          if (inp) inp.value = trimmed;
+        } else if (actualColIdx === 3) {
+          const inp = tr.querySelector(".publish-interval");
+          if (inp) {
+            const num = parseInt(trimmed, 10);
+            inp.value = isNaN(num) ? trimmed : String(num);
+          }
+        } else if (actualColIdx === 4) {
+          const inp = tr.querySelector(".row-enabled");
+          if (inp) {
+            inp.checked = normalizeBoolean(trimmed);
+          }
+        }
+      });
+    });
+
+    setPiPendingChanges(true);
+    validateGrid();
+    selectCell(startRow, EDITABLE_COLS[colOffset], true);
+    message(`${matrix.length} linha(s) colada(s) com sucesso na planilha.`, "info");
   }
 
   function renderPiSpreadsheet() {
@@ -1398,18 +1840,24 @@
 
     if (!selectedPiEquipment || !selectedPiProgId) {
       const tr = document.createElement("tr");
-      tr.innerHTML = '<td colspan="9" class="muted">Selecione um equipamento e informe o Servidor OPC para carregar a planilha.</td>';
+      tr.innerHTML = '<td colspan="10" class="muted">Selecione um equipamento e informe o Servidor OPC para carregar a planilha.</td>';
       tbody.appendChild(tr);
       if (countBadge) countBadge.textContent = "0 linha(s)";
+      piSelectedCell = null;
+      updateDeleteButtonState();
+      updateSaveButtonState();
       return;
     }
 
     if (piMappings.length === 0) {
       const tr = document.createElement("tr");
       tr.className = "empty-row";
-      tr.innerHTML = '<td colspan="9" class="muted">Nenhuma linha de mapeamento cadastrada. Clique em "+ Adicionar linha" para começar.</td>';
+      tr.innerHTML = '<td colspan="10" class="muted">Nenhuma linha de mapeamento cadastrada. Clique em "+ Adicionar linha" para começar.</td>';
       tbody.appendChild(tr);
       if (countBadge) countBadge.textContent = "0 linha(s)";
+      piSelectedCell = null;
+      updateDeleteButtonState();
+      updateSaveButtonState();
       return;
     }
 
@@ -1419,6 +1867,10 @@
       const tr = createSpreadsheetRowElement(m, idx);
       tbody.appendChild(tr);
     });
+
+    updateRowIndices();
+    validateGrid();
+    updateDeleteButtonState();
   }
 
   function createSpreadsheetRowElement(m, idx) {
@@ -1426,63 +1878,119 @@
     tr.dataset.mappingId = m.mapping_id || "";
     tr.dataset.rowIndex = String(idx);
 
+    // 0. # (Índice de linha)
+    const tdIdx = document.createElement("td");
+    tdIdx.className = "col-row-idx";
+    tdIdx.textContent = String(idx + 1);
+    tdIdx.title = `Linha ${idx + 1}`;
+    tdIdx.addEventListener("click", () => selectCell(parseInt(tr.dataset.rowIndex, 10), 1, true));
+    tr.appendChild(tdIdx);
+
     // 1. Endereço OPC (editável)
     const tdOpc = document.createElement("td");
+    tdOpc.className = "cell-editable col-opc";
     const inputOpc = document.createElement("input");
     inputOpc.type = "text";
-    inputOpc.className = "cell-input opc-path";
+    inputOpc.className = "grid-cell-input opc-path";
     inputOpc.value = m.opc_item_path || "";
     inputOpc.placeholder = "Ex: Channel.Device.Tag";
     inputOpc.required = true;
-    inputOpc.addEventListener("input", () => inputOpc.classList.remove("is-invalid"));
+    inputOpc.addEventListener("focus", () => selectCell(parseInt(tr.dataset.rowIndex, 10), 1, false));
+    inputOpc.addEventListener("input", () => {
+      setPiPendingChanges(true);
+      validateGrid();
+    });
+    inputOpc.addEventListener("change", () => {
+      setPiPendingChanges(true);
+      validateGrid();
+    });
+    inputOpc.addEventListener("keydown", (e) => handleCellKeyDown(e, parseInt(tr.dataset.rowIndex, 10), 1));
     tdOpc.appendChild(inputOpc);
+    tdOpc.addEventListener("click", () => selectCell(parseInt(tr.dataset.rowIndex, 10), 1, true));
     tr.appendChild(tdOpc);
 
     // 2. PI Point (editável)
     const tdPt = document.createElement("td");
+    tdPt.className = "cell-editable col-pi-point";
     const inputPt = document.createElement("input");
     inputPt.type = "text";
-    inputPt.className = "cell-input pi-point";
+    inputPt.className = "grid-cell-input pi-point";
     inputPt.value = m.pi_point_name || "";
     inputPt.placeholder = "Ex: TAG_OPC_01";
     inputPt.required = true;
-    inputPt.addEventListener("input", () => inputPt.classList.remove("is-invalid"));
+    inputPt.addEventListener("focus", () => selectCell(parseInt(tr.dataset.rowIndex, 10), 2, false));
+    inputPt.addEventListener("input", () => {
+      setPiPendingChanges(true);
+      validateGrid();
+    });
+    inputPt.addEventListener("change", () => {
+      setPiPendingChanges(true);
+      validateGrid();
+    });
+    inputPt.addEventListener("keydown", (e) => handleCellKeyDown(e, parseInt(tr.dataset.rowIndex, 10), 2));
     tdPt.appendChild(inputPt);
+    tdPt.addEventListener("click", () => selectCell(parseInt(tr.dataset.rowIndex, 10), 2, true));
     tr.appendChild(tdPt);
 
     // 3. Velocidade de publicação (ms) (editável)
     const tdInt = document.createElement("td");
+    tdInt.className = "cell-editable col-interval";
     const inputInt = document.createElement("input");
     inputInt.type = "number";
-    inputInt.className = "cell-input publish-interval";
+    inputInt.className = "grid-cell-input publish-interval";
     inputInt.min = "1000";
     inputInt.max = "60000";
     inputInt.step = "1";
     inputInt.value = m.publish_interval_ms || 5000;
     inputInt.required = true;
-    inputInt.addEventListener("input", () => inputInt.classList.remove("is-invalid"));
+    inputInt.addEventListener("focus", () => selectCell(parseInt(tr.dataset.rowIndex, 10), 3, false));
+    inputInt.addEventListener("input", () => {
+      setPiPendingChanges(true);
+      validateGrid();
+    });
+    inputInt.addEventListener("change", () => {
+      setPiPendingChanges(true);
+      validateGrid();
+    });
+    inputInt.addEventListener("keydown", (e) => handleCellKeyDown(e, parseInt(tr.dataset.rowIndex, 10), 3));
     tdInt.appendChild(inputInt);
+    tdInt.addEventListener("click", () => selectCell(parseInt(tr.dataset.rowIndex, 10), 3, true));
     tr.appendChild(tdInt);
 
     // 4. Ativo (checkbox)
     const tdEn = document.createElement("td");
-    tdEn.style.textAlign = "center";
+    tdEn.className = "cell-editable col-active";
     const inputEn = document.createElement("input");
     inputEn.type = "checkbox";
-    inputEn.className = "cell-checkbox row-enabled";
+    inputEn.className = "grid-cell-checkbox row-enabled";
     inputEn.checked = m.enabled !== undefined ? Boolean(m.enabled) : true;
+    inputEn.addEventListener("focus", () => selectCell(parseInt(tr.dataset.rowIndex, 10), 4, false));
+    inputEn.addEventListener("change", () => {
+      setPiPendingChanges(true);
+      validateGrid();
+    });
+    inputEn.addEventListener("keydown", (e) => handleCellKeyDown(e, parseInt(tr.dataset.rowIndex, 10), 4));
     tdEn.appendChild(inputEn);
+    tdEn.addEventListener("click", (e) => {
+      if (e.target !== inputEn) {
+        inputEn.checked = !inputEn.checked;
+        setPiPendingChanges(true);
+        validateGrid();
+      }
+      selectCell(parseInt(tr.dataset.rowIndex, 10), 4, false);
+    });
     tr.appendChild(tdEn);
 
-    // 5. Último valor
+    // 5. Último valor (somente leitura)
     const tdVal = document.createElement("td");
-    tdVal.className = "col-val";
+    tdVal.className = "cell-readonly col-val";
     tdVal.textContent = m.current_value !== null && m.current_value !== undefined ? String(m.current_value) : "—";
+    tdVal.addEventListener("click", () => selectCell(parseInt(tr.dataset.rowIndex, 10), 5, false));
     tr.appendChild(tdVal);
 
-    // 6. Qualidade
+    // 6. Qualidade (somente leitura)
     const tdQual = document.createElement("td");
-    tdQual.className = "col-qual";
+    tdQual.className = "cell-readonly col-qual";
     if (m.quality === null || m.quality === undefined) {
       tdQual.textContent = "—";
     } else if (m.quality >= 192) {
@@ -1490,16 +1998,19 @@
     } else {
       tdQual.innerHTML = `<span class="cell-quality bad">Bad (${m.quality})</span>`;
     }
+    tdQual.addEventListener("click", () => selectCell(parseInt(tr.dataset.rowIndex, 10), 6, false));
     tr.appendChild(tdQual);
 
-    // 7. Último timestamp
+    // 7. Último timestamp (somente leitura)
     const tdTs = document.createElement("td");
-    tdTs.className = "col-ts";
+    tdTs.className = "cell-readonly col-ts";
     tdTs.textContent = formatOpcTimestamp(m.opc_timestamp);
+    tdTs.addEventListener("click", () => selectCell(parseInt(tr.dataset.rowIndex, 10), 7, false));
     tr.appendChild(tdTs);
 
-    // 8. Resultado
+    // 8. Resultado (somente leitura)
     const tdRes = document.createElement("td");
+    tdRes.className = "cell-readonly col-res";
     const st = String(m.last_publish_status || "").toLowerCase();
     if (st === "simulado" || st === "simulated") {
       const tsFormatted = formatOpcTimestamp(m.last_published_at);
@@ -1518,11 +2029,12 @@
     } else {
       tdRes.innerHTML = '<span class="badge unconfigured">Não configurado</span>';
     }
+    tdRes.addEventListener("click", () => selectCell(parseInt(tr.dataset.rowIndex, 10), 8, false));
     tr.appendChild(tdRes);
 
-    // 9. Ações
+    // 9. Ações (somente leitura)
     const tdAct = document.createElement("td");
-    tdAct.className = "actions";
+    tdAct.className = "cell-actions actions";
     tdAct.style.justifyContent = "center";
 
     if (m.mapping_id) {
@@ -1572,7 +2084,19 @@
       btnDel.title = "Remover esta linha da planilha";
       btnDel.addEventListener("click", () => {
         tr.remove();
+        updateRowIndices();
         updateRowCountBadge();
+        const remaining = tbody.querySelectorAll("tr:not(.empty-row)");
+        if (remaining.length === 0) {
+          const emptyTr = document.createElement("tr");
+          emptyTr.className = "empty-row";
+          emptyTr.innerHTML = '<td colspan="10" class="muted">Nenhuma linha de mapeamento cadastrada. Clique em "+ Adicionar linha" para começar.</td>';
+          tbody.appendChild(emptyTr);
+          piSelectedCell = null;
+        }
+        setPiPendingChanges(true);
+        validateGrid();
+        updateDeleteButtonState();
       });
       tdAct.appendChild(btnDel);
     }
@@ -1603,215 +2127,55 @@
       last_publish_status: "unconfigured"
     };
 
-    const idx = tbody.querySelectorAll("tr").length;
-    const tr = createSpreadsheetRowElement(newMapping, idx);
+    const rows = [...tbody.querySelectorAll("tr")].filter(r => !r.classList.contains("empty-row"));
+    const newIdx = rows.length;
+    const tr = createSpreadsheetRowElement(newMapping, newIdx);
     tbody.appendChild(tr);
 
+    updateRowIndices();
     updateRowCountBadge();
+    setPiPendingChanges(true);
+    validateGrid();
 
-    const inputOpc = tr.querySelector(".opc-path");
-    if (inputOpc) inputOpc.focus();
+    selectCell(newIdx, 1, true);
   }
 
-  async function savePiSheetChanges() {
-    clearSheetMessages();
-    if (!selectedPiEquipment || !selectedPiProgId) {
-      showSheetError("Selecione um equipamento e informe o Servidor OPC antes de salvar.");
+  function deleteSelectedRow() {
+    if (!piSelectedCell) {
+      message("Selecione uma linha na grade para excluir.", "warning");
       return;
     }
-    if (!currentPiProfile || !currentPiProfile.enabled) {
-      showSheetError("É obrigatório configurar e ativar o perfil PI para este Equipamento e Servidor OPC antes de salvar a planilha.");
-      return;
-    }
-
     const tbody = el("pi-spreadsheet-body");
+    if (!tbody) return;
     const rows = [...tbody.querySelectorAll("tr")].filter(r => !r.classList.contains("empty-row"));
+    const tr = rows[piSelectedCell.rIdx];
+    if (!tr) return;
 
-    let hasError = false;
-    const errorsList = [];
-    const seenOpc = new Map();
-    const seenPoints = new Map();
-    const batchRows = [];
-
-    // Clear previous invalid highlights
-    rows.forEach(r => {
-      r.querySelectorAll(".is-invalid").forEach(input => input.classList.remove("is-invalid"));
-    });
-
-    rows.forEach((r, idx) => {
-      const opcInput = r.querySelector(".opc-path");
-      const pointInput = r.querySelector(".pi-point");
-      const intervalInput = r.querySelector(".publish-interval");
-      const enabledInput = r.querySelector(".row-enabled");
-
-      const opcPath = opcInput ? opcInput.value.trim() : "";
-      const pointName = pointInput ? pointInput.value.trim() : "";
-      const intervalVal = intervalInput ? parseInt(intervalInput.value, 10) : NaN;
-      const enabled = enabledInput ? enabledInput.checked : true;
-      const mappingId = r.dataset.mappingId || "";
-
-      // 1. Validate OPC Address
-      if (!opcPath) {
-        hasError = true;
-        if (opcInput) opcInput.classList.add("is-invalid");
-        errorsList.push(`Linha ${idx + 1}: Endereço OPC obrigatório.`);
-      } else if (seenOpc.has(opcPath)) {
-        hasError = true;
-        if (opcInput) opcInput.classList.add("is-invalid");
-        const prevRow = seenOpc.get(opcPath);
-        const prevInput = prevRow.querySelector(".opc-path");
-        if (prevInput) prevInput.classList.add("is-invalid");
-        errorsList.push(`Linha ${idx + 1}: Endereço OPC "${opcPath}" duplicado na planilha.`);
-      } else {
-        seenOpc.set(opcPath, r);
-      }
-
-      // 2. Validate PI Point
-      if (!pointName) {
-        hasError = true;
-        if (pointInput) pointInput.classList.add("is-invalid");
-        errorsList.push(`Linha ${idx + 1}: PI Point obrigatório.`);
-      } else if (seenPoints.has(pointName.toUpperCase())) {
-        hasError = true;
-        if (pointInput) pointInput.classList.add("is-invalid");
-        const prevRow = seenPoints.get(pointName.toUpperCase());
-        const prevInput = prevRow.querySelector(".pi-point");
-        if (prevInput) prevInput.classList.add("is-invalid");
-        errorsList.push(`Linha ${idx + 1}: PI Point "${pointName}" duplicado na planilha.`);
-      } else {
-        seenPoints.set(pointName.toUpperCase(), r);
-      }
-
-      // 3. Validate interval (1000 - 60000 ms)
-      if (isNaN(intervalVal) || intervalVal < 1000 || intervalVal > 60000) {
-        hasError = true;
-        if (intervalInput) intervalInput.classList.add("is-invalid");
-        errorsList.push(`Linha ${idx + 1}: Velocidade de publicação deve ser um número inteiro entre 1000 e 60000 ms.`);
-      }
-
-      batchRows.push({
-        mapping_id: mappingId,
-        opc_item_path: opcPath,
-        pi_point_name: pointName,
-        publish_interval_ms: isNaN(intervalVal) ? 5000 : intervalVal,
-        enabled: enabled
-      });
-    });
-
-    if (hasError) {
-      showSheetError(errorsList.join("<br>"));
-      return;
-    }
-
-    const payload = {
-      equipment_id: selectedPiEquipment.equipment_id,
-      opc_prog_id: selectedPiProgId,
-      rows: batchRows
-    };
-
-    try {
-      const btnSave = el("btn-save-pi-sheet");
-      if (btnSave) btnSave.disabled = true;
-      const res = await api("/api/v1/pi-mappings/batch", payload, "POST");
-      showSheetSuccess(`${res.saved_count || batchRows.length} mapeamento(s) salvo(s) com sucesso.`);
-      message("Planilha de mapeamentos PI salva com sucesso.", "success");
-      await loadPiMappings();
-      await loadPiAudit();
-    } catch (err) {
-      if (err.data && err.data.row_errors) {
-        err.data.row_errors.forEach(re => {
-          const r = rows[re.row_index];
-          if (r) {
-            if (re.field === "opc_item_path") r.querySelector(".opc-path")?.classList.add("is-invalid");
-            if (re.field === "pi_point_name") r.querySelector(".pi-point")?.classList.add("is-invalid");
-            if (re.field === "publish_interval_ms") r.querySelector(".publish-interval")?.classList.add("is-invalid");
-          }
-        });
-        const msgs = err.data.row_errors.map(re => re.message).join("<br>");
-        showSheetError(msgs);
-      } else {
-        showSheetError(err.message);
-      }
-      message(err.message, "error");
-    } finally {
-      const btnSave = el("btn-save-pi-sheet");
-      if (btnSave) btnSave.disabled = false;
-    }
-  }
-
-  async function readNowPiTags() {
-    if (!selectedPiEquipment?.agent_id || busy) return;
-    const btn = el("btn-read-now-pi");
-    const tbody = el("pi-spreadsheet-body");
-    const rows = [...tbody.querySelectorAll("tr")].filter(r => !r.classList.contains("empty-row"));
-
-    const tags = rows.map(r => r.querySelector(".opc-path")?.value.trim()).filter(Boolean);
-    if (tags.length === 0) {
-      message("Nenhum endereço OPC informado na planilha para leitura.", "warning");
-      return;
-    }
-
-    try {
-      busy = true;
-      if (btn) btn.disabled = true;
-      message("Lendo valores atuais no servidor OPC via agente...", "info");
-
-      const payload = {
-        equipment_id: selectedPiEquipment.equipment_id,
-        opc_prog_id: selectedPiProgId,
-        tags: tags
-      };
-
-      const data = await api("/api/v1/pi-integration/read-now", payload, "POST");
-      const results = data.results || [];
-      const notFoundList = [];
-
-      rows.forEach(r => {
-        const opcInput = r.querySelector(".opc-path");
-        const path = opcInput ? opcInput.value.trim() : "";
-        const res = results.find(resItem => resItem.opc_item_path === path);
-
-        const tdVal = r.querySelector(".col-val");
-        const tdQual = r.querySelector(".col-qual");
-        const tdTs = r.querySelector(".col-ts");
-
-        if (res) {
-          if (res.status === "valid" || (res.value !== null && res.value !== undefined)) {
-            opcInput.classList.remove("is-invalid");
-            if (tdVal) tdVal.textContent = String(res.value);
-            if (tdQual) {
-              tdQual.innerHTML = '<span class="cell-quality good">Good</span>';
-            }
-            if (tdTs) tdTs.textContent = formatOpcTimestamp(res.opc_timestamp);
-          } else {
-            opcInput.classList.add("is-invalid");
-            if (tdVal) tdVal.textContent = "—";
-            if (tdQual) {
-              tdQual.innerHTML = `<span class="cell-quality bad" title="${res.error || 'Endereço OPC não encontrado'}">Bad</span>`;
-            }
-            if (tdTs) tdTs.textContent = "—";
-            notFoundList.push(path);
-          }
-        }
-      });
-
-      if (notFoundList.length > 0) {
-        message(`Leitura concluída com ${notFoundList.length} endereço(s) OPC com falha. Verifique os campos destacados em vermelho.`, "warning");
-      } else {
-        message(`Leitura concluída com sucesso para todas as ${tags.length} tags OPC.`, "success");
-      }
-    } catch (err) {
-      message(err.message, "error");
-    } finally {
-      busy = false;
-      if (btn) btn.disabled = false;
-    }
+    const mappingId = tr.dataset.mappingId || "";
+    const piPointName = tr.querySelector(".pi-point")?.value || "";
+    confirmDeleteRow(tr, { mapping_id: mappingId, pi_point_name: piPointName });
   }
 
   function confirmDeleteRow(tr, m) {
     if (!m || !m.mapping_id) {
       tr.remove();
+      updateRowIndices();
       updateRowCountBadge();
+      const tbody = el("pi-spreadsheet-body");
+      const remaining = tbody ? [...tbody.querySelectorAll("tr")].filter(r => !r.classList.contains("empty-row")) : [];
+      if (remaining.length === 0 && tbody) {
+        const emptyTr = document.createElement("tr");
+        emptyTr.className = "empty-row";
+        emptyTr.innerHTML = '<td colspan="10" class="muted">Nenhuma linha de mapeamento cadastrada. Clique em "+ Adicionar linha" para começar.</td>';
+        tbody.appendChild(emptyTr);
+        piSelectedCell = null;
+      } else {
+        const nextIdx = Math.min(piSelectedCell ? piSelectedCell.rIdx : 0, remaining.length - 1);
+        selectCell(nextIdx, 1, false);
+      }
+      setPiPendingChanges(true);
+      validateGrid();
+      updateDeleteButtonState();
       return;
     }
     deletingMappingId = m.mapping_id;
@@ -1829,10 +2193,103 @@
       const modal = el("modal-delete-mapping-confirm");
       if (modal) modal.hidden = true;
       deletingMappingId = null;
+      piSelectedCell = null;
+      updateDeleteButtonState();
       await loadPiMappings();
       await loadPiAudit();
     } catch (err) {
       message(err.message, "error");
+    }
+  }
+
+  async function savePiSheetChanges() {
+    clearSheetMessages();
+    if (!selectedPiEquipment || !selectedPiProgId) {
+      showSheetError("Selecione um equipamento e informe o Servidor OPC antes de salvar.");
+      return;
+    }
+    if (!currentPiProfile || !currentPiProfile.enabled) {
+      showSheetError("É obrigatório configurar e ativar o perfil PI para este Equipamento e Servidor OPC antes de salvar a planilha.");
+      return;
+    }
+
+    const { isValid } = validateGrid();
+    if (!isValid) {
+      showSheetError("Existem células com erros na planilha. Corrija os campos destacados em vermelho antes de salvar.");
+      return;
+    }
+
+    const tbody = el("pi-spreadsheet-body");
+    const rows = [...tbody.querySelectorAll("tr")].filter(r => !r.classList.contains("empty-row"));
+
+    const batchRows = rows.map(r => {
+      const opcInput = r.querySelector(".opc-path");
+      const pointInput = r.querySelector(".pi-point");
+      const intervalInput = r.querySelector(".publish-interval");
+      const enabledInput = r.querySelector(".row-enabled");
+
+      return {
+        mapping_id: r.dataset.mappingId || "",
+        opc_item_path: opcInput ? opcInput.value.trim() : "",
+        pi_point_name: pointInput ? pointInput.value.trim() : "",
+        publish_interval_ms: intervalInput ? parseInt(intervalInput.value, 10) : 5000,
+        enabled: enabledInput ? enabledInput.checked : true
+      };
+    });
+
+    try {
+      const btnSave = el("btn-save-pi-sheet");
+      if (btnSave) btnSave.disabled = true;
+      const payload = {
+        equipment_id: selectedPiEquipment.equipment_id,
+        opc_prog_id: selectedPiProgId,
+        rows: batchRows
+      };
+      const res = await api("/api/v1/pi-mappings/batch", payload, "POST");
+      showSheetSuccess(`${res.saved_count || batchRows.length} mapeamento(s) salvo(s) com sucesso.`);
+      message("Planilha de mapeamentos PI salva com sucesso.", "success");
+
+      const savedSelected = piSelectedCell ? { ...piSelectedCell } : null;
+      setPiPendingChanges(false);
+      await loadPiMappings();
+      await loadPiAudit();
+
+      if (savedSelected) {
+        selectCell(savedSelected.rIdx, savedSelected.cIdx, false);
+      }
+    } catch (err) {
+      if (err.data && err.data.row_errors) {
+        err.data.row_errors.forEach(re => {
+          const r = rows[re.row_index];
+          if (r) {
+            const cells = r.querySelectorAll("td");
+            if (re.field === "opc_item_path") {
+              cells[1]?.classList.add("cell-invalid");
+              r.querySelector(".opc-path")?.classList.add("is-invalid");
+              piCellErrors.set(`${re.row_index}:1`, re.message);
+            }
+            if (re.field === "pi_point_name") {
+              cells[2]?.classList.add("cell-invalid");
+              r.querySelector(".pi-point")?.classList.add("is-invalid");
+              piCellErrors.set(`${re.row_index}:2`, re.message);
+            }
+            if (re.field === "publish_interval_ms") {
+              cells[3]?.classList.add("cell-invalid");
+              r.querySelector(".publish-interval")?.classList.add("is-invalid");
+              piCellErrors.set(`${re.row_index}:3`, re.message);
+            }
+          }
+        });
+        const msgs = err.data.row_errors.map(re => re.message).join("<br>");
+        showSheetError(msgs);
+        updateSaveButtonState(false);
+        updateGridStatusBar();
+      } else {
+        showSheetError(err.message);
+      }
+      message(err.message, "error");
+    } finally {
+      updateSaveButtonState();
     }
   }
 
@@ -2172,11 +2629,17 @@
       if (el("btn-add-pi-row")) {
         el("btn-add-pi-row").addEventListener("click", addPiRow);
       }
+      if (el("btn-delete-pi-row")) {
+        el("btn-delete-pi-row").addEventListener("click", deleteSelectedRow);
+      }
       if (el("btn-save-pi-sheet")) {
         el("btn-save-pi-sheet").addEventListener("click", savePiSheetChanges);
       }
       if (el("btn-read-now-pi")) {
         el("btn-read-now-pi").addEventListener("click", readNowPiTags);
+      }
+      if (el("pi-spreadsheet-table")) {
+        el("pi-spreadsheet-table").addEventListener("paste", handleTabularPaste);
       }
 
       if (el("btn-refresh-pi-audit")) {
@@ -2218,7 +2681,7 @@
         if (currentTab === "pi" && selectedPiEquipment && selectedPiProgId) {
           const activeEl = document.activeElement;
           const isEditingTable = activeEl && activeEl.closest && activeEl.closest("#pi-spreadsheet-table");
-          if (!isEditingTable) {
+          if (!isEditingTable && !piHasPendingChanges) {
             loadPiMappings().catch(() => {});
           }
           loadPiAudit().catch(() => {});

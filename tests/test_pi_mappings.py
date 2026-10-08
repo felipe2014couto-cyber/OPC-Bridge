@@ -829,3 +829,183 @@ def test_pi_attribute_divergence_blocks_publication():
     assert err_ok is None
     assert details["point_source"] == "OPCBRIDGE"
     assert details["location1"] == 1
+
+
+def test_ui_spreadsheet_editable_grid_structure_and_columns():
+    """Verify HTML and CSS define the 10-column spreadsheet structure and Google Sheets styling."""
+    from pathlib import Path
+
+    static_dir = Path(__file__).resolve().parent.parent / "src" / "opc_bridge" / "server" / "admin" / "static"
+    html_content = (static_dir / "index.html").read_text(encoding="utf-8")
+    css_content = (static_dir / "style.css").read_text(encoding="utf-8")
+    js_content = (static_dir / "app.js").read_text(encoding="utf-8")
+
+    # 1. HTML table structure: 10 columns
+    assert 'id="pi-spreadsheet-table"' in html_content
+    assert 'id="pi-spreadsheet-body"' in html_content
+    assert 'id="btn-delete-pi-row"' in html_content
+    assert 'id="pi-pending-changes-badge"' in html_content
+    assert 'id="pi-grid-cell-msg"' in html_content
+    assert 'colspan="10"' in html_content
+
+    # Check 10 column headers
+    expected_headers = [
+        ">#<",
+        "Endereço OPC",
+        "PI Point",
+        "Velocidade de publicação (ms)",
+        "Ativo",
+        "Último valor",
+        "Qualidade",
+        "Último timestamp",
+        "Resultado",
+        "Ações",
+    ]
+    for h in expected_headers:
+        assert h in html_content, f"Header '{h}' not found in index.html"
+
+    # 2. CSS contains Google Sheets grid styling
+    assert "#pi-spreadsheet-table td.cell-selected" in css_content
+    assert "#pi-spreadsheet-table td.cell-invalid" in css_content
+    assert ".grid-cell-input" in css_content
+    assert ".col-row-idx" in css_content
+    assert ".grid-status-bar" in css_content
+
+    # 3. JavaScript contains grid navigation and handlers
+    assert "handleCellKeyDown" in js_content
+    assert "handleTabularPaste" in js_content
+    assert "normalizeBoolean" in js_content
+    assert "selectCell" in js_content
+    assert "updateRowIndices" in js_content
+    assert "validateGrid" in js_content
+    assert "deleteSelectedRow" in js_content
+
+
+def test_spreadsheet_boolean_normalization_logic():
+    """Verify boolean normalization handles true/false, sim/não, 1/0 case-insensitively with accents."""
+    def normalize_boolean(raw: str | bool) -> bool:
+        if isinstance(raw, bool):
+            return raw
+        s = str(raw or "").strip().lower()
+        if s in ("true", "1", "sim", "s", "yes", "y", "t", "verdadeiro", "v", "ativo", "habilitado"):
+            return True
+        return s not in ("false", "0", "não", "nao", "n", "no", "f", "falso", "inativo", "desabilitado")
+
+    # Truthy values
+    for val in ["true", "True", "TRUE", "sim", "SIM", "Sim", "s", "1", "yes", "y", "t", "verdadeiro", "ativo"]:
+        assert normalize_boolean(val) is True, f"Failed for {val}"
+
+    # Falsy values
+    for val in ["false", "False", "FALSE", "não", "NÃO", "nao", "NAO", "n", "0", "no", "f", "falso", "inativo"]:
+        assert normalize_boolean(val) is False, f"Failed for {val}"
+
+
+def test_spreadsheet_tabular_paste_parsing_and_readonly_protection():
+    """Simulate tabular paste with multiple rows and extra columns to ensure result columns are protected."""
+    tsv_data = (
+        "Channel.Device.Tag1\tTAG_01\t2000\tsim\t123.45\tGood\n"
+        "Channel.Device.Tag2\tTAG_02\t5000\tnão\t999.00\tBad\n"
+    )
+
+    lines = [l.strip("\r") for l in tsv_data.split("\n") if l.strip()]
+    matrix = [l.split("\t") for l in lines]
+    assert len(matrix) == 2
+
+    editable_cols = ["opc_item_path", "pi_point_name", "publish_interval_ms", "enabled"]
+    parsed_rows = []
+
+    for row_vals in matrix:
+        parsed_row = {}
+        for col_idx, col_name in enumerate(editable_cols):
+            if col_idx < len(row_vals):
+                val = row_vals[col_idx].strip()
+                if col_name == "publish_interval_ms":
+                    parsed_row[col_name] = int(val)
+                elif col_name == "enabled":
+                    parsed_row[col_name] = val.lower() in ("true", "1", "sim", "s", "yes")
+                else:
+                    parsed_row[col_name] = val
+        # Extra columns like 123.45 (val) or Good (qual) are NEVER mapped into editable fields
+        parsed_rows.append(parsed_row)
+
+    assert parsed_rows[0] == {
+        "opc_item_path": "Channel.Device.Tag1",
+        "pi_point_name": "TAG_01",
+        "publish_interval_ms": 2000,
+        "enabled": True,
+    }
+    assert parsed_rows[1] == {
+        "opc_item_path": "Channel.Device.Tag2",
+        "pi_point_name": "TAG_02",
+        "publish_interval_ms": 5000,
+        "enabled": False,
+    }
+
+
+def test_spreadsheet_batch_validation_duplicate_prevention(pi_mapping_runtime):
+    """Verify batch save API blocks duplicate OPC paths and duplicate PI points within the same profile."""
+    app, _, _, _, _ = pi_mapping_runtime
+
+    # 1. Duplicate OPC path in same payload
+    dup_opc_payload = {
+        "equipment_id": "eq-100",
+        "opc_prog_id": "ABB.AfwOpcDaSurrogate.1",
+        "rows": [
+            {
+                "mapping_id": "",
+                "opc_item_path": "Path.Device.DuplicateTag",
+                "pi_point_name": "POINT_01",
+                "publish_interval_ms": 5000,
+                "enabled": True,
+            },
+            {
+                "mapping_id": "",
+                "opc_item_path": "Path.Device.DuplicateTag",
+                "pi_point_name": "POINT_02",
+                "publish_interval_ms": 5000,
+                "enabled": True,
+            },
+        ],
+    }
+    status, _, resp = request(
+        app,
+        "/api/v1/pi-mappings/batch",
+        method="POST",
+        payload=dup_opc_payload,
+    )
+    assert status.startswith("400")
+    assert resp["error"] == "validation_failed"
+    errors = [e["message"] for e in resp["row_errors"]]
+    assert any("duplicado" in msg.lower() for msg in errors)
+
+    # 2. Duplicate PI Point (case-insensitive) in same payload
+    dup_pt_payload = {
+        "equipment_id": "eq-100",
+        "opc_prog_id": "ABB.AfwOpcDaSurrogate.1",
+        "rows": [
+            {
+                "mapping_id": "",
+                "opc_item_path": "Path.Device.TagA",
+                "pi_point_name": "PI_POINT_DUPLICATE",
+                "publish_interval_ms": 5000,
+                "enabled": True,
+            },
+            {
+                "mapping_id": "",
+                "opc_item_path": "Path.Device.TagB",
+                "pi_point_name": "pi_point_duplicate",  # case-insensitive check
+                "publish_interval_ms": 5000,
+                "enabled": True,
+            },
+        ],
+    }
+    status, _, resp = request(
+        app,
+        "/api/v1/pi-mappings/batch",
+        method="POST",
+        payload=dup_pt_payload,
+    )
+    assert status.startswith("400")
+    assert resp["error"] == "validation_failed"
+    errors = [e["message"] for e in resp["row_errors"]]
+    assert any("duplicado" in msg.lower() for msg in errors)

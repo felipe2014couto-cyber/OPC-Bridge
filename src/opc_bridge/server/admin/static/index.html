@@ -290,9 +290,11 @@
 
         <!-- Toolbar da planilha -->
         <div style="display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; flex-wrap: wrap;">
-          <div style="display: flex; gap: 8px;">
+          <div style="display: flex; align-items: center; gap: 8px;">
             <button type="button" id="btn-add-pi-row" class="secondary" disabled>+ Adicionar linha</button>
+            <button type="button" id="btn-delete-pi-row" class="secondary danger" disabled title="Excluir a linha selecionada na grade">Excluir linha</button>
             <button type="button" id="btn-save-pi-sheet" class="primary" disabled>Salvar alterações</button>
+            <span id="pi-pending-changes-badge" class="badge warning" hidden>Alterações pendentes</span>
           </div>
           <div>
             <button type="button" id="btn-read-now-pi" class="secondary" disabled title="Executar leitura OPC sob demanda para preencher valores e validar endereços">⚡ Ler agora</button>
@@ -304,24 +306,26 @@
           <table id="pi-spreadsheet-table">
             <thead>
               <tr>
+                <th style="width: 44px; text-align: center;">#</th>
                 <th style="min-width: 240px;">Endereço OPC *</th>
                 <th style="min-width: 200px;">PI Point *</th>
-                <th style="width: 160px;">Velocidade de publicação (ms) *</th>
+                <th style="width: 170px; text-align: right;">Velocidade de publicação (ms) *</th>
                 <th style="width: 70px; text-align: center;">Ativo</th>
                 <th style="min-width: 120px;">Último valor</th>
-                <th style="min-width: 100px;">Qualidade</th>
+                <th style="min-width: 100px; text-align: center;">Qualidade</th>
                 <th style="min-width: 160px;">Último timestamp</th>
                 <th style="min-width: 180px;">Resultado</th>
-                <th style="width: 140px; text-align: center;">Ações</th>
+                <th style="min-width: 220px; text-align: center;">Ações</th>
               </tr>
             </thead>
             <tbody id="pi-spreadsheet-body">
               <tr>
-                <td colspan="9" class="muted">Selecione um equipamento e informe o Servidor OPC para carregar a planilha.</td>
+                <td colspan="10" class="muted">Selecione um equipamento e informe o Servidor OPC para carregar a planilha.</td>
               </tr>
             </tbody>
           </table>
         </div>
+        <div id="pi-grid-cell-msg" class="grid-status-bar" style="margin-top: 6px; font-size: 12px; color: var(--muted); min-height: 20px;"></div>
       </section>
 
       <!-- Seção: Histórico de Simulação e Auditoria -->

@@ -501,29 +501,168 @@ tr.row-error td {
   color: var(--muted);
 }
 
-/* Planilha de Mapeamentos PI */
-.cell-input {
+/* Planilha de Mapeamentos PI — Google Sheets Style Grid */
+#pi-spreadsheet-table {
   width: 100%;
+  border-collapse: collapse;
+  table-layout: auto;
+  background: #ffffff;
+  border: 1px solid #cbd5e1;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+
+#pi-spreadsheet-table th {
+  background: #f8fafc;
+  color: #475569;
+  font-weight: 600;
+  font-size: 12px;
+  padding: 8px 10px;
+  border: 1px solid #cbd5e1;
+  white-space: nowrap;
+  user-select: none;
+}
+
+#pi-spreadsheet-table td {
+  border: 1px solid #e2e8f0;
+  padding: 0;
+  height: 34px;
+  position: relative;
+  font-size: 13px;
+  vertical-align: middle;
+}
+
+/* Row index column (#) like Google Sheets */
+#pi-spreadsheet-table td.col-row-idx {
+  width: 44px;
+  text-align: center;
+  background: #f8fafc;
+  color: #64748b;
+  font-size: 11px;
+  font-weight: 600;
+  border-right: 1px solid #cbd5e1;
+  user-select: none;
+  cursor: pointer;
+}
+
+tr.row-selected td.col-row-idx {
+  background: #e2e8f0;
+  color: #0f172a;
+}
+
+tr.row-selected {
+  background-color: rgba(241, 245, 249, 0.6);
+}
+
+/* Editable cells */
+#pi-spreadsheet-table td.cell-editable {
+  background: #ffffff;
+  cursor: cell;
+}
+
+/* Cell inputs fitting 100% inside cell */
+.grid-cell-input {
+  width: 100%;
+  height: 100%;
+  border: none;
+  background: transparent;
   padding: 6px 8px;
   font-size: 13px;
-  border: 1px solid var(--line);
-  border-radius: 4px;
-  box-sizing: border-box;
-  background: #ffffff;
   font-family: inherit;
-  transition: border-color 0.15s, background-color 0.15s;
-}
-
-.cell-input:focus {
-  border-color: var(--primary);
+  color: #1e293b;
+  box-sizing: border-box;
   outline: none;
-  box-shadow: 0 0 0 2px rgba(10, 80, 160, 0.15);
 }
 
+.grid-cell-input:focus {
+  outline: none;
+}
+
+.grid-cell-input.publish-interval {
+  text-align: right;
+}
+
+/* Checkbox cell */
+#pi-spreadsheet-table td.col-active {
+  text-align: center;
+  cursor: pointer;
+}
+
+.grid-cell-checkbox {
+  cursor: pointer;
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  vertical-align: middle;
+}
+
+/* Read-only cells */
+#pi-spreadsheet-table td.cell-readonly {
+  background: #f8fafc;
+  color: #334155;
+  padding: 6px 8px;
+  font-size: 12px;
+  white-space: nowrap;
+  user-select: text;
+}
+
+#pi-spreadsheet-table td.cell-actions {
+  background: #ffffff;
+  padding: 4px 6px;
+  text-align: center;
+  white-space: nowrap;
+}
+
+/* Google Sheets style cell selection border */
+#pi-spreadsheet-table td.cell-selected {
+  outline: 2px solid #1a73e8 !important;
+  outline-offset: -1px;
+  z-index: 10;
+}
+
+/* Google Sheets style cell error border */
+#pi-spreadsheet-table td.cell-invalid,
+.grid-cell-input.is-invalid,
 .cell-input.is-invalid {
-  border-color: var(--status-red) !important;
-  background-color: #fff2f2 !important;
-  box-shadow: 0 0 0 1px var(--status-red) !important;
+  outline: 2px solid #ea4335 !important;
+  outline-offset: -1px;
+  background-color: #fef2f2 !important;
+  z-index: 11;
+}
+
+/* Status indicator badge for pending changes */
+#pi-pending-changes-badge {
+  font-size: 11px;
+  padding: 3px 8px;
+  background: #fef3c7;
+  color: #92400e;
+  border: 1px solid #fcd34d;
+  font-weight: 600;
+  border-radius: 12px;
+  display: inline-flex;
+  align-items: center;
+}
+
+/* Grid bottom status bar */
+.grid-status-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 10px;
+  font-size: 12px;
+  color: #64748b;
+  border: 1px solid #e2e8f0;
+  border-radius: 4px;
+  background: #f8fafc;
+}
+
+.grid-status-bar .status-coord {
+  font-weight: 600;
+  color: #334155;
+}
+
+.grid-status-bar .status-error {
+  color: #ea4335;
+  font-weight: 500;
 }
 
 .cell-quality {
@@ -544,4 +683,16 @@ tr.row-error td {
   background: var(--status-red-bg);
   color: var(--status-red);
   border: 1px solid var(--status-red);
+}
+
+/* Legacy .cell-input compatibility */
+.cell-input {
+  width: 100%;
+  padding: 6px 8px;
+  font-size: 13px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  box-sizing: border-box;
+  background: #ffffff;
+  font-family: inherit;
 }
