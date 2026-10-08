@@ -502,44 +502,86 @@ tr.row-error td {
 }
 
 /* Planilha de Mapeamentos PI — Google Sheets Style Grid */
+.table-wrap.pi-spreadsheet-wrap {
+  position: relative;
+  max-height: 480px;
+  overflow: auto;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px 6px 0 0;
+  background: #ffffff;
+  margin: 12px 0 0 0;
+}
+
 #pi-spreadsheet-table {
   width: 100%;
-  border-collapse: collapse;
+  border-collapse: separate;
+  border-spacing: 0;
   table-layout: auto;
   background: #ffffff;
-  border: 1px solid #cbd5e1;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  user-select: none;
+}
+
+#pi-spreadsheet-table:focus {
+  outline: none;
 }
 
 #pi-spreadsheet-table th {
+  position: sticky;
+  top: 0;
+  z-index: 20;
   background: #f8fafc;
   color: #475569;
   font-weight: 600;
   font-size: 12px;
-  padding: 8px 10px;
-  border: 1px solid #cbd5e1;
+  padding: 7px 10px;
+  border-bottom: 1px solid #cbd5e1;
+  border-right: 1px solid #cbd5e1;
   white-space: nowrap;
   user-select: none;
 }
 
+/* Header index column top-left corner (#) */
+#pi-spreadsheet-table th.col-hdr-idx {
+  position: sticky;
+  top: 0;
+  left: 0;
+  z-index: 30;
+  background: #f1f5f9;
+  width: 44px;
+  min-width: 44px;
+  max-width: 44px;
+  text-align: center;
+  border-right: 1px solid #cbd5e1;
+  border-bottom: 1px solid #cbd5e1;
+}
+
 #pi-spreadsheet-table td {
-  border: 1px solid #e2e8f0;
+  border-right: 1px solid #e2e8f0;
+  border-bottom: 1px solid #e2e8f0;
   padding: 0;
-  height: 34px;
+  height: 30px;
   position: relative;
   font-size: 13px;
   vertical-align: middle;
+  background: #ffffff;
 }
 
-/* Row index column (#) like Google Sheets */
+/* Row index column (#) sticky left */
 #pi-spreadsheet-table td.col-row-idx {
+  position: sticky;
+  left: 0;
+  z-index: 10;
   width: 44px;
+  min-width: 44px;
+  max-width: 44px;
   text-align: center;
   background: #f8fafc;
   color: #64748b;
   font-size: 11px;
   font-weight: 600;
   border-right: 1px solid #cbd5e1;
+  border-bottom: 1px solid #e2e8f0;
   user-select: none;
   cursor: pointer;
 }
@@ -550,31 +592,41 @@ tr.row-selected td.col-row-idx {
 }
 
 tr.row-selected {
-  background-color: rgba(241, 245, 249, 0.6);
+  background-color: rgba(241, 245, 249, 0.4);
 }
 
-/* Editable cells */
+/* Editable cells: appear as plain text, no input boxes or form borders */
 #pi-spreadsheet-table td.cell-editable {
   background: #ffffff;
   cursor: cell;
 }
 
-/* Cell inputs fitting 100% inside cell */
 .grid-cell-input {
   width: 100%;
   height: 100%;
-  border: none;
-  background: transparent;
-  padding: 6px 8px;
+  border: none !important;
+  background: transparent !important;
+  padding: 5px 8px;
   font-size: 13px;
   font-family: inherit;
   color: #1e293b;
   box-sizing: border-box;
-  outline: none;
+  outline: none !important;
+  box-shadow: none !important;
+  cursor: cell;
+  pointer-events: none;
 }
 
-.grid-cell-input:focus {
-  outline: none;
+/* When the cell is in active direct EDIT mode */
+#pi-spreadsheet-table td.cell-editing {
+  background: #ffffff !important;
+  z-index: 18 !important;
+}
+
+#pi-spreadsheet-table td.cell-editing .grid-cell-input {
+  cursor: text !important;
+  background: #ffffff !important;
+  pointer-events: auto;
 }
 
 .grid-cell-input.publish-interval {
@@ -589,69 +641,116 @@ tr.row-selected {
 
 .grid-cell-checkbox {
   cursor: pointer;
-  width: 16px;
-  height: 16px;
+  width: 15px;
+  height: 15px;
   margin: 0;
   vertical-align: middle;
 }
 
-/* Read-only cells */
+/* Read-only result columns: locked / grey appearance */
 #pi-spreadsheet-table td.cell-readonly {
   background: #f8fafc;
-  color: #334155;
-  padding: 6px 8px;
+  color: #475569;
+  padding: 5px 8px;
   font-size: 12px;
   white-space: nowrap;
   user-select: text;
+  cursor: default;
 }
 
 #pi-spreadsheet-table td.cell-actions {
   background: #ffffff;
-  padding: 4px 6px;
+  padding: 3px 6px;
   text-align: center;
   white-space: nowrap;
+  cursor: default;
 }
 
-/* Google Sheets style cell selection border */
+/* Google Sheets style active cell border */
 #pi-spreadsheet-table td.cell-selected {
   outline: 2px solid #1a73e8 !important;
   outline-offset: -1px;
-  z-index: 10;
+  z-index: 15;
+  background-color: #ffffff;
 }
 
-/* Google Sheets style cell error border */
-#pi-spreadsheet-table td.cell-invalid,
-.grid-cell-input.is-invalid,
-.cell-input.is-invalid {
-  outline: 2px solid #ea4335 !important;
-  outline-offset: -1px;
+/* Range selection styling (Google Sheets light blue fill) */
+#pi-spreadsheet-table td.cell-in-range {
+  background-color: rgba(26, 115, 232, 0.1) !important;
+}
+
+/* Range perimeter borders */
+#pi-spreadsheet-table td.range-top {
+  border-top: 2px solid #1a73e8 !important;
+}
+#pi-spreadsheet-table td.range-bottom {
+  border-bottom: 2px solid #1a73e8 !important;
+}
+#pi-spreadsheet-table td.range-left {
+  border-left: 2px solid #1a73e8 !important;
+}
+#pi-spreadsheet-table td.range-right {
+  border-right: 2px solid #1a73e8 !important;
+}
+
+/* Fill handle (small square at bottom-right corner of selection) */
+.grid-fill-handle {
+  position: absolute;
+  right: -3px;
+  bottom: -3px;
+  width: 6px;
+  height: 6px;
+  background: #1a73e8;
+  border: 1px solid #ffffff;
+  cursor: crosshair;
+  z-index: 25;
+}
+
+/* Drag fill preview styling */
+#pi-spreadsheet-table td.cell-drag-fill-preview {
+  background-color: rgba(26, 115, 232, 0.18) !important;
+  border-bottom: 1px dashed #1a73e8 !important;
+  border-right: 1px dashed #1a73e8 !important;
+  border-left: 1px dashed #1a73e8 !important;
+}
+
+/* Validation error highlighting: subtle, non-intrusive */
+#pi-spreadsheet-table td.cell-invalid {
   background-color: #fef2f2 !important;
-  z-index: 11;
+}
+
+#pi-spreadsheet-table td.cell-invalid .grid-cell-input {
+  color: #b91c1c !important;
+}
+
+#pi-spreadsheet-table td.cell-selected.cell-invalid {
+  outline: 2px solid #ea4335 !important;
 }
 
 /* Status indicator badge for pending changes */
 #pi-pending-changes-badge {
   font-size: 11px;
-  padding: 3px 8px;
+  padding: 2px 7px;
   background: #fef3c7;
   color: #92400e;
   border: 1px solid #fcd34d;
   font-weight: 600;
-  border-radius: 12px;
+  border-radius: 10px;
   display: inline-flex;
   align-items: center;
 }
 
-/* Grid bottom status bar */
+/* Grid bottom status bar: compact spreadsheet footer */
 .grid-status-bar {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 4px 10px;
-  font-size: 12px;
+  padding: 3px 10px;
+  font-size: 11px;
   color: #64748b;
-  border: 1px solid #e2e8f0;
-  border-radius: 4px;
+  border: 1px solid #cbd5e1;
+  border-top: none;
+  border-radius: 0 0 6px 6px;
   background: #f8fafc;
 }
 
@@ -688,7 +787,7 @@ tr.row-selected {
 /* Legacy .cell-input compatibility */
 .cell-input {
   width: 100%;
-  padding: 6px 8px;
+  padding: 5px 8px;
   font-size: 13px;
   border: 1px solid var(--line);
   border-radius: 4px;

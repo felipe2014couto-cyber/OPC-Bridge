@@ -23,7 +23,15 @@
   let deletingMappingId = null;
   let publishingOnceMapping = null;
   let piOutputEnabled = false;
+  let piActiveCell = null;
   let piSelectedCell = null;
+  let piSelectionRange = null;
+  let piIsEditing = false;
+  let piIsMouseDown = false;
+  let piDragAnchor = null;
+  let piIsDraggingHandle = false;
+  let piDragHandleSourceRange = null;
+  let piDragTargetRow = null;
   let piHasPendingChanges = false;
   let piCellErrors = new Map();
   let piEditingCellVal = null;
@@ -1395,10 +1403,35 @@
     }
   }
 
-  function updateRowIndices() {
+  // ==========================================
+  // GOOGLE SHEETS / EXCEL STYLE SPREADSHEET ENGINE
+  // ==========================================
+
+  function getTableRows() {
     const tbody = el("pi-spreadsheet-body");
-    if (!tbody) return;
-    const rows = [...tbody.querySelectorAll("tr")].filter(r => !r.classList.contains("empty-row"));
+    if (!tbody) return [];
+    return [...tbody.querySelectorAll("tr")].filter(r => !r.classList.contains("empty-row"));
+  }
+
+  function getCellElement(rIdx, cIdx) {
+    const rows = getTableRows();
+    if (rIdx < 0 || rIdx >= rows.length) return null;
+    const cells = rows[rIdx].querySelectorAll("td");
+    if (cIdx < 0 || cIdx >= cells.length) return null;
+    return cells[cIdx];
+  }
+
+  function normalizeRange(r1, c1, r2, c2) {
+    return {
+      r1: Math.min(r1, r2),
+      r2: Math.max(r1, r2),
+      c1: Math.min(c1, c2),
+      c2: Math.max(c1, c2)
+    };
+  }
+
+  function updateRowIndices() {
+    const rows = getTableRows();
     rows.forEach((tr, idx) => {
       tr.dataset.rowIndex = String(idx);
       const colIdx = tr.querySelector(".col-row-idx");
@@ -1409,36 +1442,632 @@
     });
   }
 
-  function selectCell(rIdx, cIdx, focusInput = false) {
+  function renderSelection() {
     const tbody = el("pi-spreadsheet-body");
     if (!tbody) return;
-    const rows = [...tbody.querySelectorAll("tr")].filter(r => !r.classList.contains("empty-row"));
-    if (rIdx < 0 || rIdx >= rows.length) return;
-    const tr = rows[rIdx];
-    const cells = tr.querySelectorAll("td");
-    if (cIdx < 0 || cIdx >= cells.length) return;
-    const td = cells[cIdx];
 
-    tbody.querySelectorAll(".cell-selected").forEach(c => c.classList.remove("cell-selected"));
-    tbody.querySelectorAll("tr.row-selected").forEach(r => r.classList.remove("row-selected"));
+    tbody.querySelectorAll(".cell-selected").forEach(el => el.classList.remove("cell-selected"));
+    tbody.querySelectorAll(".cell-in-range").forEach(el => el.classList.remove("cell-in-range"));
+    tbody.querySelectorAll(".range-top").forEach(el => el.classList.remove("range-top"));
+    tbody.querySelectorAll(".range-bottom").forEach(el => el.classList.remove("range-bottom"));
+    tbody.querySelectorAll(".range-left").forEach(el => el.classList.remove("range-left"));
+    tbody.querySelectorAll(".range-right").forEach(el => el.classList.remove("range-right"));
+    tbody.querySelectorAll(".cell-editing").forEach(el => el.classList.remove("cell-editing"));
+    tbody.querySelectorAll("tr.row-selected").forEach(el => el.classList.remove("row-selected"));
+    tbody.querySelectorAll(".grid-fill-handle").forEach(el => el.remove());
 
-    tr.classList.add("row-selected");
-    td.classList.add("cell-selected");
-    piSelectedCell = { rIdx, cIdx };
-    updateDeleteButtonState();
+    if (!piActiveCell) {
+      updateDeleteButtonState();
+      updateGridStatusBar();
+      return;
+    }
 
-    const input = td.querySelector("input");
-    if (input) {
-      piEditingCellVal = input.type === "checkbox" ? input.checked : input.value;
-      if (focusInput && document.activeElement !== input) {
-        input.focus();
-        if (input.type === "text" || input.type === "number") {
-          input.select();
+    if (!piSelectionRange) {
+      piSelectionRange = {
+        r1: piActiveCell.rIdx,
+        c1: piActiveCell.cIdx,
+        r2: piActiveCell.rIdx,
+        c2: piActiveCell.cIdx
+      };
+    }
+
+    const rows = getTableRows();
+    if (rows.length === 0) return;
+
+    // Highlight active row & active cell
+    const activeRow = rows[piActiveCell.rIdx];
+    if (activeRow) {
+      activeRow.classList.add("row-selected");
+      const activeCell = activeRow.querySelectorAll("td")[piActiveCell.cIdx];
+      if (activeCell) {
+        activeCell.classList.add("cell-selected");
+        if (piIsEditing) {
+          activeCell.classList.add("cell-editing");
         }
       }
     }
 
+    // Highlight selected range
+    const { r1, c1, r2, c2 } = piSelectionRange;
+    for (let r = r1; r <= r2 && r < rows.length; r++) {
+      const row = rows[r];
+      if (!row) continue;
+      const cells = row.querySelectorAll("td");
+      for (let c = c1; c <= c2 && c < cells.length; c++) {
+        const td = cells[c];
+        if (!td) continue;
+        td.classList.add("cell-in-range");
+        if (r === r1) td.classList.add("range-top");
+        if (r === r2) td.classList.add("range-bottom");
+        if (c === c1) td.classList.add("range-left");
+        if (c === c2) td.classList.add("range-right");
+      }
+    }
+
+    // Append Fill Handle to bottom-right of selection range (if contains editable columns)
+    const canShowHandle = c1 <= 4;
+    if (canShowHandle && r2 < rows.length && !piIsEditing) {
+      const bottomRow = rows[r2];
+      const handleCellCol = Math.min(c2, 4);
+      const handleTd = bottomRow?.querySelectorAll("td")[handleCellCol];
+      if (handleTd) {
+        const handle = document.createElement("div");
+        handle.className = "grid-fill-handle";
+        handle.title = "Arrastar para preencher linhas abaixo";
+        handle.addEventListener("mousedown", e => {
+          e.stopPropagation();
+          e.preventDefault();
+          startFillHandleDrag();
+        });
+        handleTd.appendChild(handle);
+      }
+    }
+
+    piSelectedCell = piActiveCell;
+    updateDeleteButtonState();
     updateGridStatusBar();
+  }
+
+  function selectSingleCell(rIdx, cIdx) {
+    if (piIsEditing) {
+      commitCellEdit();
+    }
+    const rows = getTableRows();
+    if (rows.length === 0) return;
+    const clampedR = Math.max(0, Math.min(rows.length - 1, rIdx));
+    const clampedC = Math.max(1, Math.min(9, cIdx));
+
+    piActiveCell = { rIdx: clampedR, cIdx: clampedC };
+    piSelectedCell = piActiveCell;
+    piSelectionRange = { r1: clampedR, c1: clampedC, r2: clampedR, c2: clampedC };
+    piIsEditing = false;
+    renderSelection();
+
+    const sheetTable = el("pi-spreadsheet-table");
+    if (sheetTable && !piIsEditing) {
+      try {
+        sheetTable.focus({ preventScroll: true });
+      } catch (_) {}
+    }
+  }
+
+  function selectCell(rIdx, cIdx) {
+    selectSingleCell(rIdx, cIdx);
+  }
+
+  function extendSelectionTo(rIdx, cIdx) {
+    if (!piActiveCell) {
+      selectSingleCell(rIdx, cIdx);
+      return;
+    }
+    const rows = getTableRows();
+    if (rows.length === 0) return;
+    const clampedR = Math.max(0, Math.min(rows.length - 1, rIdx));
+    const clampedC = Math.max(1, Math.min(9, cIdx));
+
+    piSelectionRange = normalizeRange(piActiveCell.rIdx, piActiveCell.cIdx, clampedR, clampedC);
+    renderSelection();
+  }
+
+  function startCellEdit(replaceValue = false, initialChar = null) {
+    if (!piActiveCell) return;
+    const { rIdx, cIdx } = piActiveCell;
+    if (cIdx < 1 || cIdx > 4) return; // Result columns are strictly read-only
+
+    const td = getCellElement(rIdx, cIdx);
+    if (!td) return;
+    const input = td.querySelector("input");
+    if (!input) return;
+
+    if (input.type === "checkbox") {
+      input.checked = !input.checked;
+      setPiPendingChanges(true);
+      validateGrid();
+      renderSelection();
+      return;
+    }
+
+    piIsEditing = true;
+    piEditingCellVal = input.value;
+    td.classList.add("cell-editing");
+
+    if (replaceValue && initialChar !== null) {
+      input.value = initialChar;
+      setPiPendingChanges(true);
+      validateGrid();
+      input.focus();
+      input.selectionStart = input.selectionEnd = input.value.length;
+    } else {
+      input.focus();
+      input.select();
+    }
+  }
+
+  function commitCellEdit() {
+    if (!piIsEditing) return;
+    piIsEditing = false;
+    if (piActiveCell) {
+      const td = getCellElement(piActiveCell.rIdx, piActiveCell.cIdx);
+      if (td) td.classList.remove("cell-editing");
+      const input = td ? td.querySelector("input") : null;
+      if (input && input.value !== piEditingCellVal) {
+        setPiPendingChanges(true);
+        validateGrid();
+      }
+    }
+    renderSelection();
+  }
+
+  function cancelCellEdit() {
+    if (!piIsEditing) return;
+    piIsEditing = false;
+    if (piActiveCell && piEditingCellVal !== null) {
+      const td = getCellElement(piActiveCell.rIdx, piActiveCell.cIdx);
+      const input = td ? td.querySelector("input") : null;
+      if (input) {
+        input.value = String(piEditingCellVal);
+        validateGrid();
+      }
+      if (td) td.classList.remove("cell-editing");
+    }
+    renderSelection();
+  }
+
+  // --- FILL HANDLE ENGINE (Alça de Preenchimento por Arrasto) ---
+
+  function startFillHandleDrag() {
+    if (!piSelectionRange) return;
+    piIsDraggingHandle = true;
+    piDragHandleSourceRange = { ...piSelectionRange };
+    piDragTargetRow = piSelectionRange.r2;
+  }
+
+  function onFillHandleHoverRow(rIdx) {
+    if (!piIsDraggingHandle || !piDragHandleSourceRange) return;
+    piDragTargetRow = Math.max(rIdx, piDragHandleSourceRange.r2);
+
+    const rows = getTableRows();
+    rows.forEach((tr, idx) => {
+      tr.querySelectorAll("td.cell-drag-fill-preview").forEach(td => td.classList.remove("cell-drag-fill-preview"));
+      if (idx > piDragHandleSourceRange.r2 && idx <= piDragTargetRow) {
+        const cells = tr.querySelectorAll("td");
+        const c1 = piDragHandleSourceRange.c1;
+        const c2 = Math.min(piDragHandleSourceRange.c2, 4);
+        for (let c = c1; c <= c2; c++) {
+          if (cells[c]) cells[c].classList.add("cell-drag-fill-preview");
+        }
+      }
+    });
+  }
+
+  function finishFillHandleDrag() {
+    if (!piIsDraggingHandle) return;
+    piIsDraggingHandle = false;
+
+    const tbody = el("pi-spreadsheet-body");
+    if (tbody) {
+      tbody.querySelectorAll(".cell-drag-fill-preview").forEach(td => td.classList.remove("cell-drag-fill-preview"));
+    }
+
+    if (piDragHandleSourceRange && piDragTargetRow !== null && piDragTargetRow > piDragHandleSourceRange.r2) {
+      const src = piDragHandleSourceRange;
+      const targetR = piDragTargetRow;
+
+      let domRows = getTableRows();
+      while (domRows.length <= targetR) {
+        addPiRowSilently();
+        domRows = getTableRows();
+      }
+
+      const sourceRowCount = src.r2 - src.r1 + 1;
+      const editC1 = src.c1;
+      const editC2 = Math.min(src.c2, 4);
+
+      for (let r = src.r2 + 1; r <= targetR; r++) {
+        const patternOffset = (r - (src.r2 + 1)) % sourceRowCount;
+        const srcRowIdx = src.r1 + patternOffset;
+        const srcRow = domRows[srcRowIdx];
+        const tgtRow = domRows[r];
+        if (!srcRow || !tgtRow) continue;
+
+        for (let c = editC1; c <= editC2; c++) {
+          if (c === 1) {
+            const srcInp = srcRow.querySelector(".opc-path");
+            const tgtInp = tgtRow.querySelector(".opc-path");
+            if (srcInp && tgtInp) tgtInp.value = srcInp.value;
+          } else if (c === 2) {
+            const srcInp = srcRow.querySelector(".pi-point");
+            const tgtInp = tgtRow.querySelector(".pi-point");
+            if (srcInp && tgtInp) tgtInp.value = srcInp.value;
+          } else if (c === 3) {
+            const srcInp = srcRow.querySelector(".publish-interval");
+            const tgtInp = tgtRow.querySelector(".publish-interval");
+            if (srcInp && tgtInp) tgtInp.value = srcInp.value;
+          } else if (c === 4) {
+            const srcInp = srcRow.querySelector(".row-enabled");
+            const tgtInp = tgtRow.querySelector(".row-enabled");
+            if (srcInp && tgtInp) tgtInp.checked = srcInp.checked;
+          }
+        }
+      }
+
+      setPiPendingChanges(true);
+      validateGrid();
+      piSelectionRange = { r1: src.r1, c1: src.c1, r2: targetR, c2: src.c2 };
+      renderSelection();
+      message("Preenchimento por arrasto concluído.", "info");
+    }
+
+    piDragHandleSourceRange = null;
+    piDragTargetRow = null;
+  }
+
+  // --- CLIPBOARD ENGINE: COPY, CUT, PASTE ---
+
+  function copySelectionToClipboard() {
+    if (!piSelectionRange) return "";
+    const { r1, c1, r2, c2 } = piSelectionRange;
+    const domRows = getTableRows();
+    const lines = [];
+
+    for (let r = r1; r <= r2 && r < domRows.length; r++) {
+      const row = domRows[r];
+      if (!row) continue;
+      const cells = row.querySelectorAll("td");
+      const rowVals = [];
+      for (let c = c1; c <= c2 && c < cells.length; c++) {
+        const td = cells[c];
+        if (!td) { rowVals.push(""); continue; }
+        if (c >= 1 && c <= 3) {
+          const inp = td.querySelector("input");
+          rowVals.push(inp ? inp.value : "");
+        } else if (c === 4) {
+          const inp = td.querySelector("input");
+          rowVals.push(inp ? (inp.checked ? "true" : "false") : "");
+        } else {
+          rowVals.push(td.textContent.trim());
+        }
+      }
+      lines.push(rowVals.join("\t"));
+    }
+
+    const tsv = lines.join("\n");
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(tsv).then(() => {
+        message("Células copiadas para a área de transferência.", "info");
+      }).catch(() => {});
+    }
+    return tsv;
+  }
+
+  function cutSelection() {
+    if (!piSelectionRange) return;
+    copySelectionToClipboard();
+
+    const { r1, c1, r2, c2 } = piSelectionRange;
+    const domRows = getTableRows();
+
+    for (let r = r1; r <= r2 && r < domRows.length; r++) {
+      const row = domRows[r];
+      if (!row) continue;
+      const cells = row.querySelectorAll("td");
+      for (let c = c1; c <= c2 && c < cells.length; c++) {
+        if (c === 1 || c === 2) {
+          const inp = cells[c]?.querySelector("input");
+          if (inp) inp.value = "";
+        } else if (c === 3) {
+          const inp = cells[c]?.querySelector("input");
+          if (inp) inp.value = "5000";
+        } else if (c === 4) {
+          const inp = cells[c]?.querySelector("input");
+          if (inp) inp.checked = false;
+        }
+      }
+    }
+
+    setPiPendingChanges(true);
+    validateGrid();
+    renderSelection();
+    message("Células recortadas.", "info");
+  }
+
+  function handleTabularPaste(e) {
+    const clipboardData = e.clipboardData || window.clipboardData;
+    if (!clipboardData) return;
+    const text = clipboardData.getData("text");
+    if (!text) return;
+
+    const hasTab = text.includes("\t");
+    const hasNewline = text.includes("\n") || text.includes("\r");
+
+    if (!hasTab && !hasNewline && piIsEditing) {
+      setTimeout(() => {
+        setPiPendingChanges(true);
+        validateGrid();
+      }, 0);
+      return;
+    }
+
+    e.preventDefault();
+    const lines = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+    if (lines.length > 0 && lines[lines.length - 1] === "") {
+      lines.pop();
+    }
+    if (lines.length === 0) return;
+
+    const matrix = lines.map(line => line.split("\t"));
+    const tbody = el("pi-spreadsheet-body");
+    if (!tbody) return;
+
+    const EDITABLE_COLS = [1, 2, 3, 4];
+    let startRow = piActiveCell ? piActiveCell.rIdx : 0;
+    let startCol = piActiveCell ? piActiveCell.cIdx : 1;
+
+    let colOffset = EDITABLE_COLS.indexOf(startCol);
+    if (colOffset === -1) {
+      colOffset = 0;
+    }
+
+    let domRows = getTableRows();
+    const neededRows = startRow + matrix.length;
+
+    while (domRows.length < neededRows) {
+      addPiRowSilently();
+      domRows = getTableRows();
+    }
+
+    updateRowIndices();
+    updateRowCountBadge();
+
+    matrix.forEach((rowVals, rIdxOffset) => {
+      const targetRowIdx = startRow + rIdxOffset;
+      const tr = domRows[targetRowIdx];
+      if (!tr) return;
+
+      rowVals.forEach((val, cIdxOffset) => {
+        const targetEditColIdx = colOffset + cIdxOffset;
+        if (targetEditColIdx >= EDITABLE_COLS.length) {
+          // Ignore result columns (5..9)!
+          return;
+        }
+        const actualColIdx = EDITABLE_COLS[targetEditColIdx];
+        const trimmed = val.trim();
+
+        if (actualColIdx === 1) {
+          const inp = tr.querySelector(".opc-path");
+          if (inp) inp.value = trimmed;
+        } else if (actualColIdx === 2) {
+          const inp = tr.querySelector(".pi-point");
+          if (inp) inp.value = trimmed;
+        } else if (actualColIdx === 3) {
+          const inp = tr.querySelector(".publish-interval");
+          if (inp) {
+            const num = parseInt(trimmed, 10);
+            inp.value = isNaN(num) ? trimmed : String(num);
+          }
+        } else if (actualColIdx === 4) {
+          const inp = tr.querySelector(".row-enabled");
+          if (inp) {
+            inp.checked = normalizeBoolean(trimmed, inp.checked);
+          }
+        }
+      });
+    });
+
+    setPiPendingChanges(true);
+    validateGrid();
+    const endCol = Math.min(4, EDITABLE_COLS[colOffset] + matrix[0].length - 1);
+    piSelectionRange = {
+      r1: startRow,
+      c1: EDITABLE_COLS[colOffset],
+      r2: startRow + matrix.length - 1,
+      c2: endCol
+    };
+    renderSelection();
+    message(`${matrix.length} linha(s) colada(s) com sucesso na planilha.`, "info");
+  }
+
+  function normalizeBoolean(raw, fallback = true) {
+    if (typeof raw === "boolean") return raw;
+    const s = String(raw || "").trim().toLowerCase();
+    if (["true", "1", "sim", "s", "yes", "y", "t", "verdadeiro", "v", "ativo", "habilitado"].includes(s)) {
+      return true;
+    }
+    if (["false", "0", "não", "nao", "n", "no", "f", "falso", "inativo", "desabilitado"].includes(s)) {
+      return false;
+    }
+    return fallback;
+  }
+
+  function handleCellKeyDown(e, rIdx, cIdx) {
+    if (e.defaultPrevented) return;
+    const rows = getTableRows();
+    const totalRows = rows.length;
+
+    // Clipboard shortcuts: Ctrl/Cmd + C, X
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "c" && !piIsEditing) {
+      e.preventDefault();
+      copySelectionToClipboard();
+      return;
+    }
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "x" && !piIsEditing) {
+      e.preventDefault();
+      cutSelection();
+      return;
+    }
+
+    if (e.key === "Tab") {
+      e.preventDefault();
+      commitCellEdit();
+      if (e.shiftKey) {
+        if (cIdx === 1) {
+          if (rIdx > 0) selectSingleCell(rIdx - 1, 4);
+        } else if (cIdx === 2) {
+          selectSingleCell(rIdx, 1);
+        } else if (cIdx === 3) {
+          selectSingleCell(rIdx, 2);
+        } else if (cIdx === 4) {
+          selectSingleCell(rIdx, 3);
+        } else {
+          selectSingleCell(rIdx, 4);
+        }
+      } else {
+        if (cIdx === 1) {
+          selectSingleCell(rIdx, 2);
+        } else if (cIdx === 2) {
+          selectSingleCell(rIdx, 3);
+        } else if (cIdx === 3) {
+          selectSingleCell(rIdx, 4);
+        } else if (cIdx === 4) {
+          if (rIdx < totalRows - 1) selectSingleCell(rIdx + 1, 1);
+        } else {
+          selectSingleCell(rIdx, 1);
+        }
+      }
+      return;
+    }
+
+    if (e.key === "Enter") {
+      e.preventDefault();
+      if (piIsEditing) {
+        commitCellEdit();
+        if (e.shiftKey) {
+          if (rIdx > 0) selectSingleCell(rIdx - 1, cIdx);
+        } else {
+          if (rIdx < totalRows - 1) selectSingleCell(rIdx + 1, cIdx);
+        }
+      } else {
+        if (e.shiftKey) {
+          if (rIdx > 0) selectSingleCell(rIdx - 1, cIdx);
+        } else {
+          if (cIdx >= 1 && cIdx <= 4) {
+            startCellEdit(false);
+          } else {
+            if (rIdx < totalRows - 1) selectSingleCell(rIdx + 1, cIdx);
+          }
+        }
+      }
+      return;
+    }
+
+    if (e.key === "Escape") {
+      e.preventDefault();
+      cancelCellEdit();
+      return;
+    }
+
+    if (e.key === "Delete" || e.key === "Backspace") {
+      if (!piIsEditing) {
+        e.preventDefault();
+        if (piSelectionRange) {
+          for (let r = piSelectionRange.r1; r <= piSelectionRange.r2 && r < rows.length; r++) {
+            const row = rows[r];
+            if (!row) continue;
+            const cells = row.querySelectorAll("td");
+            for (let c = piSelectionRange.c1; c <= piSelectionRange.c2 && c < cells.length; c++) {
+              if (c === 1 || c === 2) {
+                const inp = cells[c]?.querySelector("input");
+                if (inp) inp.value = "";
+              } else if (c === 3) {
+                const inp = cells[c]?.querySelector("input");
+                if (inp) inp.value = "5000";
+              } else if (c === 4) {
+                const inp = cells[c]?.querySelector("input");
+                if (inp) inp.checked = false;
+              }
+            }
+          }
+          setPiPendingChanges(true);
+          validateGrid();
+          renderSelection();
+        }
+        return;
+      }
+    }
+
+    if (e.key === "ArrowUp") {
+      if (!piIsEditing) {
+        e.preventDefault();
+        if (e.shiftKey && piSelectionRange) {
+          const newR1 = Math.max(0, piSelectionRange.r1 - 1);
+          piSelectionRange = { ...piSelectionRange, r1: newR1 };
+          renderSelection();
+        } else {
+          if (rIdx > 0) selectSingleCell(rIdx - 1, cIdx);
+        }
+        return;
+      }
+    }
+
+    if (e.key === "ArrowDown") {
+      if (!piIsEditing) {
+        e.preventDefault();
+        if (e.shiftKey && piSelectionRange) {
+          const newR2 = Math.min(totalRows - 1, piSelectionRange.r2 + 1);
+          piSelectionRange = { ...piSelectionRange, r2: newR2 };
+          renderSelection();
+        } else {
+          if (rIdx < totalRows - 1) selectSingleCell(rIdx + 1, cIdx);
+        }
+        return;
+      }
+    }
+
+    if (e.key === "ArrowLeft") {
+      if (!piIsEditing) {
+        e.preventDefault();
+        if (e.shiftKey && piSelectionRange) {
+          const newC1 = Math.max(1, piSelectionRange.c1 - 1);
+          piSelectionRange = { ...piSelectionRange, c1: newC1 };
+          renderSelection();
+        } else {
+          if (cIdx > 1) selectSingleCell(rIdx, cIdx - 1);
+        }
+        return;
+      }
+    }
+
+    if (e.key === "ArrowRight") {
+      if (!piIsEditing) {
+        e.preventDefault();
+        if (e.shiftKey && piSelectionRange) {
+          const newC2 = Math.min(9, piSelectionRange.c2 + 1);
+          piSelectionRange = { ...piSelectionRange, c2: newC2 };
+          renderSelection();
+        } else {
+          if (cIdx < 9) selectSingleCell(rIdx, cIdx + 1);
+        }
+        return;
+      }
+    }
+
+    // Direct typing on selected editable cell
+    if (!piIsEditing && e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      if (cIdx >= 1 && cIdx <= 3) {
+        e.preventDefault();
+        startCellEdit(true, e.key);
+      }
+    }
   }
 
   function updateGridStatusBar() {
@@ -1458,31 +2087,37 @@
       "Ações"
     ];
 
-    if (!piSelectedCell) {
+    if (!piActiveCell) {
       if (piCellErrors.size > 0) {
         const firstErr = Array.from(piCellErrors.values())[0];
-        bar.innerHTML = `<span class="status-error">⚠️ ${escapeHtml(firstErr)} (${piCellErrors.size} erro(s) pendente(s))</span>`;
+        bar.innerHTML = `<span class="status-error">${escapeHtml(firstErr)} (${piCellErrors.size} erro(s))</span>`;
       } else if (piHasPendingChanges) {
-        bar.innerHTML = `<span style="color: #92400e; font-weight: 500;">● Alterações pendentes de gravação</span>`;
+        bar.innerHTML = `<span style="color: #92400e; font-weight: 500;">Alterações pendentes</span>`;
       } else {
         bar.textContent = "Pronto";
       }
       return;
     }
 
-    const { rIdx, cIdx } = piSelectedCell;
-    const coord = `Linha ${rIdx + 1}, Coluna: ${colNames[cIdx] || cIdx}`;
+    const { rIdx, cIdx } = piActiveCell;
+    let rangeTxt = `Linha ${rIdx + 1}, Coluna: ${colNames[cIdx] || cIdx}`;
+    if (piSelectionRange && (piSelectionRange.r1 !== piSelectionRange.r2 || piSelectionRange.c1 !== piSelectionRange.c2)) {
+      const rowCount = piSelectionRange.r2 - piSelectionRange.r1 + 1;
+      const colCount = piSelectionRange.c2 - piSelectionRange.c1 + 1;
+      rangeTxt += ` (${rowCount}L × ${colCount}C selecionadas)`;
+    }
+
     const cellErrKey = `${rIdx}:${cIdx}`;
     const cellErr = piCellErrors.get(cellErrKey);
 
     if (cellErr) {
-      bar.innerHTML = `<span class="status-coord">${coord}</span> &nbsp;|&nbsp; <span class="status-error">⚠️ ${escapeHtml(cellErr)}</span>`;
+      bar.innerHTML = `<span class="status-coord">${rangeTxt}</span> &nbsp;|&nbsp; <span class="status-error">${escapeHtml(cellErr)}</span>`;
     } else if (piCellErrors.size > 0) {
-      bar.innerHTML = `<span class="status-coord">${coord}</span> &nbsp;|&nbsp; <span class="status-error">⚠️ ${piCellErrors.size} célula(s) com erro na planilha</span>`;
+      bar.innerHTML = `<span class="status-coord">${rangeTxt}</span> &nbsp;|&nbsp; <span class="status-error">${piCellErrors.size} célula(s) com erro</span>`;
     } else if (piHasPendingChanges) {
-      bar.innerHTML = `<span class="status-coord">${coord}</span> &nbsp;|&nbsp; <span style="color: #92400e; font-weight: 500;">● Alterações pendentes</span>`;
+      bar.innerHTML = `<span class="status-coord">${rangeTxt}</span> &nbsp;|&nbsp; <span style="color: #92400e; font-weight: 500;">Alterações pendentes</span>`;
     } else {
-      bar.innerHTML = `<span class="status-coord">${coord}</span>`;
+      bar.innerHTML = `<span class="status-coord">${rangeTxt}</span>`;
     }
   }
 
@@ -1491,7 +2126,7 @@
     piCellErrors.clear();
     if (!tbody) return { isValid: true, errorCount: 0 };
 
-    const rows = [...tbody.querySelectorAll("tr")].filter(r => !r.classList.contains("empty-row"));
+    const rows = getTableRows();
 
     rows.forEach(r => {
       r.querySelectorAll("td.cell-invalid").forEach(td => td.classList.remove("cell-invalid"));
@@ -1587,8 +2222,7 @@
     if (!btnSave) return;
 
     const valid = isValid !== undefined ? isValid : (piCellErrors.size === 0);
-    const tbody = el("pi-spreadsheet-body");
-    const rows = tbody ? [...tbody.querySelectorAll("tr")].filter(r => !r.classList.contains("empty-row")) : [];
+    const rows = getTableRows();
 
     const canSave = Boolean(
       selectedPiEquipment &&
@@ -1606,229 +2240,9 @@
   function updateDeleteButtonState() {
     const btnDelete = el("btn-delete-pi-row");
     if (!btnDelete) return;
-    const tbody = el("pi-spreadsheet-body");
-    const rows = tbody ? [...tbody.querySelectorAll("tr")].filter(r => !r.classList.contains("empty-row")) : [];
-    const hasSelectedRow = piSelectedCell !== null && piSelectedCell.rIdx >= 0 && piSelectedCell.rIdx < rows.length;
+    const rows = getTableRows();
+    const hasSelectedRow = piActiveCell !== null && piActiveCell.rIdx >= 0 && piActiveCell.rIdx < rows.length;
     btnDelete.disabled = !hasSelectedRow;
-  }
-
-  function normalizeBoolean(raw) {
-    if (typeof raw === "boolean") return raw;
-    const s = String(raw || "").trim().toLowerCase();
-    if (["true", "1", "sim", "s", "yes", "y", "t", "verdadeiro", "v", "ativo", "habilitado"].includes(s)) {
-      return true;
-    }
-    if (["false", "0", "não", "nao", "n", "no", "f", "falso", "inativo", "desabilitado"].includes(s)) {
-      return false;
-    }
-    return true;
-  }
-
-  function handleCellKeyDown(e, rIdx, cIdx) {
-    const tbody = el("pi-spreadsheet-body");
-    const rows = tbody ? [...tbody.querySelectorAll("tr")].filter(r => !r.classList.contains("empty-row")) : [];
-    const totalRows = rows.length;
-
-    if (e.key === "Tab") {
-      e.preventDefault();
-      if (e.shiftKey) {
-        if (cIdx === 1) {
-          if (rIdx > 0) {
-            selectCell(rIdx - 1, 4, true);
-          }
-        } else if (cIdx === 2) {
-          selectCell(rIdx, 1, true);
-        } else if (cIdx === 3) {
-          selectCell(rIdx, 2, true);
-        } else if (cIdx === 4) {
-          selectCell(rIdx, 3, true);
-        }
-      } else {
-        if (cIdx === 1) {
-          selectCell(rIdx, 2, true);
-        } else if (cIdx === 2) {
-          selectCell(rIdx, 3, true);
-        } else if (cIdx === 3) {
-          selectCell(rIdx, 4, true);
-        } else if (cIdx === 4) {
-          if (rIdx < totalRows - 1) {
-            selectCell(rIdx + 1, 1, true);
-          }
-        }
-      }
-      return;
-    }
-
-    if (e.key === "Enter") {
-      e.preventDefault();
-      if (e.shiftKey) {
-        if (rIdx > 0) {
-          selectCell(rIdx - 1, cIdx, true);
-        }
-      } else {
-        if (rIdx < totalRows - 1) {
-          selectCell(rIdx + 1, cIdx, true);
-        }
-      }
-      return;
-    }
-
-    if (e.key === "Escape") {
-      e.preventDefault();
-      const input = e.target;
-      if (input && piEditingCellVal !== null) {
-        if (input.type === "checkbox") {
-          input.checked = Boolean(piEditingCellVal);
-        } else {
-          input.value = String(piEditingCellVal);
-        }
-        validateGrid();
-      }
-      return;
-    }
-
-    if (e.key === "ArrowUp") {
-      if (rIdx > 0) {
-        e.preventDefault();
-        selectCell(rIdx - 1, cIdx, true);
-      }
-      return;
-    }
-
-    if (e.key === "ArrowDown") {
-      if (rIdx < totalRows - 1) {
-        e.preventDefault();
-        selectCell(rIdx + 1, cIdx, true);
-      }
-      return;
-    }
-
-    if (e.key === "ArrowLeft") {
-      const input = e.target;
-      if (input.type === "checkbox" || (input.selectionStart === 0 && input.selectionEnd === 0)) {
-        if (cIdx > 1) {
-          e.preventDefault();
-          selectCell(rIdx, cIdx - 1, true);
-        }
-      }
-      return;
-    }
-
-    if (e.key === "ArrowRight") {
-      const input = e.target;
-      if (input.type === "checkbox" || (input.selectionStart === input.value.length && input.selectionEnd === input.value.length)) {
-        if (cIdx < 4) {
-          e.preventDefault();
-          selectCell(rIdx, cIdx + 1, true);
-        }
-      }
-      return;
-    }
-  }
-
-  function handleTabularPaste(e) {
-    const clipboardData = e.clipboardData || window.clipboardData;
-    if (!clipboardData) return;
-    const text = clipboardData.getData("text");
-    if (!text) return;
-
-    const hasTab = text.includes("\t");
-    const hasNewline = text.includes("\n") || text.includes("\r");
-    if (!hasTab && !hasNewline) {
-      setTimeout(() => {
-        setPiPendingChanges(true);
-        validateGrid();
-      }, 0);
-      return;
-    }
-
-    e.preventDefault();
-    const lines = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
-    if (lines.length > 0 && lines[lines.length - 1] === "") {
-      lines.pop();
-    }
-    if (lines.length === 0) return;
-
-    const matrix = lines.map(line => line.split("\t"));
-    const tbody = el("pi-spreadsheet-body");
-    if (!tbody) return;
-
-    const EDITABLE_COLS = [1, 2, 3, 4];
-    let startRow = piSelectedCell ? piSelectedCell.rIdx : 0;
-    let startCol = piSelectedCell ? piSelectedCell.cIdx : 1;
-
-    let colOffset = EDITABLE_COLS.indexOf(startCol);
-    if (colOffset === -1) {
-      colOffset = 0;
-    }
-
-    const emptyRow = tbody.querySelector(".empty-row");
-    if (emptyRow) emptyRow.remove();
-
-    let domRows = [...tbody.querySelectorAll("tr")].filter(r => !r.classList.contains("empty-row"));
-    const neededRows = startRow + matrix.length;
-
-    while (domRows.length < neededRows) {
-      const newMapping = {
-        mapping_id: "",
-        equipment_id: selectedPiEquipment?.equipment_id || "",
-        opc_prog_id: selectedPiProgId,
-        opc_item_path: "",
-        pi_point_name: "",
-        publish_interval_ms: 5000,
-        enabled: true,
-        current_value: null,
-        quality: null,
-        quality_text: null,
-        opc_timestamp: null,
-        last_publish_status: "unconfigured"
-      };
-      const tr = createSpreadsheetRowElement(newMapping, domRows.length);
-      tbody.appendChild(tr);
-      domRows.push(tr);
-    }
-
-    updateRowIndices();
-    updateRowCountBadge();
-
-    matrix.forEach((rowVals, rIdxOffset) => {
-      const targetRowIdx = startRow + rIdxOffset;
-      const tr = domRows[targetRowIdx];
-      if (!tr) return;
-
-      rowVals.forEach((val, cIdxOffset) => {
-        const targetEditColIdx = colOffset + cIdxOffset;
-        if (targetEditColIdx >= EDITABLE_COLS.length) {
-          return;
-        }
-        const actualColIdx = EDITABLE_COLS[targetEditColIdx];
-        const trimmed = val.trim();
-
-        if (actualColIdx === 1) {
-          const inp = tr.querySelector(".opc-path");
-          if (inp) inp.value = trimmed;
-        } else if (actualColIdx === 2) {
-          const inp = tr.querySelector(".pi-point");
-          if (inp) inp.value = trimmed;
-        } else if (actualColIdx === 3) {
-          const inp = tr.querySelector(".publish-interval");
-          if (inp) {
-            const num = parseInt(trimmed, 10);
-            inp.value = isNaN(num) ? trimmed : String(num);
-          }
-        } else if (actualColIdx === 4) {
-          const inp = tr.querySelector(".row-enabled");
-          if (inp) {
-            inp.checked = normalizeBoolean(trimmed);
-          }
-        }
-      });
-    });
-
-    setPiPendingChanges(true);
-    validateGrid();
-    selectCell(startRow, EDITABLE_COLS[colOffset], true);
-    message(`${matrix.length} linha(s) colada(s) com sucesso na planilha.`, "info");
   }
 
   function renderPiSpreadsheet() {
@@ -1843,7 +2257,9 @@
       tr.innerHTML = '<td colspan="10" class="muted">Selecione um equipamento e informe o Servidor OPC para carregar a planilha.</td>';
       tbody.appendChild(tr);
       if (countBadge) countBadge.textContent = "0 linha(s)";
+      piActiveCell = null;
       piSelectedCell = null;
+      piSelectionRange = null;
       updateDeleteButtonState();
       updateSaveButtonState();
       return;
@@ -1855,7 +2271,9 @@
       tr.innerHTML = '<td colspan="10" class="muted">Nenhuma linha de mapeamento cadastrada. Clique em "+ Adicionar linha" para começar.</td>';
       tbody.appendChild(tr);
       if (countBadge) countBadge.textContent = "0 linha(s)";
+      piActiveCell = null;
       piSelectedCell = null;
+      piSelectionRange = null;
       updateDeleteButtonState();
       updateSaveButtonState();
       return;
@@ -1871,6 +2289,9 @@
     updateRowIndices();
     validateGrid();
     updateDeleteButtonState();
+    if (piMappings.length > 0) {
+      selectSingleCell(0, 1);
+    }
   }
 
   function createSpreadsheetRowElement(m, idx) {
@@ -1878,13 +2299,65 @@
     tr.dataset.mappingId = m.mapping_id || "";
     tr.dataset.rowIndex = String(idx);
 
-    // 0. # (Índice de linha)
+    // 0. # (Índice de linha sticky)
     const tdIdx = document.createElement("td");
     tdIdx.className = "col-row-idx";
     tdIdx.textContent = String(idx + 1);
     tdIdx.title = `Linha ${idx + 1}`;
-    tdIdx.addEventListener("click", () => selectCell(parseInt(tr.dataset.rowIndex, 10), 1, true));
+    tdIdx.addEventListener("mousedown", e => {
+      if (e.button !== 0) return;
+      selectSingleCell(parseInt(tr.dataset.rowIndex, 10), 1);
+    });
     tr.appendChild(tdIdx);
+
+    tr.addEventListener("mouseenter", () => {
+      const curR = parseInt(tr.dataset.rowIndex, 10);
+      if (piIsDraggingHandle) {
+        onFillHandleHoverRow(curR);
+      }
+    });
+
+    // Helper for editable td click & drag wiring
+    function setupEditableTd(td, colIdx, input) {
+      td.addEventListener("mousedown", e => {
+        if (e.button !== 0) return;
+        if (e.target.classList.contains("grid-fill-handle")) return;
+        const curR = parseInt(tr.dataset.rowIndex, 10);
+        if (e.shiftKey) {
+          extendSelectionTo(curR, colIdx);
+        } else {
+          piIsMouseDown = true;
+          piDragAnchor = { rIdx: curR, cIdx: colIdx };
+          selectSingleCell(curR, colIdx);
+        }
+      });
+      td.addEventListener("mouseenter", () => {
+        const curR = parseInt(tr.dataset.rowIndex, 10);
+        if (piIsDraggingHandle) {
+          onFillHandleHoverRow(curR);
+        } else if (piIsMouseDown && piDragAnchor) {
+          piSelectionRange = normalizeRange(piDragAnchor.rIdx, piDragAnchor.cIdx, curR, colIdx);
+          renderSelection();
+        }
+      });
+      td.addEventListener("dblclick", () => {
+        startCellEdit(false);
+      });
+      input.addEventListener("blur", () => {
+        if (piIsEditing) {
+          commitCellEdit();
+        }
+      });
+      input.addEventListener("keydown", e => handleCellKeyDown(e, parseInt(tr.dataset.rowIndex, 10), colIdx));
+      input.addEventListener("input", () => {
+        setPiPendingChanges(true);
+        validateGrid();
+      });
+      input.addEventListener("change", () => {
+        setPiPendingChanges(true);
+        validateGrid();
+      });
+    }
 
     // 1. Endereço OPC (editável)
     const tdOpc = document.createElement("td");
@@ -1895,18 +2368,8 @@
     inputOpc.value = m.opc_item_path || "";
     inputOpc.placeholder = "Ex: Channel.Device.Tag";
     inputOpc.required = true;
-    inputOpc.addEventListener("focus", () => selectCell(parseInt(tr.dataset.rowIndex, 10), 1, false));
-    inputOpc.addEventListener("input", () => {
-      setPiPendingChanges(true);
-      validateGrid();
-    });
-    inputOpc.addEventListener("change", () => {
-      setPiPendingChanges(true);
-      validateGrid();
-    });
-    inputOpc.addEventListener("keydown", (e) => handleCellKeyDown(e, parseInt(tr.dataset.rowIndex, 10), 1));
     tdOpc.appendChild(inputOpc);
-    tdOpc.addEventListener("click", () => selectCell(parseInt(tr.dataset.rowIndex, 10), 1, true));
+    setupEditableTd(tdOpc, 1, inputOpc);
     tr.appendChild(tdOpc);
 
     // 2. PI Point (editável)
@@ -1918,18 +2381,8 @@
     inputPt.value = m.pi_point_name || "";
     inputPt.placeholder = "Ex: TAG_OPC_01";
     inputPt.required = true;
-    inputPt.addEventListener("focus", () => selectCell(parseInt(tr.dataset.rowIndex, 10), 2, false));
-    inputPt.addEventListener("input", () => {
-      setPiPendingChanges(true);
-      validateGrid();
-    });
-    inputPt.addEventListener("change", () => {
-      setPiPendingChanges(true);
-      validateGrid();
-    });
-    inputPt.addEventListener("keydown", (e) => handleCellKeyDown(e, parseInt(tr.dataset.rowIndex, 10), 2));
     tdPt.appendChild(inputPt);
-    tdPt.addEventListener("click", () => selectCell(parseInt(tr.dataset.rowIndex, 10), 2, true));
+    setupEditableTd(tdPt, 2, inputPt);
     tr.appendChild(tdPt);
 
     // 3. Velocidade de publicação (ms) (editável)
@@ -1943,49 +2396,48 @@
     inputInt.step = "1";
     inputInt.value = m.publish_interval_ms || 5000;
     inputInt.required = true;
-    inputInt.addEventListener("focus", () => selectCell(parseInt(tr.dataset.rowIndex, 10), 3, false));
-    inputInt.addEventListener("input", () => {
-      setPiPendingChanges(true);
-      validateGrid();
-    });
-    inputInt.addEventListener("change", () => {
-      setPiPendingChanges(true);
-      validateGrid();
-    });
-    inputInt.addEventListener("keydown", (e) => handleCellKeyDown(e, parseInt(tr.dataset.rowIndex, 10), 3));
     tdInt.appendChild(inputInt);
-    tdInt.addEventListener("click", () => selectCell(parseInt(tr.dataset.rowIndex, 10), 3, true));
+    setupEditableTd(tdInt, 3, inputInt);
     tr.appendChild(tdInt);
 
-    // 4. Ativo (checkbox)
+    // 4. Ativo (checkbox editável)
     const tdEn = document.createElement("td");
     tdEn.className = "cell-editable col-active";
     const inputEn = document.createElement("input");
     inputEn.type = "checkbox";
     inputEn.className = "grid-cell-checkbox row-enabled";
     inputEn.checked = m.enabled !== undefined ? Boolean(m.enabled) : true;
-    inputEn.addEventListener("focus", () => selectCell(parseInt(tr.dataset.rowIndex, 10), 4, false));
-    inputEn.addEventListener("change", () => {
-      setPiPendingChanges(true);
-      validateGrid();
-    });
-    inputEn.addEventListener("keydown", (e) => handleCellKeyDown(e, parseInt(tr.dataset.rowIndex, 10), 4));
     tdEn.appendChild(inputEn);
-    tdEn.addEventListener("click", (e) => {
-      if (e.target !== inputEn) {
-        inputEn.checked = !inputEn.checked;
-        setPiPendingChanges(true);
-        validateGrid();
-      }
-      selectCell(parseInt(tr.dataset.rowIndex, 10), 4, false);
-    });
+    setupEditableTd(tdEn, 4, inputEn);
     tr.appendChild(tdEn);
+
+    // Helper for readonly result columns
+    function setupReadonlyTd(td, colIdx) {
+      td.addEventListener("mousedown", e => {
+        if (e.button !== 0) return;
+        const curR = parseInt(tr.dataset.rowIndex, 10);
+        if (e.shiftKey) {
+          extendSelectionTo(curR, colIdx);
+        } else {
+          piIsMouseDown = true;
+          piDragAnchor = { rIdx: curR, cIdx: colIdx };
+          selectSingleCell(curR, colIdx);
+        }
+      });
+      td.addEventListener("mouseenter", () => {
+        const curR = parseInt(tr.dataset.rowIndex, 10);
+        if (piIsMouseDown && piDragAnchor) {
+          piSelectionRange = normalizeRange(piDragAnchor.rIdx, piDragAnchor.cIdx, curR, colIdx);
+          renderSelection();
+        }
+      });
+    }
 
     // 5. Último valor (somente leitura)
     const tdVal = document.createElement("td");
     tdVal.className = "cell-readonly col-val";
     tdVal.textContent = m.current_value !== null && m.current_value !== undefined ? String(m.current_value) : "—";
-    tdVal.addEventListener("click", () => selectCell(parseInt(tr.dataset.rowIndex, 10), 5, false));
+    setupReadonlyTd(tdVal, 5);
     tr.appendChild(tdVal);
 
     // 6. Qualidade (somente leitura)
@@ -1998,14 +2450,14 @@
     } else {
       tdQual.innerHTML = `<span class="cell-quality bad">Bad (${m.quality})</span>`;
     }
-    tdQual.addEventListener("click", () => selectCell(parseInt(tr.dataset.rowIndex, 10), 6, false));
+    setupReadonlyTd(tdQual, 6);
     tr.appendChild(tdQual);
 
     // 7. Último timestamp (somente leitura)
     const tdTs = document.createElement("td");
     tdTs.className = "cell-readonly col-ts";
     tdTs.textContent = formatOpcTimestamp(m.opc_timestamp);
-    tdTs.addEventListener("click", () => selectCell(parseInt(tr.dataset.rowIndex, 10), 7, false));
+    setupReadonlyTd(tdTs, 7);
     tr.appendChild(tdTs);
 
     // 8. Resultado (somente leitura)
@@ -2029,7 +2481,7 @@
     } else {
       tdRes.innerHTML = '<span class="badge unconfigured">Não configurado</span>';
     }
-    tdRes.addEventListener("click", () => selectCell(parseInt(tr.dataset.rowIndex, 10), 8, false));
+    setupReadonlyTd(tdRes, 8);
     tr.appendChild(tdRes);
 
     // 9. Ações (somente leitura)
@@ -2086,17 +2538,19 @@
         tr.remove();
         updateRowIndices();
         updateRowCountBadge();
-        const remaining = tbody.querySelectorAll("tr:not(.empty-row)");
+        const remaining = getTableRows();
         if (remaining.length === 0) {
           const emptyTr = document.createElement("tr");
           emptyTr.className = "empty-row";
           emptyTr.innerHTML = '<td colspan="10" class="muted">Nenhuma linha de mapeamento cadastrada. Clique em "+ Adicionar linha" para começar.</td>';
           tbody.appendChild(emptyTr);
+          piActiveCell = null;
           piSelectedCell = null;
+          piSelectionRange = null;
         }
         setPiPendingChanges(true);
         validateGrid();
-        updateDeleteButtonState();
+        renderSelection();
       });
       tdAct.appendChild(btnDel);
     }
@@ -2105,10 +2559,9 @@
     return tr;
   }
 
-  function addPiRow() {
+  function addPiRowSilently() {
     const tbody = el("pi-spreadsheet-body");
-    if (!tbody) return;
-
+    if (!tbody) return null;
     const emptyRow = tbody.querySelector(".empty-row");
     if (emptyRow) emptyRow.remove();
 
@@ -2127,28 +2580,32 @@
       last_publish_status: "unconfigured"
     };
 
-    const rows = [...tbody.querySelectorAll("tr")].filter(r => !r.classList.contains("empty-row"));
+    const rows = getTableRows();
     const newIdx = rows.length;
     const tr = createSpreadsheetRowElement(newMapping, newIdx);
     tbody.appendChild(tr);
-
     updateRowIndices();
     updateRowCountBadge();
+    return tr;
+  }
+
+  function addPiRow() {
+    const tr = addPiRowSilently();
+    if (!tr) return;
+    const newIdx = parseInt(tr.dataset.rowIndex, 10);
     setPiPendingChanges(true);
     validateGrid();
-
-    selectCell(newIdx, 1, true);
+    selectSingleCell(newIdx, 1);
+    startCellEdit(false);
   }
 
   function deleteSelectedRow() {
-    if (!piSelectedCell) {
+    if (!piActiveCell) {
       message("Selecione uma linha na grade para excluir.", "warning");
       return;
     }
-    const tbody = el("pi-spreadsheet-body");
-    if (!tbody) return;
-    const rows = [...tbody.querySelectorAll("tr")].filter(r => !r.classList.contains("empty-row"));
-    const tr = rows[piSelectedCell.rIdx];
+    const domRows = getTableRows();
+    const tr = domRows[piActiveCell.rIdx];
     if (!tr) return;
 
     const mappingId = tr.dataset.mappingId || "";
@@ -2162,16 +2619,18 @@
       updateRowIndices();
       updateRowCountBadge();
       const tbody = el("pi-spreadsheet-body");
-      const remaining = tbody ? [...tbody.querySelectorAll("tr")].filter(r => !r.classList.contains("empty-row")) : [];
+      const remaining = getTableRows();
       if (remaining.length === 0 && tbody) {
         const emptyTr = document.createElement("tr");
         emptyTr.className = "empty-row";
         emptyTr.innerHTML = '<td colspan="10" class="muted">Nenhuma linha de mapeamento cadastrada. Clique em "+ Adicionar linha" para começar.</td>';
         tbody.appendChild(emptyTr);
+        piActiveCell = null;
         piSelectedCell = null;
+        piSelectionRange = null;
       } else {
-        const nextIdx = Math.min(piSelectedCell ? piSelectedCell.rIdx : 0, remaining.length - 1);
-        selectCell(nextIdx, 1, false);
+        const nextIdx = Math.min(piActiveCell ? piActiveCell.rIdx : 0, remaining.length - 1);
+        selectSingleCell(nextIdx, 1);
       }
       setPiPendingChanges(true);
       validateGrid();
@@ -2193,7 +2652,9 @@
       const modal = el("modal-delete-mapping-confirm");
       if (modal) modal.hidden = true;
       deletingMappingId = null;
+      piActiveCell = null;
       piSelectedCell = null;
+      piSelectionRange = null;
       updateDeleteButtonState();
       await loadPiMappings();
       await loadPiAudit();
@@ -2219,8 +2680,7 @@
       return;
     }
 
-    const tbody = el("pi-spreadsheet-body");
-    const rows = [...tbody.querySelectorAll("tr")].filter(r => !r.classList.contains("empty-row"));
+    const rows = getTableRows();
 
     const batchRows = rows.map(r => {
       const opcInput = r.querySelector(".opc-path");
@@ -2249,13 +2709,13 @@
       showSheetSuccess(`${res.saved_count || batchRows.length} mapeamento(s) salvo(s) com sucesso.`);
       message("Planilha de mapeamentos PI salva com sucesso.", "success");
 
-      const savedSelected = piSelectedCell ? { ...piSelectedCell } : null;
+      const savedSelected = piActiveCell ? { ...piActiveCell } : null;
       setPiPendingChanges(false);
       await loadPiMappings();
       await loadPiAudit();
 
       if (savedSelected) {
-        selectCell(savedSelected.rIdx, savedSelected.cIdx, false);
+        selectSingleCell(savedSelected.rIdx, savedSelected.cIdx);
       }
     } catch (err) {
       if (err.data && err.data.row_errors) {
@@ -2638,9 +3098,65 @@
       if (el("btn-read-now-pi")) {
         el("btn-read-now-pi").addEventListener("click", readNowPiTags);
       }
-      if (el("pi-spreadsheet-table")) {
-        el("pi-spreadsheet-table").addEventListener("paste", handleTabularPaste);
+      const sheetTable = el("pi-spreadsheet-table");
+      if (sheetTable) {
+        sheetTable.tabIndex = 0;
+        sheetTable.addEventListener("paste", handleTabularPaste);
+        sheetTable.addEventListener("copy", e => {
+          if (!piIsEditing && piSelectionRange) {
+            e.preventDefault();
+            copySelectionToClipboard();
+          }
+        });
+        sheetTable.addEventListener("cut", e => {
+          if (!piIsEditing && piSelectionRange) {
+            e.preventDefault();
+            cutSelection();
+          }
+        });
       }
+
+      // Global mouseup and mousemove for selection dragging and fill handle dragging
+      document.addEventListener("mouseup", () => {
+        if (piIsDraggingHandle) {
+          finishFillHandleDrag();
+        }
+        piIsMouseDown = false;
+        piDragAnchor = null;
+      });
+
+      document.addEventListener("mousemove", e => {
+        if (piIsDraggingHandle && piDragHandleSourceRange) {
+          const domRows = getTableRows();
+          if (domRows.length > 0) {
+            const lastRow = domRows[domRows.length - 1];
+            const rect = lastRow.getBoundingClientRect();
+            if (e.clientY > rect.bottom) {
+              const rowHeight = rect.height || 30;
+              const extra = Math.min(50, Math.max(1, Math.floor((e.clientY - rect.bottom) / rowHeight) + 1));
+              const targetR = (domRows.length - 1) + extra;
+              while (getTableRows().length <= targetR) {
+                addPiRowSilently();
+              }
+              updateRowIndices();
+              updateRowCountBadge();
+              onFillHandleHoverRow(targetR);
+            }
+          }
+        }
+      });
+
+      // Global keyboard handler when spreadsheet or active cell is focused
+      document.addEventListener("keydown", e => {
+        if (currentTab !== "pi") return;
+        if (!piActiveCell) return;
+        const activeEl = document.activeElement;
+        const isTableDescendant = activeEl && (activeEl.closest && activeEl.closest("#pi-spreadsheet-table"));
+        const isBodyOrTable = !activeEl || activeEl === document.body || activeEl === sheetTable;
+        if (isTableDescendant || isBodyOrTable) {
+          handleCellKeyDown(e, piActiveCell.rIdx, piActiveCell.cIdx);
+        }
+      });
 
       if (el("btn-refresh-pi-audit")) {
         el("btn-refresh-pi-audit").addEventListener("click", loadPiAudit);

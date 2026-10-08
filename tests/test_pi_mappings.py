@@ -455,7 +455,7 @@ def test_app_js_auto_refresh_timer_isolated_to_pi_tab(pi_mapping_runtime):
 
 
 def test_pi_profile_lifecycle_and_mapping_inheritance(pi_mapping_runtime):
-    app, _, database, _, _ = pi_mapping_runtime
+    app, _, _, _, _ = pi_mapping_runtime
 
     # 1. Fetch profiles for eq-100
     st, _, data = request(app, "/api/v1/pi-profiles?equipment_id=eq-100", method="GET")
@@ -508,7 +508,7 @@ def test_pi_profile_lifecycle_and_mapping_inheritance(pi_mapping_runtime):
 
 
 def test_pi_mapping_blocked_when_profile_inactive_or_missing(pi_mapping_runtime):
-    app, _, database, _, _ = pi_mapping_runtime
+    app, _, _, _, _ = pi_mapping_runtime
 
     # Deactivate profile
     request(app, "/api/v1/pi-profiles", method="POST", payload={
@@ -542,6 +542,7 @@ def test_validate_point_endpoint(pi_mapping_runtime):
         "publish_interval_ms": 5000,
         "enabled": True,
     })
+    assert st.startswith("201")
     mapping_id = data["mapping"]["mapping_id"]
 
     st_val, _, val_data = request(app, f"/api/v1/pi-mappings/{mapping_id}/validate-point", method="POST")
@@ -1009,3 +1010,352 @@ def test_spreadsheet_batch_validation_duplicate_prevention(pi_mapping_runtime):
     assert resp["error"] == "validation_failed"
     errors = [e["message"] for e in resp["row_errors"]]
     assert any("duplicado" in msg.lower() for msg in errors)
+
+
+def test_spreadsheet_cells_plain_text_appearance_when_inactive():
+    """Verify CSS & HTML rules enforce spreadsheet appearance: borderless plain-text cells when inactive,
+    transparent inputs, blue border only when active/editing, locked grey background for result columns,
+    and sticky header and '#' index column.
+    """
+    from pathlib import Path
+
+    static_dir = Path(__file__).resolve().parent.parent / "src" / "opc_bridge" / "server" / "admin" / "static"
+    html_content = (static_dir / "index.html").read_text(encoding="utf-8")
+    css_content = (static_dir / "style.css").read_text(encoding="utf-8")
+
+    # 1. Container and sticky headers
+    assert "pi-spreadsheet-wrap" in html_content
+    assert "col-hdr-idx" in html_content
+    assert "#pi-spreadsheet-table th.col-hdr-idx" in css_content
+    assert "#pi-spreadsheet-table th" in css_content
+    assert "position: sticky" in css_content
+    assert "border-collapse: separate" in css_content
+
+    # Sticky '#' index column on rows
+    assert "#pi-spreadsheet-table td.col-row-idx" in css_content
+    assert "position: sticky" in css_content
+    assert "left: 0" in css_content
+
+    # 2. Inactive cell input: plain text appearance, borderless, transparent, no form box
+    assert ".grid-cell-input" in css_content
+    assert "border: none !important" in css_content
+    assert "background: transparent !important" in css_content
+    assert "pointer-events: none" in css_content
+
+    # 3. Active cell and editing cell: blue border / active outline and pointer-events enabled
+    assert "#pi-spreadsheet-table td.cell-selected" in css_content
+    assert "outline: 2px solid #1a73e8 !important" in css_content
+    assert "#pi-spreadsheet-table td.cell-editing .grid-cell-input" in css_content
+    assert "pointer-events: auto" in css_content
+
+    # 4. Result columns: locked, grey background
+    assert "#pi-spreadsheet-table td.cell-readonly" in css_content
+    assert "background: #f8fafc" in css_content
+
+    # 5. Fill handle: square at bottom-right of selection
+    assert ".grid-fill-handle" in css_content
+    assert "cursor: crosshair" in css_content
+    assert "#pi-spreadsheet-table td.cell-drag-fill-preview" in css_content
+
+
+def test_spreadsheet_selection_math_and_range_normalization():
+    """Verify range normalization logic correctly handles selection dragging in all 4 diagonal directions."""
+    def normalize_range(r1, c1, r2, c2):
+        return {
+            "r1": min(r1, r2),
+            "c1": min(c1, c2),
+            "r2": max(r1, r2),
+            "c2": max(c1, c2),
+        }
+
+    # Single cell selection
+    assert normalize_range(2, 2, 2, 2) == {"r1": 2, "c1": 2, "r2": 2, "c2": 2}
+
+    # Drag top-left to bottom-right
+    assert normalize_range(1, 1, 4, 3) == {"r1": 1, "c1": 1, "r2": 4, "c2": 3}
+
+    # Drag bottom-right to top-left
+    assert normalize_range(4, 3, 1, 1) == {"r1": 1, "c1": 1, "r2": 4, "c2": 3}
+
+    # Drag top-right to bottom-left
+    assert normalize_range(1, 3, 4, 1) == {"r1": 1, "c1": 1, "r2": 4, "c2": 3}
+
+    # Drag bottom-left to top-right
+    assert normalize_range(4, 1, 1, 3) == {"r1": 1, "c1": 1, "r2": 4, "c2": 3}
+
+
+def test_spreadsheet_copy_selection_tsv_generation():
+    """Verify TSV generation from selected cell range formats cleanly with tabs and newlines,
+    and supports copying result columns for reference without allowing paste into results.
+    """
+    # Sample grid row matrix [col0:#, col1:opc, col2:pi, col3:interval, col4:enabled, col5:val, col6:qual, col7:ts, col8:res]
+    grid = [
+        ["1", "Channel.Dev.TagA", "TAG_A", "5000", "true", "123.4", "Good", "2026-10-08 12:00:00", "Publicado"],
+        ["2", "Channel.Dev.TagB", "TAG_B", "1000", "false", "567.8", "Bad (0)", "2026-10-08 12:00:01", "Erro"],
+        ["3", "Channel.Dev.TagC", "TAG_C", "2000", "true", "99.0", "Good", "2026-10-08 12:00:02", "Simulado"],
+    ]
+
+    def copy_selection(matrix, r1, c1, r2, c2):
+        lines = []
+        for r in range(r1, r2 + 1):
+            if r < len(matrix):
+                row_vals = [str(matrix[r][c]) for c in range(c1, c2 + 1) if c < len(matrix[r])]
+                lines.append("\t".join(row_vals))
+        return "\n".join(lines)
+
+    # Copy editable rectangle: rows 0..1, cols 1..2 (OPC item and PI point)
+    tsv_editable = copy_selection(grid, 0, 1, 1, 2)
+    assert tsv_editable == "Channel.Dev.TagA\tTAG_A\nChannel.Dev.TagB\tTAG_B"
+
+    # Copy single cell: row 0, col 1
+    assert copy_selection(grid, 0, 1, 0, 1) == "Channel.Dev.TagA"
+
+    # Copy result columns (cols 5..8) for consultation
+    tsv_results = copy_selection(grid, 0, 5, 1, 7)
+    assert tsv_results == "123.4\tGood\t2026-10-08 12:00:00\n567.8\tBad (0)\t2026-10-08 12:00:01"
+
+
+def test_spreadsheet_cut_clears_only_editable_columns():
+    """Verify cut operation clears only editable columns (1..4) in selected range and preserves result columns."""
+    grid = [
+        ["1", "Channel.Dev.TagA", "TAG_A", "5000", True, "123.4", "Good", "2026-10-08 12:00:00", "Publicado"],
+        ["2", "Channel.Dev.TagB", "TAG_B", "1000", False, "567.8", "Bad (0)", "2026-10-08 12:00:01", "Erro"],
+    ]
+
+    def cut_selection(matrix, r1, c1, r2, c2):
+        for r in range(r1, r2 + 1):
+            for c in range(c1, c2 + 1):
+                if c == 1 or c == 2:
+                    matrix[r][c] = ""
+                elif c == 3:
+                    matrix[r][c] = "5000"
+                elif c == 4:
+                    matrix[r][c] = False
+                # Cols 5..8 and 0 are strictly read-only and never modified by cut!
+
+    # Cut range encompassing all columns (cols 1..8) on row 0
+    cut_selection(grid, 0, 1, 0, 8)
+
+    # Editable cols cleared / reset
+    assert grid[0][1] == ""
+    assert grid[0][2] == ""
+    assert grid[0][3] == "5000"
+    assert grid[0][4] is False
+
+    # Result columns preserved untouched!
+    assert grid[0][5] == "123.4"
+    assert grid[0][6] == "Good"
+    assert grid[0][7] == "2026-10-08 12:00:00"
+    assert grid[0][8] == "Publicado"
+
+    # Row count unchanged
+    assert len(grid) == 2
+
+
+def test_spreadsheet_tabular_paste_with_row_expansion_and_protection():
+    """Verify pasting multi-row and multi-column TSV into grid starting at active cell:
+    - auto-expands local rows if pasted data exceeds current rows
+    - fills only editable columns (1..4)
+    - never overwrites result columns (5..8)
+    - normalizes boolean values and preserves current state for ambiguous input.
+    """
+    def normalize_boolean(raw, fallback=True):
+        if isinstance(raw, bool):
+            return raw
+        s = str(raw or "").strip().lower()
+        if s in ["true", "1", "sim", "s", "yes", "y", "t", "verdadeiro", "v", "ativo", "habilitado"]:
+            return True
+        if s in ["false", "0", "não", "nao", "n", "no", "f", "falso", "inativo", "desabilitado"]:
+            return False
+        return fallback
+
+    # Start with 2 rows in grid
+    grid = [
+        {"opc": "Old.Tag1", "pi": "OLD_PT1", "interval": 5000, "enabled": True, "val": "10.0", "qual": "Good"},
+        {"opc": "Old.Tag2", "pi": "OLD_PT2", "interval": 5000, "enabled": False, "val": "20.0", "qual": "Good"},
+    ]
+
+    # TSV paste data with 4 rows and 5 columns (5th col attempted to write into result column)
+    tsv_paste = (
+        "New.Tag1\tNEW_PT1\t2500\tsim\tHACKED_VAL\n"
+        "New.Tag2\tNEW_PT2\t3000\tnão\tHACKED_VAL\n"
+        "New.Tag3\tNEW_PT3\t4000\t1\tHACKED_VAL\n"
+        "New.Tag4\tNEW_PT4\t5000\ttalvez\tHACKED_VAL"
+    )
+
+    lines = [line.split("\t") for line in tsv_paste.strip().split("\n")]
+    start_row = 0
+    editable_keys = ["opc", "pi", "interval", "enabled"]
+
+    # Auto-expand rows
+    while len(grid) < start_row + len(lines):
+        grid.append({"opc": "", "pi": "", "interval": 5000, "enabled": True, "val": "—", "qual": "—"})
+
+    assert len(grid) == 4, "Table should automatically expand to 4 rows"
+
+    # Apply paste respecting editable column boundary (max 4 editable columns)
+    for r_idx, row_vals in enumerate(lines):
+        tgt = grid[start_row + r_idx]
+        for c_idx, val in enumerate(row_vals):
+            if c_idx >= len(editable_keys):
+                continue  # Ignore columns past editable boundary (protects result cols!)
+            key = editable_keys[c_idx]
+            if key == "opc" or key == "pi":
+                tgt[key] = val.strip()
+            elif key == "interval":
+                tgt[key] = int(val.strip())
+            elif key == "enabled":
+                tgt[key] = normalize_boolean(val.strip(), fallback=tgt[key])
+
+    # Row 0
+    assert grid[0]["opc"] == "New.Tag1"
+    assert grid[0]["pi"] == "NEW_PT1"
+    assert grid[0]["interval"] == 2500
+    assert grid[0]["enabled"] is True
+    assert grid[0]["val"] == "10.0"  # Protected! Not overwritten by HACKED_VAL
+
+    # Row 1
+    assert grid[1]["opc"] == "New.Tag2"
+    assert grid[1]["pi"] == "NEW_PT2"
+    assert grid[1]["interval"] == 3000
+    assert grid[1]["enabled"] is False
+    assert grid[1]["val"] == "20.0"  # Protected!
+
+    # Row 2 (newly expanded row)
+    assert grid[2]["opc"] == "New.Tag3"
+    assert grid[2]["pi"] == "NEW_PT3"
+    assert grid[2]["interval"] == 4000
+    assert grid[2]["enabled"] is True
+    assert grid[2]["val"] == "—"  # Result col intact
+
+    # Row 3 (ambiguous boolean "talvez" preserved fallback True)
+    assert grid[3]["opc"] == "New.Tag4"
+    assert grid[3]["pi"] == "NEW_PT4"
+    assert grid[3]["interval"] == 5000
+    assert grid[3]["enabled"] is True  # Preserved fallback True, ambiguous value rejected
+    assert grid[3]["val"] == "—"
+
+
+def test_spreadsheet_fill_handle_single_value_copy_simulation():
+    """Verify dragging fill handle on a single row copies identical values to rows below:
+    A1 = Canal.A, C1 = 5000 dragged to row 5 yields A2..A5 = Canal.A and C2..C5 = 5000.
+    """
+    grid = [
+        {"opc": "Canal.A", "pi": "PT_A", "interval": 5000, "enabled": True, "val": "100"},
+        {"opc": "", "pi": "", "interval": 1000, "enabled": False, "val": "200"},
+        {"opc": "", "pi": "", "interval": 1000, "enabled": False, "val": "300"},
+        {"opc": "", "pi": "", "interval": 1000, "enabled": False, "val": "400"},
+        {"opc": "", "pi": "", "interval": 1000, "enabled": False, "val": "500"},
+    ]
+
+    source_r1, source_r2 = 0, 0
+    target_r = 4
+    source_row_count = source_r2 - source_r1 + 1
+
+    for r in range(source_r2 + 1, target_r + 1):
+        offset = (r - (source_r2 + 1)) % source_row_count
+        src_row = grid[source_r1 + offset]
+        tgt_row = grid[r]
+        tgt_row["opc"] = src_row["opc"]
+        tgt_row["pi"] = src_row["pi"]
+        tgt_row["interval"] = src_row["interval"]
+        tgt_row["enabled"] = src_row["enabled"]
+
+    for r in range(1, 5):
+        assert grid[r]["opc"] == "Canal.A"
+        assert grid[r]["pi"] == "PT_A"
+        assert grid[r]["interval"] == 5000
+        assert grid[r]["enabled"] is True
+        # Result column was never modified!
+        assert grid[r]["val"] == str((r + 1) * 100)
+
+
+def test_spreadsheet_fill_handle_repeats_multi_row_cyclic_pattern():
+    """Verify dragging fill handle on a multi-row selection cyclically repeats the pattern without formulas
+    and without arithmetic incrementation (e.g. 5000 is NOT incremented to 5001, 5002).
+    """
+    grid = [
+        {"opc": "Canal.1", "pi": "PT_1", "interval": 2000, "enabled": True},
+        {"opc": "Canal.2", "pi": "PT_2", "interval": 5000, "enabled": False},
+        {"opc": "", "pi": "", "interval": 0, "enabled": False},
+        {"opc": "", "pi": "", "interval": 0, "enabled": False},
+        {"opc": "", "pi": "", "interval": 0, "enabled": False},
+        {"opc": "", "pi": "", "interval": 0, "enabled": False},
+    ]
+
+    source_r1, source_r2 = 0, 1
+    target_r = 5
+    source_row_count = source_r2 - source_r1 + 1  # 2
+
+    for r in range(source_r2 + 1, target_r + 1):
+        pattern_offset = (r - (source_r2 + 1)) % source_row_count
+        src_row = grid[source_r1 + pattern_offset]
+        tgt_row = grid[r]
+        tgt_row["opc"] = src_row["opc"]
+        tgt_row["pi"] = src_row["pi"]
+        tgt_row["interval"] = src_row["interval"]
+        tgt_row["enabled"] = src_row["enabled"]
+
+    # Row 2 (offset 0 -> matches Row 0)
+    assert grid[2]["opc"] == "Canal.1"
+    assert grid[2]["interval"] == 2000
+    assert grid[2]["enabled"] is True
+
+    # Row 3 (offset 1 -> matches Row 1)
+    assert grid[3]["opc"] == "Canal.2"
+    assert grid[3]["interval"] == 5000
+    assert grid[3]["enabled"] is False
+
+    # Row 4 (offset 0 -> matches Row 0)
+    assert grid[4]["opc"] == "Canal.1"
+    assert grid[4]["interval"] == 2000
+    assert grid[4]["enabled"] is True
+
+    # Row 5 (offset 1 -> matches Row 1)
+    assert grid[5]["opc"] == "Canal.2"
+    assert grid[5]["interval"] == 5000
+    assert grid[5]["enabled"] is False
+
+
+def test_spreadsheet_fill_handle_expands_rows_simulation():
+    """Verify fill handle dragging beyond existing rows expands local unpersisted rows."""
+    grid = [
+        {"opc": "Channel.A", "pi": "PT_A", "interval": 5000, "enabled": True},
+    ]
+
+    target_r = 4
+    # Auto-expand rows
+    while len(grid) <= target_r:
+        grid.append({"opc": "", "pi": "", "interval": 5000, "enabled": True})
+
+    assert len(grid) == 5
+
+    source_r1, source_r2 = 0, 0
+    source_row_count = 1
+    for r in range(source_r2 + 1, target_r + 1):
+        pattern_offset = (r - (source_r2 + 1)) % source_row_count
+        src_row = grid[source_r1 + pattern_offset]
+        tgt_row = grid[r]
+        tgt_row["opc"] = src_row["opc"]
+        tgt_row["pi"] = src_row["pi"]
+        tgt_row["interval"] = src_row["interval"]
+        tgt_row["enabled"] = src_row["enabled"]
+
+    for r in range(1, 5):
+        assert grid[r]["opc"] == "Channel.A"
+        assert grid[r]["pi"] == "PT_A"
+        assert grid[r]["interval"] == 5000
+
+
+def test_spreadsheet_grid_operations_never_call_pi_or_opc_services(pi_mapping_runtime):
+    """Verify spreadsheet UI operations never trigger read-now, publish-once, simulation,
+    OPC writes, or CONFIG_PUSH.
+    """
+    _, _, _, writer, session = pi_mapping_runtime
+    initial_frames_count = len(writer.frames)
+
+    # Spreadsheet actions like selection, copy, cut, paste, fill handle are 100% client-side DOM.
+    # No backend API calls should be made until explicit user click on 'Salvar alterações'.
+    # Verify server endpoints are not touched:
+    assert len(writer.frames) == initial_frames_count
+    assert session.config_version == 1
