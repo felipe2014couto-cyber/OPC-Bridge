@@ -28,6 +28,8 @@
   let piSelectionRange = null;
   let piIsEditing = false;
   let piIsMouseDown = false;
+  let piMouseDownPos = null;
+  let piIsDraggingSelection = false;
   let piDragAnchor = null;
   let piIsDraggingHandle = false;
   let piDragHandleSourceRange = null;
@@ -1505,7 +1507,7 @@
     }
 
     // Append Fill Handle to bottom-right of selection range (if contains editable columns)
-    const canShowHandle = c1 <= 4;
+    const canShowHandle = c1 >= 1 && c1 <= 4 && c2 <= 4;
     if (canShowHandle && r2 < rows.length && !piIsEditing) {
       const bottomRow = rows[r2];
       const handleCellCol = Math.min(c2, 4);
@@ -1513,7 +1515,7 @@
       if (handleTd) {
         const handle = document.createElement("div");
         handle.className = "grid-fill-handle";
-        handle.title = "Arrastar para preencher linhas abaixo";
+        handle.title = "Arraste para repetir valores";
         handle.addEventListener("mousedown", e => {
           e.stopPropagation();
           e.preventDefault();
@@ -1563,9 +1565,13 @@
     const rows = getTableRows();
     if (rows.length === 0) return;
     const clampedR = Math.max(0, Math.min(rows.length - 1, rIdx));
-    const clampedC = Math.max(1, Math.min(9, cIdx));
 
-    piSelectionRange = normalizeRange(piActiveCell.rIdx, piActiveCell.cIdx, clampedR, clampedC);
+    if (piActiveCell.cIdx >= 1 && piActiveCell.cIdx <= 4) {
+      const clampedC = Math.max(1, Math.min(4, cIdx));
+      piSelectionRange = normalizeRange(piActiveCell.rIdx, piActiveCell.cIdx, clampedR, clampedC);
+    } else {
+      piSelectionRange = { r1: clampedR, c1: piActiveCell.cIdx, r2: clampedR, c2: piActiveCell.cIdx };
+    }
     renderSelection();
   }
 
@@ -1691,6 +1697,8 @@
         if (!srcRow || !tgtRow) continue;
 
         for (let c = editC1; c <= editC2; c++) {
+          const tgtCell = tgtRow.querySelectorAll("td")[c];
+          if (tgtCell) tgtCell.dataset.touched = "true";
           if (c === 1) {
             const srcInp = srcRow.querySelector(".opc-path");
             const tgtInp = tgtRow.querySelector(".opc-path");
@@ -1851,6 +1859,8 @@
           return;
         }
         const actualColIdx = EDITABLE_COLS[targetEditColIdx];
+        const targetTd = tr.querySelectorAll("td")[actualColIdx];
+        if (targetTd) targetTd.dataset.touched = "true";
         const trimmed = val.trim();
 
         if (actualColIdx === 1) {
@@ -2051,7 +2061,8 @@
       if (!piIsEditing) {
         e.preventDefault();
         if (e.shiftKey && piSelectionRange) {
-          const newC2 = Math.min(9, piSelectionRange.c2 + 1);
+          const maxCol = piSelectionRange.c1 <= 4 ? 4 : 9;
+          const newC2 = Math.min(maxCol, piSelectionRange.c2 + 1);
           piSelectionRange = { ...piSelectionRange, c2: newC2 };
           renderSelection();
         } else {
@@ -2087,38 +2098,47 @@
       "Ações"
     ];
 
-    if (!piActiveCell) {
-      if (piCellErrors.size > 0) {
-        const firstErr = Array.from(piCellErrors.values())[0];
-        bar.innerHTML = `<span class="status-error">${escapeHtml(firstErr)} (${piCellErrors.size} erro(s))</span>`;
-      } else if (piHasPendingChanges) {
-        bar.innerHTML = `<span style="color: #92400e; font-weight: 500;">Alterações pendentes</span>`;
+    const parts = [];
+
+    if (piActiveCell) {
+      const { rIdx, cIdx } = piActiveCell;
+      if (piSelectionRange && (piSelectionRange.r1 !== piSelectionRange.r2 || piSelectionRange.c1 !== piSelectionRange.c2)) {
+        const rowCount = piSelectionRange.r2 - piSelectionRange.r1 + 1;
+        const colCount = piSelectionRange.c2 - piSelectionRange.c1 + 1;
+        parts.push(`Intervalo: ${rowCount} linhas × ${colCount} colunas`);
       } else {
-        bar.textContent = "Pronto";
+        parts.push(`Linha ${rIdx + 1} · ${colNames[cIdx] || cIdx}`);
       }
-      return;
+
+      const cellErrKey = `${rIdx}:${cIdx}`;
+      const cellErr = piCellErrors.get(cellErrKey);
+      if (cellErr) {
+        parts.push(`<span class="status-error">${escapeHtml(cellErr)}</span>`);
+      }
     }
 
-    const { rIdx, cIdx } = piActiveCell;
-    let rangeTxt = `Linha ${rIdx + 1}, Coluna: ${colNames[cIdx] || cIdx}`;
-    if (piSelectionRange && (piSelectionRange.r1 !== piSelectionRange.r2 || piSelectionRange.c1 !== piSelectionRange.c2)) {
-      const rowCount = piSelectionRange.r2 - piSelectionRange.r1 + 1;
-      const colCount = piSelectionRange.c2 - piSelectionRange.c1 + 1;
-      rangeTxt += ` (${rowCount}L × ${colCount}C selecionadas)`;
-    }
-
-    const cellErrKey = `${rIdx}:${cIdx}`;
-    const cellErr = piCellErrors.get(cellErrKey);
-
-    if (cellErr) {
-      bar.innerHTML = `<span class="status-coord">${rangeTxt}</span> &nbsp;|&nbsp; <span class="status-error">${escapeHtml(cellErr)}</span>`;
-    } else if (piCellErrors.size > 0) {
-      bar.innerHTML = `<span class="status-coord">${rangeTxt}</span> &nbsp;|&nbsp; <span class="status-error">${piCellErrors.size} célula(s) com erro</span>`;
-    } else if (piHasPendingChanges) {
-      bar.innerHTML = `<span class="status-coord">${rangeTxt}</span> &nbsp;|&nbsp; <span style="color: #92400e; font-weight: 500;">Alterações pendentes</span>`;
+    if (piCellErrors.size > 0) {
+      if (!piActiveCell || !piCellErrors.has(`${piActiveCell.rIdx}:${piActiveCell.cIdx}`)) {
+        parts.push(`<span class="status-error">${piCellErrors.size} célula(s) com erro</span>`);
+      }
     } else {
-      bar.innerHTML = `<span class="status-coord">${rangeTxt}</span>`;
+      parts.push(`<span>Pronto</span>`);
     }
+
+    if (piHasPendingChanges) {
+      const rows = getTableRows();
+      let modCount = 0;
+      rows.forEach(r => {
+        modCount += r.querySelectorAll("td.cell-modified").length;
+      });
+      if (modCount > 0) {
+        parts.push(`<span style="color: #92400e; font-weight: 500;">${modCount} alterações pendentes</span>`);
+      } else {
+        parts.push(`<span style="color: #92400e; font-weight: 500;">Alterações pendentes</span>`);
+      }
+    }
+
+    bar.innerHTML = parts.join(" &nbsp;·&nbsp; ");
   }
 
   function validateGrid() {
@@ -2131,29 +2151,50 @@
     rows.forEach(r => {
       r.querySelectorAll("td.cell-invalid").forEach(td => td.classList.remove("cell-invalid"));
       r.querySelectorAll(".is-invalid").forEach(inp => inp.classList.remove("is-invalid"));
+      r.querySelectorAll("td.cell-modified").forEach(td => td.classList.remove("cell-modified"));
     });
 
     const seenOpc = new Map();
     const seenPoints = new Map();
+    let realErrorCount = 0;
 
     rows.forEach((r, rIdx) => {
       const cells = r.querySelectorAll("td");
       const tdOpc = cells[1];
       const tdPoint = cells[2];
       const tdInterval = cells[3];
+      const tdEn = cells[4];
 
       const opcInput = tdOpc ? tdOpc.querySelector(".opc-path") : null;
       const pointInput = tdPoint ? tdPoint.querySelector(".pi-point") : null;
       const intervalInput = tdInterval ? tdInterval.querySelector(".publish-interval") : null;
+      const enInput = tdEn ? tdEn.querySelector(".row-enabled") : null;
 
       const opcPath = opcInput ? opcInput.value.trim() : "";
       const pointName = pointInput ? pointInput.value.trim() : "";
       const intervalVal = intervalInput ? parseInt(intervalInput.value, 10) : NaN;
 
+      // Track modified state (against initial loaded value)
+      if (opcInput && opcInput.dataset.initialVal !== undefined && opcInput.value !== opcInput.dataset.initialVal) {
+        tdOpc.classList.add("cell-modified");
+      }
+      if (pointInput && pointInput.dataset.initialVal !== undefined && pointInput.value !== pointInput.dataset.initialVal) {
+        tdPoint.classList.add("cell-modified");
+      }
+      if (intervalInput && intervalInput.dataset.initialVal !== undefined && intervalInput.value !== intervalInput.dataset.initialVal) {
+        tdInterval.classList.add("cell-modified");
+      }
+      if (enInput && enInput.dataset.initialVal !== undefined && String(enInput.checked) !== enInput.dataset.initialVal) {
+        tdEn.classList.add("cell-modified");
+      }
+
       if (!opcPath) {
-        if (tdOpc) tdOpc.classList.add("cell-invalid");
-        if (opcInput) opcInput.classList.add("is-invalid");
-        piCellErrors.set(`${rIdx}:1`, `Linha ${rIdx + 1}: Endereço OPC obrigatório.`);
+        realErrorCount++;
+        if (tdOpc && tdOpc.dataset.touched === "true") {
+          tdOpc.classList.add("cell-invalid");
+          if (opcInput) opcInput.classList.add("is-invalid");
+          piCellErrors.set(`${rIdx}:1`, `Linha ${rIdx + 1}: Endereço OPC obrigatório.`);
+        }
       } else {
         if (!seenOpc.has(opcPath)) {
           seenOpc.set(opcPath, []);
@@ -2162,9 +2203,12 @@
       }
 
       if (!pointName) {
-        if (tdPoint) tdPoint.classList.add("cell-invalid");
-        if (pointInput) pointInput.classList.add("is-invalid");
-        piCellErrors.set(`${rIdx}:2`, `Linha ${rIdx + 1}: PI Point obrigatório.`);
+        realErrorCount++;
+        if (tdPoint && tdPoint.dataset.touched === "true") {
+          tdPoint.classList.add("cell-invalid");
+          if (pointInput) pointInput.classList.add("is-invalid");
+          piCellErrors.set(`${rIdx}:2`, `Linha ${rIdx + 1}: PI Point obrigatório.`);
+        }
       } else {
         const ptKey = pointName.toUpperCase();
         if (!seenPoints.has(ptKey)) {
@@ -2174,37 +2218,46 @@
       }
 
       if (isNaN(intervalVal) || intervalVal < 1000 || intervalVal > 60000) {
-        if (tdInterval) tdInterval.classList.add("cell-invalid");
-        if (intervalInput) intervalInput.classList.add("is-invalid");
-        piCellErrors.set(`${rIdx}:3`, `Linha ${rIdx + 1}: Velocidade de publicação deve ser um número inteiro entre 1000 e 60000 ms.`);
+        realErrorCount++;
+        if (tdInterval && tdInterval.dataset.touched === "true") {
+          tdInterval.classList.add("cell-invalid");
+          if (intervalInput) intervalInput.classList.add("is-invalid");
+          piCellErrors.set(`${rIdx}:3`, `Linha ${rIdx + 1}: Velocidade de publicação deve ser um número inteiro entre 1000 e 60000 ms.`);
+        }
       }
     });
 
     for (const [path, occurrences] of seenOpc.entries()) {
       if (occurrences.length > 1) {
+        realErrorCount += (occurrences.length - 1);
         occurrences.forEach(item => {
-          if (item.td) item.td.classList.add("cell-invalid");
-          if (item.inp) item.inp.classList.add("is-invalid");
-          piCellErrors.set(`${item.rIdx}:1`, `Linha ${item.rIdx + 1}: Endereço OPC "${path}" duplicado na planilha.`);
+          if (item.td && item.td.dataset.touched === "true") {
+            item.td.classList.add("cell-invalid");
+            if (item.inp) item.inp.classList.add("is-invalid");
+            piCellErrors.set(`${item.rIdx}:1`, `Linha ${item.rIdx + 1}: Endereço OPC "${path}" duplicado na planilha.`);
+          }
         });
       }
     }
 
     for (const [ptKey, occurrences] of seenPoints.entries()) {
       if (occurrences.length > 1) {
+        realErrorCount += (occurrences.length - 1);
         occurrences.forEach(item => {
-          if (item.td) item.td.classList.add("cell-invalid");
-          if (item.inp) item.inp.classList.add("is-invalid");
-          piCellErrors.set(`${item.rIdx}:2`, `Linha ${item.rIdx + 1}: PI Point "${item.name}" duplicado na planilha.`);
+          if (item.td && item.td.dataset.touched === "true") {
+            item.td.classList.add("cell-invalid");
+            if (item.inp) item.inp.classList.add("is-invalid");
+            piCellErrors.set(`${item.rIdx}:2`, `Linha ${item.rIdx + 1}: PI Point "${item.name}" duplicado na planilha.`);
+          }
         });
       }
     }
 
-    const isValid = piCellErrors.size === 0;
+    const isValid = realErrorCount === 0;
     updateSaveButtonState(isValid);
     updateGridStatusBar();
 
-    return { isValid, errorCount: piCellErrors.size };
+    return { isValid, errorCount: realErrorCount };
   }
 
   function setPiPendingChanges(dirty) {
@@ -2308,6 +2361,15 @@
       if (e.button !== 0) return;
       selectSingleCell(parseInt(tr.dataset.rowIndex, 10), 1);
     });
+    tdIdx.addEventListener("mouseenter", () => {
+      const curR = parseInt(tr.dataset.rowIndex, 10);
+      if (piIsDraggingHandle) {
+        onFillHandleHoverRow(curR);
+      } else if (piIsMouseDown && piDragAnchor && piDragAnchor.cIdx <= 4) {
+        piSelectionRange = normalizeRange(piDragAnchor.rIdx, piDragAnchor.cIdx, curR, 1);
+        renderSelection();
+      }
+    });
     tr.appendChild(tdIdx);
 
     tr.addEventListener("mouseenter", () => {
@@ -2327,16 +2389,24 @@
           extendSelectionTo(curR, colIdx);
         } else {
           piIsMouseDown = true;
+          piMouseDownPos = { x: e.clientX, y: e.clientY };
+          piIsDraggingSelection = false;
           piDragAnchor = { rIdx: curR, cIdx: colIdx };
           selectSingleCell(curR, colIdx);
         }
       });
-      td.addEventListener("mouseenter", () => {
+      td.addEventListener("mouseenter", e => {
         const curR = parseInt(tr.dataset.rowIndex, 10);
         if (piIsDraggingHandle) {
           onFillHandleHoverRow(curR);
-        } else if (piIsMouseDown && piDragAnchor) {
-          piSelectionRange = normalizeRange(piDragAnchor.rIdx, piDragAnchor.cIdx, curR, colIdx);
+        } else if (piIsMouseDown && piDragAnchor && piDragAnchor.cIdx <= 4) {
+          if (!piIsDraggingSelection && piMouseDownPos && e) {
+            const dist = Math.hypot(e.clientX - piMouseDownPos.x, e.clientY - piMouseDownPos.y);
+            if (dist < 6) return;
+            piIsDraggingSelection = true;
+          }
+          const clampedCol = Math.max(1, Math.min(4, colIdx));
+          piSelectionRange = normalizeRange(piDragAnchor.rIdx, piDragAnchor.cIdx, curR, clampedCol);
           renderSelection();
         }
       });
@@ -2344,16 +2414,19 @@
         startCellEdit(false);
       });
       input.addEventListener("blur", () => {
+        td.dataset.touched = "true";
         if (piIsEditing) {
           commitCellEdit();
         }
       });
       input.addEventListener("keydown", e => handleCellKeyDown(e, parseInt(tr.dataset.rowIndex, 10), colIdx));
       input.addEventListener("input", () => {
+        td.dataset.touched = "true";
         setPiPendingChanges(true);
         validateGrid();
       });
       input.addEventListener("change", () => {
+        td.dataset.touched = "true";
         setPiPendingChanges(true);
         validateGrid();
       });
@@ -2366,8 +2439,9 @@
     inputOpc.type = "text";
     inputOpc.className = "grid-cell-input opc-path";
     inputOpc.value = m.opc_item_path || "";
-    inputOpc.placeholder = "Ex: Channel.Device.Tag";
+    inputOpc.placeholder = "Canal.Dispositivo.Tag";
     inputOpc.required = true;
+    inputOpc.dataset.initialVal = m.opc_item_path || "";
     tdOpc.appendChild(inputOpc);
     setupEditableTd(tdOpc, 1, inputOpc);
     tr.appendChild(tdOpc);
@@ -2379,8 +2453,9 @@
     inputPt.type = "text";
     inputPt.className = "grid-cell-input pi-point";
     inputPt.value = m.pi_point_name || "";
-    inputPt.placeholder = "Ex: TAG_OPC_01";
+    inputPt.placeholder = "PI_Point_Tag";
     inputPt.required = true;
+    inputPt.dataset.initialVal = m.pi_point_name || "";
     tdPt.appendChild(inputPt);
     setupEditableTd(tdPt, 2, inputPt);
     tr.appendChild(tdPt);
@@ -2396,6 +2471,7 @@
     inputInt.step = "1";
     inputInt.value = m.publish_interval_ms || 5000;
     inputInt.required = true;
+    inputInt.dataset.initialVal = String(m.publish_interval_ms || 5000);
     tdInt.appendChild(inputInt);
     setupEditableTd(tdInt, 3, inputInt);
     tr.appendChild(tdInt);
@@ -2407,27 +2483,34 @@
     inputEn.type = "checkbox";
     inputEn.className = "grid-cell-checkbox row-enabled";
     inputEn.checked = m.enabled !== undefined ? Boolean(m.enabled) : true;
+    inputEn.dataset.initialVal = String(m.enabled !== undefined ? Boolean(m.enabled) : true);
     tdEn.appendChild(inputEn);
     setupEditableTd(tdEn, 4, inputEn);
     tr.appendChild(tdEn);
+
+    // Persisted rows loaded from server start with touched=true
+    if (m.mapping_id) {
+      tdOpc.dataset.touched = "true";
+      tdPt.dataset.touched = "true";
+      tdInterval.dataset.touched = "true";
+      tdEn.dataset.touched = "true";
+    }
 
     // Helper for readonly result columns
     function setupReadonlyTd(td, colIdx) {
       td.addEventListener("mousedown", e => {
         if (e.button !== 0) return;
         const curR = parseInt(tr.dataset.rowIndex, 10);
-        if (e.shiftKey) {
-          extendSelectionTo(curR, colIdx);
-        } else {
-          piIsMouseDown = true;
-          piDragAnchor = { rIdx: curR, cIdx: colIdx };
-          selectSingleCell(curR, colIdx);
-        }
+        piIsMouseDown = false;
+        piDragAnchor = null;
+        selectSingleCell(curR, colIdx);
       });
       td.addEventListener("mouseenter", () => {
         const curR = parseInt(tr.dataset.rowIndex, 10);
-        if (piIsMouseDown && piDragAnchor) {
-          piSelectionRange = normalizeRange(piDragAnchor.rIdx, piDragAnchor.cIdx, curR, colIdx);
+        if (piIsDraggingHandle) {
+          onFillHandleHoverRow(curR);
+        } else if (piIsMouseDown && piDragAnchor && piDragAnchor.cIdx <= 4) {
+          piSelectionRange = normalizeRange(piDragAnchor.rIdx, piDragAnchor.cIdx, curR, 4);
           renderSelection();
         }
       });
@@ -2674,13 +2757,20 @@
       return;
     }
 
+    // Mark ALL editable cells as touched on save attempt so any invalid/empty cell is revealed
+    const rows = getTableRows();
+    rows.forEach(r => {
+      r.querySelectorAll("td.cell-editable").forEach(td => {
+        td.dataset.touched = "true";
+      });
+    });
+
     const { isValid } = validateGrid();
     if (!isValid) {
       showSheetError("Existem células com erros na planilha. Corrija os campos destacados em vermelho antes de salvar.");
+      message("Corrija os erros destacados na planilha antes de salvar.", "error");
       return;
     }
-
-    const rows = getTableRows();
 
     const batchRows = rows.map(r => {
       const opcInput = r.querySelector(".opc-path");
@@ -3123,6 +3213,8 @@
         }
         piIsMouseDown = false;
         piDragAnchor = null;
+        piMouseDownPos = null;
+        piIsDraggingSelection = false;
       });
 
       document.addEventListener("mousemove", e => {

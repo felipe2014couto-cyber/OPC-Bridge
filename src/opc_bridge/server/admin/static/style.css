@@ -556,6 +556,18 @@ tr.row-error td {
   border-bottom: 1px solid #cbd5e1;
 }
 
+/* Header actions column top-right corner */
+#pi-spreadsheet-table th.col-hdr-actions {
+  position: sticky;
+  top: 0;
+  right: 0;
+  z-index: 30;
+  background: #f1f5f9;
+  border-left: 1px solid #cbd5e1;
+  border-bottom: 1px solid #cbd5e1;
+  text-align: center;
+}
+
 #pi-spreadsheet-table td {
   border-right: 1px solid #e2e8f0;
   border-bottom: 1px solid #e2e8f0;
@@ -617,6 +629,13 @@ tr.row-selected {
   pointer-events: none;
 }
 
+.grid-cell-input::placeholder {
+  color: #94a3b8;
+  opacity: 0.5;
+  font-size: 12px;
+  font-style: italic;
+}
+
 /* When the cell is in active direct EDIT mode */
 #pi-spreadsheet-table td.cell-editing {
   background: #ffffff !important;
@@ -633,6 +652,11 @@ tr.row-selected {
   text-align: right;
 }
 
+/* Subtle light yellow tint for cells with pending local modifications */
+#pi-spreadsheet-table td.cell-modified {
+  background-color: #fefce8 !important;
+}
+
 /* Checkbox cell */
 #pi-spreadsheet-table td.col-active {
   text-align: center;
@@ -647,10 +671,10 @@ tr.row-selected {
   vertical-align: middle;
 }
 
-/* Read-only result columns: locked / grey appearance */
+/* Read-only result columns: locked / grey appearance with reduced contrast */
 #pi-spreadsheet-table td.cell-readonly {
   background: #f8fafc;
-  color: #475569;
+  color: #64748b;
   padding: 5px 8px;
   font-size: 12px;
   white-space: nowrap;
@@ -658,12 +682,22 @@ tr.row-selected {
   cursor: default;
 }
 
+/* Actions column sticky to the right */
 #pi-spreadsheet-table td.cell-actions {
+  position: sticky;
+  right: 0;
+  z-index: 10;
   background: #ffffff;
+  border-left: 1px solid #cbd5e1;
+  border-bottom: 1px solid #e2e8f0;
   padding: 3px 6px;
   text-align: center;
   white-space: nowrap;
   cursor: default;
+}
+
+tr.row-selected td.cell-actions {
+  background: #f8fafc;
 }
 
 /* Google Sheets style active cell border */
@@ -693,17 +727,19 @@ tr.row-selected {
   border-right: 2px solid #1a73e8 !important;
 }
 
-/* Fill handle (small square at bottom-right corner of selection) */
+/* Fill handle (solid blue square at bottom-right corner of selection) */
 .grid-fill-handle {
   position: absolute;
-  right: -3px;
-  bottom: -3px;
-  width: 6px;
-  height: 6px;
+  right: -5px;
+  bottom: -5px;
+  width: 10px;
+  height: 10px;
   background: #1a73e8;
-  border: 1px solid #ffffff;
+  border: 2px solid #ffffff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
   cursor: crosshair;
-  z-index: 25;
+  z-index: 40;
+  box-sizing: content-box;
 }
 
 /* Drag fill preview styling */

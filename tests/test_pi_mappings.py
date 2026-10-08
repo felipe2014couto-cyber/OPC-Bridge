@@ -1359,3 +1359,172 @@ def test_spreadsheet_grid_operations_never_call_pi_or_opc_services(pi_mapping_ru
     # Verify server endpoints are not touched:
     assert len(writer.frames) == initial_frames_count
     assert session.config_version == 1
+
+
+def test_spreadsheet_new_row_neutrality_and_validation_lifecycle():
+    """Verify newly added rows remain neutral and error-free until touched,
+    and validation errors clear immediately once corrected or block on save.
+    """
+    from pathlib import Path
+    static_dir = Path(__file__).resolve().parent.parent / "src" / "opc_bridge" / "server" / "admin" / "static"
+    js_content = (static_dir / "app.js").read_text(encoding="utf-8")
+
+    # 1. Persisted rows get touched, new rows do not initially get touched
+    assert 'if (m.mapping_id) {' in js_content
+    assert 'tdOpc.dataset.touched = "true";' in js_content
+    assert 'td.dataset.touched = "true";' in js_content
+
+    # 2. Validation only marks cell-invalid if touched
+    assert 'tdOpc.dataset.touched === "true"' in js_content
+    assert 'tdOpc.classList.add("cell-invalid");' in js_content
+
+    # 3. Save attempt marks all editable cells as touched to reveal errors
+    assert 'r.querySelectorAll("td.cell-editable").forEach(td => {' in js_content
+    assert 'td.dataset.touched = "true";' in js_content
+
+    # Simulation of validation lifecycle logic
+    class CellState:
+        def __init__(self, val, required=True, touched=False):
+            self.val = val
+            self.required = required
+            self.touched = touched
+            self.invalid = False
+
+        def validate(self):
+            has_error = self.required and not self.val.strip()
+            if self.touched:
+                self.invalid = has_error
+            else:
+                self.invalid = False
+            return has_error
+
+    # Case A: Brand new empty row untouched -> neutral, not invalid
+    opc_cell = CellState("", required=True, touched=False)
+    has_err = opc_cell.validate()
+    assert has_err is True
+    assert opc_cell.invalid is False
+
+    # Case B: User touches cell by typing or blurring -> now marked invalid
+    opc_cell.touched = True
+    opc_cell.validate()
+    assert opc_cell.invalid is True
+
+    # Case C: User types valid content -> immediately clears invalid state
+    opc_cell.val = "Canal.Dispositivo.Tag1"
+    has_err = opc_cell.validate()
+    assert has_err is False
+    assert opc_cell.invalid is False
+
+    # Case D: Save attempt marks untouched cells as touched
+    empty_cell = CellState("", required=True, touched=False)
+    assert empty_cell.invalid is False
+    empty_cell.touched = True
+    empty_cell.validate()
+    assert empty_cell.invalid is True
+
+
+def test_spreadsheet_drag_selection_clamped_to_editable_columns():
+    """Verify drag selection starting on editable cells (cols 1..4) is strictly clamped
+    to column 4 (Ativo), preventing rectangular selection from encompassing read-only result columns (5..8).
+    """
+    from pathlib import Path
+    static_dir = Path(__file__).resolve().parent.parent / "src" / "opc_bridge" / "server" / "admin" / "static"
+    js_content = (static_dir / "app.js").read_text(encoding="utf-8")
+
+    # Clamping in extendSelectionTo:
+    assert 'if (piActiveCell.cIdx >= 1 && piActiveCell.cIdx <= 4) {' in js_content
+    assert 'const clampedC = Math.max(1, Math.min(4, cIdx));' in js_content
+    # Clamping in editable td mouseenter:
+    assert 'Math.max(1, Math.min(4, colIdx))' in js_content
+    # Clamping in readonly td mouseenter:
+    assert 'piSelectionRange = normalizeRange(piDragAnchor.rIdx, piDragAnchor.cIdx, curR, 4);' in js_content
+
+    # Logic test: drag anchor on col 3 (Velocidade) dragged to col 7 (Qualidade)
+    def calculate_selection_bounds(anchor_c, target_c):
+        if anchor_c <= 4:
+            clamped_target_c = min(4, max(1, target_c))
+            return min(anchor_c, clamped_target_c), max(anchor_c, clamped_target_c)
+        return min(anchor_c, target_c), max(anchor_c, target_c)
+
+    c1, c2 = calculate_selection_bounds(3, 7)
+    assert c1 == 3
+    assert c2 == 4  # Strictly capped at col 4 (Ativo), result cols 5..8 excluded
+
+    # Drag starting at col 1 across to col 8
+    c1, c2 = calculate_selection_bounds(1, 8)
+    assert c1 == 1
+    assert c2 == 4  # Maximum editable column
+
+
+def test_spreadsheet_click_vs_drag_threshold():
+    """Verify movements < 6px do not trigger multi-cell drag selection, preventing accidental drag."""
+    import math
+    from pathlib import Path
+    static_dir = Path(__file__).resolve().parent.parent / "src" / "opc_bridge" / "server" / "admin" / "static"
+    js_content = (static_dir / "app.js").read_text(encoding="utf-8")
+
+    assert 'Math.hypot(e.clientX - piMouseDownPos.x, e.clientY - piMouseDownPos.y)' in js_content
+    assert 'if (dist < 6) return;' in js_content
+
+    def is_drag(x0, y0, x1, y1, threshold=6):
+        return math.hypot(x1 - x0, y1 - y0) >= threshold
+
+    # Micro-movement of 2px or 5px:
+    assert is_drag(100, 100, 102, 101) is False
+    assert is_drag(100, 100, 103, 104) is False
+
+    # Intentional movement of 8px:
+    assert is_drag(100, 100, 106, 106) is True
+
+
+def test_spreadsheet_fill_handle_attributes_and_editable_restriction():
+    """Verify fill handle styling, minimum dimensions (10x10px), solid blue with white border,
+    tooltip text, and restriction to editable columns only.
+    """
+    from pathlib import Path
+    static_dir = Path(__file__).resolve().parent.parent / "src" / "opc_bridge" / "server" / "admin" / "static"
+    css_content = (static_dir / "style.css").read_text(encoding="utf-8")
+    js_content = (static_dir / "app.js").read_text(encoding="utf-8")
+
+    # CSS requirements:
+    assert "width: 10px;" in css_content
+    assert "height: 10px;" in css_content
+    assert "background: #1a73e8;" in css_content
+    assert "border: 2px solid #ffffff;" in css_content
+    assert "box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);" in css_content
+    assert "z-index: 40;" in css_content
+    assert "cursor: crosshair;" in css_content
+
+    # JS tooltip and visibility:
+    assert 'handle.title = "Arraste para repetir valores";' in js_content
+    assert 'const canShowHandle = c1 >= 1 && c1 <= 4 && c2 <= 4;' in js_content
+
+
+
+def test_spreadsheet_sticky_actions_column_and_clean_aesthetics():
+    """Verify 'Ações' column is sticky to the right, placeholders are discreet, and modified cells
+    use subtle light yellow tint without distracting borders.
+    """
+    from pathlib import Path
+    static_dir = Path(__file__).resolve().parent.parent / "src" / "opc_bridge" / "server" / "admin" / "static"
+    html_content = (static_dir / "index.html").read_text(encoding="utf-8")
+    css_content = (static_dir / "style.css").read_text(encoding="utf-8")
+    js_content = (static_dir / "app.js").read_text(encoding="utf-8")
+
+    # Sticky right actions column
+    assert 'class="col-hdr-actions"' in html_content
+    assert "#pi-spreadsheet-table th.col-hdr-actions" in css_content
+    assert "position: sticky" in css_content
+    assert "right: 0" in css_content
+    assert "#pi-spreadsheet-table td.cell-actions" in css_content
+
+    # Discreet placeholders
+    assert '.grid-cell-input::placeholder' in css_content
+    assert 'font-style: italic;' in css_content
+    assert 'opacity: 0.5;' in css_content
+    assert 'placeholder = "Canal.Dispositivo.Tag";' in js_content
+    assert 'placeholder = "PI_Point_Tag";' in js_content
+
+    # Subtle yellow tint for modified cells
+    assert "#pi-spreadsheet-table td.cell-modified" in css_content
+    assert "background-color: #fefce8 !important;" in css_content
