@@ -149,7 +149,7 @@ class PiIntegrationAdministration:
             if method != "POST":
                 return self._json_response(start_response, "405 Method Not Allowed", {"error": "method_not_allowed"})
             cfg = self._get_pi_output_config()
-            if not cfg.enabled and cfg.mode == "web_api":
+            if not cfg.enabled:
                 return self._json_response(
                     start_response,
                     "200 OK",
@@ -354,6 +354,9 @@ class PiIntegrationAdministration:
                             or bool(existing["enabled"]) != enabled
                         )
                         repo.update_pi_profile(profile_id, point_source, location1, enabled)
+                        channel = self._get_pi_output_channel()
+                        if hasattr(channel, "clear_cache"):
+                            channel.clear_cache()
                         deactivated_count = 0
                         if changed:
                             deactivated_count = repo.deactivate_mappings_for_profile(

@@ -800,8 +800,7 @@ def test_pi_attribute_divergence_blocks_publication():
         expected_location1=1,
     )
     assert valid_ps is False
-    assert "pointsource" in err_ps.lower()
-    assert "não corresponde" in err_ps.lower()
+    assert err_ps == 'Publicação bloqueada: o PI Point "TAG_POINT_TEST" possui Point Source "KEPWARE", mas este perfil permite somente "OPCBRIDGE".'
 
     # 2. Location1 mismatch
     channel._attributes_cache["webid-test-123"] = {
@@ -814,8 +813,7 @@ def test_pi_attribute_divergence_blocks_publication():
         expected_location1=1,
     )
     assert valid_loc is False
-    assert "location1" in err_loc.lower()
-    assert "não corresponde" in err_loc.lower()
+    assert err_loc == 'Publicação bloqueada: o PI Point "TAG_POINT_TEST" possui Location1 "99", mas este perfil permite somente "1".'
 
     # 3. Exact match
     channel._attributes_cache["webid-test-123"] = {

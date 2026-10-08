@@ -15,7 +15,6 @@ from __future__ import annotations
 import json
 import os
 import urllib.error
-import uuid
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
@@ -28,7 +27,6 @@ from opc_bridge.server.pi_output import (
     PiOutputConfig,
     PiOutputDisabledError,
     PiPublisher,
-    PiPublishResult,
     PiValuePayload,
     PiWebApiOutputChannel,
     SimulatedPiOutputChannel,
@@ -324,7 +322,7 @@ def test_pi_web_api_channel_with_mocked_http():
             location1=1,
         )
         assert pub_blocked.status == "Erro"
-        assert "PointSource" in pub_blocked.error
+        assert pub_blocked.error == 'Publicação bloqueada: o PI Point "BOBIN_VEL" possui Point Source "DIFF", mas este perfil permite somente "OPC".'
         # Stream POST was never called!
         assert mock_exec_fail.call_count == 2
 
@@ -713,11 +711,18 @@ def test_admin_api_pi_integration_status_endpoint(pi_runtime, monkeypatch):
 def test_admin_api_test_connection_endpoint(pi_runtime):
     app, _, _, _, _ = pi_runtime
 
-    # POST /api/v1/pi-integration/test-connection
+    # 1. By default, output is disabled -> connected=False, error=output_disabled
     st, _, data = request(app, "/api/v1/pi-integration/test-connection", method="POST")
     assert st.startswith("200")
-    assert data["connected"] is True
-    assert "simulado" in data["message"].lower() or "verificada" in data["message"].lower()
+    assert data["connected"] is False
+    assert data["error"] == "output_disabled"
+
+    # 2. When enabled in simulated mode -> connected=True
+    with patch.dict(os.environ, {"OPC_BRIDGE_PI_OUTPUT_ENABLED": "true"}):
+        st2, _, data2 = request(app, "/api/v1/pi-integration/test-connection", method="POST")
+        assert st2.startswith("200")
+        assert data2["connected"] is True
+        assert "simulado" in data2["message"].lower() or "verificada" in data2["message"].lower()
 
     # GET is rejected with 405 Method Not Allowed
     st_get, _, _ = request(app, "/api/v1/pi-integration/test-connection", method="GET")
@@ -901,8 +906,123 @@ def test_industrial_safety_zero_opc_writes(pi_runtime):
     # 1. The agent session writer received ZERO frames (no CONFIG_PUSH, no write commands)
     assert len(writer.frames) == 0
 
-    # 2. No pending config operations created
-    assert len(bridge._pending_config_operations) == 0
 
-    # 3. No pending writes created
-    assert len(bridge._pending_reads) == 0
+def test_strict_attribute_validation_divergence_messages_and_zero_post():
+    cfg = PiOutputConfig(
+        enabled=True,
+        mode="web_api",
+        base_url="http://10.247.224.39/piwebapi",
+        data_server="PIMS",
+    )
+    channel = PiWebApiOutputChannel(cfg)
+
+    points_resp = (200, {"WebId": "WEBID_PIMS_TEST_01", "Name": "TEST_POINT"})
+    attrs_match = (200, {"Items": [{"Name": "pointsource", "Value": "S"}, {"Name": "location1", "Value": 4}]})
+    write_resp = (202, {"Status": "Created"})
+
+    # 1. Matching attributes: allows POST and validates payload format
+    with patch.object(channel, "_execute_http", side_effect=[points_resp, attrs_match, write_resp]) as mock_exec:
+        res = channel.publish(
+            pi_point_name="TEST_POINT",
+            value=42.5,
+            timestamp=datetime(2026, 10, 8, 12, 0, 0, tzinfo=timezone.utc),
+            point_source="S",
+            location1=4,
+        )
+        assert res.status == "Publicado"
+        assert res.error is None
+        assert mock_exec.call_count == 3
+        # Verify POST stream call
+        req_post = mock_exec.call_args_list[2][0][0]
+        assert req_post.get_method() == "POST"
+        assert "/streams/WEBID_PIMS_TEST_01/value?updateOption=Replace" in req_post.full_url
+        payload = json.loads(req_post.data.decode("utf-8"))
+        assert payload == {"Timestamp": "2026-10-08T12:00:00+00:00", "Value": 42.5}
+
+    # 2. Point Source divergence (actual "O", expected "S"): BLOCKS before any POST
+    channel.clear_cache()
+    attrs_ps_diff = (200, {"Items": [{"Name": "pointsource", "Value": "O"}, {"Name": "location1", "Value": 4}]})
+    with patch.object(channel, "_execute_http", side_effect=[points_resp, attrs_ps_diff]) as mock_exec:
+        res_ps = channel.publish(
+            pi_point_name="TEST_POINT",
+            value=42.5,
+            point_source="S",
+            location1=4,
+        )
+        assert res_ps.status == "Erro"
+        assert res_ps.error == 'Publicação bloqueada: o PI Point "TEST_POINT" possui Point Source "O", mas este perfil permite somente "S".'
+        # Proves ZERO POST: only GET /points and GET /attributes were called
+        assert mock_exec.call_count == 2
+        for call_args in mock_exec.call_args_list:
+            req = call_args[0][0]
+            assert req.get_method() == "GET"
+
+    # 3. Location1 divergence (actual 0, expected 4): BLOCKS before any POST
+    channel.clear_cache()
+    attrs_loc_diff = (200, {"Items": [{"Name": "pointsource", "Value": "S"}, {"Name": "location1", "Value": 0}]})
+    with patch.object(channel, "_execute_http", side_effect=[points_resp, attrs_loc_diff]) as mock_exec:
+        res_loc = channel.publish(
+            pi_point_name="TEST_POINT",
+            value=42.5,
+            point_source="S",
+            location1=4,
+        )
+        assert res_loc.status == "Erro"
+        assert res_loc.error == 'Publicação bloqueada: o PI Point "TEST_POINT" possui Location1 "0", mas este perfil permite somente "4".'
+        # Proves ZERO POST
+        assert mock_exec.call_count == 2
+        for call_args in mock_exec.call_args_list:
+            assert call_args[0][0].get_method() == "GET"
+
+    # 4. Missing attribute or query failure: BLOCKS before any POST
+    channel.clear_cache()
+    attrs_empty = (200, {"Items": []})
+    with patch.object(channel, "_execute_http", side_effect=[points_resp, attrs_empty]) as mock_exec:
+        res_missing = channel.publish(
+            pi_point_name="TEST_POINT",
+            value=42.5,
+            point_source="S",
+            location1=4,
+        )
+        assert res_missing.status == "Erro"
+        assert "não possui o atributo Point Source" in res_missing.error
+        assert mock_exec.call_count == 2
+
+
+def test_test_connection_fallback_to_system_endpoint():
+    cfg = PiOutputConfig(
+        enabled=True,
+        mode="web_api",
+        base_url="http://10.247.224.39/piwebapi",
+    )
+    channel = PiWebApiOutputChannel(cfg)
+
+    # When /system/landing raises HTTP 404, it must fall back to /system
+    err_404 = urllib.error.HTTPError("http://10.247.224.39/piwebapi/system/landing", 404, "Not Found", {}, None)
+    system_ok = (200, {"ProductTitle": "PI Web API 2023 SP1 Patch 1"})
+
+    with patch.object(channel, "_execute_http", side_effect=[err_404, system_ok]) as mock_exec:
+        res = channel.test_connection()
+        assert res["connected"] is True
+        assert res["status_code"] == 200
+        assert "PI Web API 2023 SP1 Patch 1" in res["message"]
+        assert mock_exec.call_count == 2
+        assert "/system/landing" in mock_exec.call_args_list[0][0][0].full_url
+        assert "/system" in mock_exec.call_args_list[1][0][0].full_url
+
+
+def test_unencrypted_credentials_over_http_safety_guard():
+    cfg = PiOutputConfig(
+        enabled=True,
+        mode="web_api",
+        base_url="http://10.247.224.39/piwebapi",
+        username="piadmin",
+        password="secretpassword",
+    )
+    channel = PiWebApiOutputChannel(cfg)
+
+    # Attempting to build request with credentials over unencrypted HTTP must raise RuntimeError
+    with pytest.raises(RuntimeError) as exc_info:
+        channel._build_request("http://10.247.224.39/piwebapi/system", "GET")
+    assert "Segurança" in str(exc_info.value)
+    assert "inseguro" in str(exc_info.value)

@@ -532,10 +532,14 @@ class PiWebApiOutputChannel(PiOutputChannel):
 
         # In-memory Basic Auth assembly only when username and password are provided
         if (self.config.auth_type == "basic" or self.auth_mode == "basic") and self.username and self.password:
+            if url.startswith("http://"):
+                raise RuntimeError("Segurança: credenciais Basic sobre HTTP inseguro não são permitidas sem confirmação explícita do operador.")
             user_pass = f"{self.username}:{self.password}".encode("utf-8")
             encoded = base64.b64encode(user_pass).decode("ascii")
             headers["Authorization"] = f"Basic {encoded}"
         elif self.config.auth_type == "bearer" and self.config.bearer_token:
+            if url.startswith("http://"):
+                raise RuntimeError("Segurança: token sobre HTTP inseguro não é permitido sem confirmação explícita do operador.")
             headers["Authorization"] = f"Bearer {self.config.bearer_token}"
 
         return urllib.request.Request(url=url, data=data_bytes, headers=headers, method=method)
@@ -675,13 +679,17 @@ class PiWebApiOutputChannel(PiOutputChannel):
                 break
 
         if actual_ps is None:
-            return False, f"Atributo 'PointSource' não encontrado no ponto PI '{clean_point}'", attrs
+            return (
+                False,
+                f'Publicação bloqueada: o PI Point "{clean_point}" não possui o atributo Point Source ou ele não pôde ser consultado.',
+                attrs,
+            )
 
         exp_ps = str(expected_point_source or "").strip()
         if actual_ps.upper() != exp_ps.upper():
             return (
                 False,
-                f"PointSource do ponto PI ('{actual_ps}') não corresponde ao perfil configurado ('{exp_ps}')",
+                f'Publicação bloqueada: o PI Point "{clean_point}" possui Point Source "{actual_ps}", mas este perfil permite somente "{exp_ps}".',
                 attrs,
             )
 
@@ -696,7 +704,11 @@ class PiWebApiOutputChannel(PiOutputChannel):
                 break
 
         if actual_loc1 is None:
-            return False, f"Atributo 'Location1' não encontrado ou inválido no ponto PI '{clean_point}'", attrs
+            return (
+                False,
+                f'Publicação bloqueada: o PI Point "{clean_point}" não possui o atributo Location1 ou ele não pôde ser consultado.',
+                attrs,
+            )
 
         try:
             exp_loc1 = int(expected_location1)
@@ -706,7 +718,7 @@ class PiWebApiOutputChannel(PiOutputChannel):
         if actual_loc1 != exp_loc1:
             return (
                 False,
-                f"Location1 do ponto PI ({actual_loc1}) não corresponde ao perfil configurado ({exp_loc1})",
+                f'Publicação bloqueada: o PI Point "{clean_point}" possui Location1 "{actual_loc1}", mas este perfil permite somente "{exp_loc1}".',
                 attrs,
             )
 
@@ -987,7 +999,7 @@ class PiWebApiOutputChannel(PiOutputChannel):
                 "connected": False,
                 "mode": "web_api",
                 "error": "output_disabled",
-                "message": "Saída PI desabilitada. Configure OPC_BRIDGE_PI_OUTPUT_ENABLED=true para conectar ao servidor real.",
+                "message": "Saída PI: desabilitada — nenhuma escrita real habilitada. Teste de conexão bloqueado.",
             }
 
         if not self.config.base_url:
@@ -1001,7 +1013,16 @@ class PiWebApiOutputChannel(PiOutputChannel):
         test_url = f"{self.config.base_url}/system/landing"
         try:
             req = self._build_request(test_url, "GET")
-            code, data = self._execute_http(req)
+            try:
+                code, data = self._execute_http(req)
+            except urllib.error.HTTPError as exc:
+                if exc.code == 404:
+                    alt_url = f"{self.config.base_url}/system"
+                    req2 = self._build_request(alt_url, "GET")
+                    code, data = self._execute_http(req2)
+                else:
+                    raise
+
             if 200 <= code < 300:
                 prod_title = data.get("ProductTitle") if isinstance(data, dict) else None
                 msg = f"Conexão com PI Web API verificada com sucesso (HTTP {code})."

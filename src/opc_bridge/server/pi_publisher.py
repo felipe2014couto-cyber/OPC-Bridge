@@ -52,11 +52,17 @@ class PiPublisherService:
         database: Any,
         config: Optional[PiOutputConfig] = None,
         channel: Optional[PiOutputChannel] = None,
+        periodic_enabled: Optional[bool] = None,
     ) -> None:
         self.bridge_server = bridge_server
         self.database = database
         self.config = config if config is not None else PiOutputConfig.load_from_env()
         self.channel = channel if channel is not None else create_pi_output_channel(self.config)
+        if periodic_enabled is not None:
+            self.periodic_enabled = periodic_enabled
+        else:
+            import os
+            self.periodic_enabled = (os.getenv("OPC_BRIDGE_PI_PERIODIC_ENABLED", "true").lower() == "true")
         self._running = False
         self._thread: Optional[threading.Thread] = None
 
@@ -67,6 +73,10 @@ class PiPublisherService:
         """
         # Kill-switch: do nothing if output is not enabled
         if not self.config.enabled:
+            return []
+
+        # Prevent automated batch publication when periodic is disabled
+        if not self.periodic_enabled:
             return []
 
         try:

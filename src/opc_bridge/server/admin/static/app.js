@@ -1508,7 +1508,9 @@
       const tsFormatted = formatOpcTimestamp(m.last_published_at);
       tdRes.innerHTML = `<span class="badge good" title="Valor: ${m.last_published_value || ''}">Publicado (${tsFormatted})</span>`;
     } else if (st === "erro" || st === "error") {
-      tdRes.innerHTML = `<span class="badge error" title="${m.last_publish_error || ''}">Erro</span>`;
+      tr.classList.add("row-error");
+      const errTxt = escapeHtml(m.last_publish_error || "Erro na publicação");
+      tdRes.innerHTML = `<span class="badge error" title="${errTxt}">Erro</span><small class="error-msg" style="display:block; font-size:11px; color:var(--status-red); margin-top:2px;" title="${errTxt}">${errTxt}</small>`;
     } else if (st === "desabilitado" || st === "disabled") {
       tdRes.innerHTML = '<span class="badge muted">Desabilitado</span>';
     } else if (st === "lido via opc") {
@@ -1876,6 +1878,11 @@
           if (!piOutputEnabled) {
             btn.disabled = true;
             btn.title = "Publicação desabilitada: saída PI desabilitada externamente (OPC_BRIDGE_PI_OUTPUT_ENABLED=true).";
+          } else {
+            const tr = btn.closest("tr");
+            const chk = tr ? tr.querySelector(".cell-chk-enabled") : null;
+            btn.disabled = chk ? !chk.checked : false;
+            btn.title = "Publicar a leitura atual em cache no PI Point de destino";
           }
         });
       }
